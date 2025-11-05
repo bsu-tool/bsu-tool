@@ -6,7 +6,7 @@ on:
     branches: [ main ]
   workflow_dispatch:
 jobs:
-  test:
+  test: # name of job
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

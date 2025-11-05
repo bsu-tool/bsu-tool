@@ -1,3 +1,3 @@
 export function isWorking() {
-  return false; // your app health logic could live here later
+  return true; // your app health logic could live here later
 }

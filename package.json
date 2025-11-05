@@ -1,0 +1,13 @@
+{
+  "name": "example-team-repo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "jest --ci",
+    "build": "rm -rf dist && mkdir dist && cp -r src/* dist/"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  }
+}

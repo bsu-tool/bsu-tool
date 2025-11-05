@@ -1,0 +1,6 @@
+:root { font-family: system-ui, sans-serif; }
+#status-btn {
+  padding: 1rem 1.5rem;
+  border: none; border-radius: .5rem;
+  background: #1e7e34; color: white; font-weight: 700;
+}

@@ -1,3 +1,19 @@
-node_modules
-dist
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+
+# Pyright
+.pyright/
+
+# Ruff
+.ruff_cache/
+
+# Pytest
+.pytest_cache/
+
+# OS
 .DS_Store

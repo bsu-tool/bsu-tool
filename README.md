@@ -24,14 +24,16 @@ Re-activate the venv at the start of every session. Rerun `pip install -e ".[dev
 
 ## Development
 
-Never commit directly to `main`. Always work on a branch:
+Never commit directly to `main`. Always work on a branch tied to a GitHub issue:
 
 ```bash
-git checkout -b your-feature-name   # create and switch to new branch
+git checkout -b 21/parse-urb-headers   # issue number / short description
 git add <files>
 git commit -m "describe what you did"
-git push -u origin your-feature-name
+git push -u origin 21/parse-urb-headers
 ```
+
+Branch names must follow the format `<issue-number>/<short-description>`. Include `closes #21` in your PR description to automatically close the issue on merge.
 
 Then open a pull request on GitHub. CI runs automatically — all checks must pass before merging.
 

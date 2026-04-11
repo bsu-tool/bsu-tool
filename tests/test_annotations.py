@@ -35,7 +35,7 @@ def test_all_functions_fully_annotated() -> None:
                 continue
             if param not in hints:
                 missing.append(
-                    f"  {location}\n    error: parameter '{param}' in '{qualname}' has no annotation"
+                    f"  {location}\n error: parameter '{param}' in '{qualname}' has no annotation"
                 )
     assert not missing, "Annotation errors:\n" + "\n".join(missing)
 

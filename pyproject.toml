@@ -3,8 +3,11 @@ name = "bsu-tool"
 version = "0.1.0"
 description = "Behavioral Sleuth for USB — CLI tool and MCP server for USB protocol analysis"
 requires-python = ">=3.11"
-license = { text = "MIT OR Apache-2.0" }
+license = "MIT OR Apache-2.0"
 dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["bsu_tool*"]
 
 [project.scripts]
 bsu-tool = "bsu_tool.__main__:main"

@@ -8,8 +8,9 @@ import typing
 
 import bsu_tool
 
-"""Return every function defined in bsu_tool and its submodules."""
+
 def _bsu_tool_functions() -> list[tuple[str, types.FunctionType]]:
+    """Return every function defined in bsu_tool and its submodules."""
     results: list[tuple[str, types.FunctionType]] = []
     for info in pkgutil.walk_packages(bsu_tool.__path__, prefix="bsu_tool."):
         module = importlib.import_module(info.name)
@@ -18,8 +19,9 @@ def _bsu_tool_functions() -> list[tuple[str, types.FunctionType]]:
                 results.append((f"{obj.__module__}.{obj.__qualname__}", obj))
     return results
 
-"""Every function in bsu_tool must annotate all parameters and return type."""
+
 def test_all_functions_fully_annotated() -> None:
+    """Every function in bsu_tool must annotate all parameters and return type."""
     missing: list[str] = []
     for qualname, func in _bsu_tool_functions():
         hints = typing.get_type_hints(func)
@@ -35,13 +37,14 @@ def test_all_functions_fully_annotated() -> None:
                 continue
             if param not in hints:
                 missing.append(
-                    f"  {location}\n error: parameter '{param}' in '{qualname}' has no annotation"
+                    f"  {location}\n    error: parameter '{param}'"
+                    f" in '{qualname}' has no annotation"
                 )
     assert not missing, "Annotation errors:\n" + "\n".join(missing)
 
 
-"""Every public function in bsu_tool must have a docstring."""
 def test_all_functions_have_docstrings() -> None:
+    """Every public function in bsu_tool must have a docstring."""
     missing: list[str] = []
     for qualname, func in _bsu_tool_functions():
         if func.__name__.startswith("_"):

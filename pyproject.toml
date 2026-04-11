@@ -17,6 +17,7 @@ dev = [
     "pytest>=8.0",
     "pyright>=1.1",
     "ruff>=0.4",
+    "pre-commit>=3.0",
 ]
 
 [tool.pytest.ini_options]

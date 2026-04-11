@@ -17,6 +17,7 @@ python -m venv .venv
 source .venv/Scripts/activate
 
 pip install -e ".[dev]"
+pre-commit install
 ```
 
 Re-activate the venv at the start of every session. Rerun `pip install -e ".[dev]"` if `pyproject.toml` changes.

@@ -27,12 +27,16 @@ def test_all_functions_fully_annotated() -> None:
         line = inspect.getsourcelines(func)[1]
         location = f"{file}:{line}"
         if "return" not in hints:
-            missing.append(f"  {location}\n    error: missing return annotation on '{qualname}'")
+            missing.append(
+                f"  {location}\n    error: missing return annotation on '{qualname}'"
+            )
         for param in inspect.signature(func).parameters:
             if param in ("self", "cls"):
                 continue
             if param not in hints:
-                missing.append(f"  {location}\n    error: parameter '{param}' in '{qualname}' has no annotation")
+                missing.append(
+                    f"  {location}\n    error: parameter '{param}' in '{qualname}' has no annotation"
+                )
     assert not missing, "Annotation errors:\n" + "\n".join(missing)
 
 

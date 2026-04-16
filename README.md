@@ -57,16 +57,17 @@ pytest
 Run a single file or test:
 
 ```bash
-pytest tests/test_status.py
-pytest tests/test_status.py::test_is_ready
+pytest tests/unit/test_status.py
+pytest tests/unit/test_status.py::test_is_ready
 ```
 
 ### What the tests cover
 
 | File | What it checks |
 |---|---|
-| `test_status.py` | Business logic + pyright passes |
-| `test_annotations.py` | Every public function has type annotations and a docstring |
+| `tests/unit/test_status.py` | Business logic + pyright passes |
+| `tests/unit/test_annotations.py` | Every public function has type annotations and a docstring |
+| `tests/int/` | Integration tests (added as the project grows) |
 
 Every function you write in `bsu_tool/` must have:
 - A return type annotation (`-> SomeType`)

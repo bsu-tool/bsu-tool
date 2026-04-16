@@ -8,6 +8,10 @@
 
 ## Checklist
 
+- [ ] `ruff check .` passes locally
+- [ ] `ruff format .` passes locally
+- [ ] `pyright` passes locally with no new errors
 - [ ] `pytest` passes locally
 - [ ] All new functions have type annotations and docstrings
-- [ ] No new `pyright` errors
+- [ ] Branch is named `<issue-number>/<short-description>`
+- [ ] PR description includes `closes #N`

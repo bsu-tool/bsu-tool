@@ -22,7 +22,7 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests/unit", "tests/int"]
 addopts = "--cov=bsu_tool --cov-report=term-missing"
 
 [tool.coverage.run]

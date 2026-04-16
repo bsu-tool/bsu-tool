@@ -1,1 +1,1 @@
-"""Copy into each new test subfolder — required for pyright to type-check it."""
+"""Required by pyright to type-check test directories. Copy into new test subfolders."""

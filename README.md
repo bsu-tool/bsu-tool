@@ -13,8 +13,10 @@ python -m venv .venv
 
 # PowerShell
 .venv\Scripts\Activate.ps1
-# Git Bash / Linux
+# Git Bash (Windows)
 source .venv/Scripts/activate
+# Linux / Mac
+source .venv/bin/activate
 
 pip install -e ".[dev]"
 pre-commit install

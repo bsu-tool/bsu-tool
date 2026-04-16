@@ -12,8 +12,11 @@ build/
 # Ruff
 .ruff_cache/
 
-# Pytest
+# Pytest / coverage
 .pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
 
 # OS
 .DS_Store

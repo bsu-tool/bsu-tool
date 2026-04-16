@@ -11,39 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Sync labels
-        env:
-          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
-        run: |
-          # Parse labels.yml and create/update each label
-          python3 - <<'EOF'
-          import subprocess
-          import yaml
-
-          with open(".github/labels.yml") as f:
-              labels = yaml.safe_load(f)
-
-          for label in labels:
-              name = label["name"]
-              color = label["color"]
-              description = label.get("description", "")
-
-              # Try to update first, create if it doesn't exist
-              result = subprocess.run(
-                  ["gh", "label", "edit", name,
-                   "--color", color,
-                   "--description", description],
-                  capture_output=True
-              )
-              if result.returncode != 0:
-                  subprocess.run(
-                      ["gh", "label", "create", name,
-                       "--color", color,
-                       "--description", description],
-                      check=True
-                  )
-                  print(f"Created: {name}")
-              else:
-                  print(f"Updated: {name}")
-          EOF
+      - uses: EndBug/label-sync@v2
+        with:
+          config-file: .github/labels.yml
+          token: ${{ secrets.PROJECT_TOKEN }}
+          delete-other-labels: true

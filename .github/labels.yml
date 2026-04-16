@@ -1,0 +1,39 @@
+- name: epic
+  color: "5319E7"
+  description: A large body of work made up of tasks
+
+- name: task
+  color: "0075CA"
+  description: A unit of work to implement or improve something
+
+- name: subtask
+  color: "0052CC"
+  description: A small piece of work that belongs to a task or epic
+
+- name: bug
+  color: "D73A4A"
+  description: Something is broken or behaving incorrectly
+
+- name: documentation
+  color: "0075CA"
+  description: Documentation work
+
+- name: stretch-goal
+  color: "E4E669"
+  description: Nice to have — not required for project completion
+
+- name: milestone-1
+  color: "BFD4F2"
+  description: "Milestone 1 — Foundation (Weeks 1-5)"
+
+- name: milestone-2
+  color: "BFD4F2"
+  description: "Milestone 2 — MCP + Session (Weeks 6-10)"
+
+- name: milestone-3
+  color: "BFD4F2"
+  description: "Milestone 3 — Protocol Analysis (Weeks 11-15)"
+
+- name: milestone-4
+  color: "BFD4F2"
+  description: "Milestone 4 — Polish + Delivery (Weeks 16-20)"

@@ -1,0 +1,17 @@
+name: Branch Name Check
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  branch-name:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check branch name format
+        run: |
+          BRANCH="${{ github.head_ref }}"
+          if [[ ! "$BRANCH" =~ ^[0-9]+/.+ ]]; then
+            echo "Branch name '$BRANCH' does not match required format: <issue-number>/<description>"
+            echo "Example: 21/parse-urb-headers"
+            exit 1
+          fi

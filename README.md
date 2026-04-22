@@ -24,6 +24,14 @@ pre-commit install
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow, branching conventions, code standards, and testing guide.
 
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [SRS](docs/srs/README.md) | Software Requirements Specification |
+| [Architecture](docs/architecture/README.md) | Component design and data flow |
+| [User Guide](docs/user-guide/README.md) | Installation and usage (Milestone 4) |
+
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) and [Apache 2.0](LICENSE-APACHE).

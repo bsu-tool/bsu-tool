@@ -107,6 +107,20 @@ pytest tests/unit/test_status.py::test_is_ready
 
 ---
 
+## Documentation
+
+Project documentation lives in `docs/`. Keep it up to date as you build.
+
+| File | When to update |
+|------|---------------|
+| `docs/srs.md` | When requirements change or are clarified |
+| `docs/architecture.md` | When adding or significantly changing a component |
+| `docs/user-guide.md` | Milestone 4 — when the feature is complete and stable |
+
+Documentation changes follow the same branch/PR/review workflow as code. If your PR adds or changes a public interface, update the relevant doc in the same PR.
+
+---
+
 ## Questions
 
 Ask in the team chat first. If it's a blocker, bring it to the weekly check-in with Bart Massey.

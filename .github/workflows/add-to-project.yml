@@ -9,5 +9,5 @@ jobs:
     steps:
       - uses: actions/add-to-project@v1.0.2
         with:
-          project-url: https://github.com/users/TrevorWT/projects/2
+          project-url: https://github.com/orgs/bsu-tool/projects/1
           github-token: ${{ secrets.PROJECT_TOKEN }}

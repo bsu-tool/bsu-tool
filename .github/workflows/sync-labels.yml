@@ -14,5 +14,5 @@ jobs:
       - uses: EndBug/label-sync@v2
         with:
           config-file: .github/labels.yml
-          token: ${{ secrets.PROJECT_TOKEN }}
+          token: ${{ secrets.BSU_PROJECT_TOKEN }}
           delete-other-labels: true

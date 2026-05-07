@@ -1,12 +1,12 @@
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.4.0
+    rev: v0.15.12
     hooks:
       - id: ruff          # lint and auto-fix
         args: [--fix]
       - id: ruff-format   # format
 
   - repo: https://github.com/RobertCraigie/pyright-python
-    rev: v1.1.396
+    rev: v1.1.409
     hooks:
       - id: pyright

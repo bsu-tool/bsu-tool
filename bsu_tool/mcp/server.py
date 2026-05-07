@@ -1,0 +1,1 @@
+"""FastMCP instance, lifespan, transport"""

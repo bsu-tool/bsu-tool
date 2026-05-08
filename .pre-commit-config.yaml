@@ -10,3 +10,6 @@ repos:
     rev: v1.1.409
     hooks:
       - id: pyright
+        additional_dependencies:
+          - "mcp>=1.0"
+          - "pytest>=8.0"

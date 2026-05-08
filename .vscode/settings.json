@@ -1,0 +1,40 @@
+{
+  "files.exclude": {
+    ".vscode": false,
+    "**/__pycache__": true,
+    "**/__pycache__/**": true,
+    "**/*.egg-info": true,
+    "**/*.egg-info/**": true,
+    "**/.pytest_cache": true,
+    "**/.pytest_cache/**": true,
+    "**/.ruff_cache": true,
+    "**/.ruff_cache/**": true,
+    "**/.pyright": true,
+    "**/.venv": true,
+    "**/dist": true,
+    "**/build": true,
+    "**/htmlcov": true,
+    "**/.coverage": true,
+    "**/coverage.xml": true,
+    "**/.DS_Store": true,
+    "**/Thumbs.db": true
+  },
+  "search.exclude": {
+    "**/__pycache__": true,
+    "**/*.egg-info": true,
+    "**/.pytest_cache": true,
+    "**/.ruff_cache": true,
+    "**/.venv": true,
+    "**/dist": true,
+    "**/build": true,
+    "**/htmlcov": true
+  },
+  "files.watcherExclude": {
+    "**/__pycache__/**": true,
+    "**/.venv/**": true,
+    "**/.pytest_cache/**": true,
+    "**/.ruff_cache/**": true,
+    "**/dist/**": true,
+    "**/build/**": true
+  }
+}

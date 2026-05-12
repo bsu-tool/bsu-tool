@@ -1,0 +1,31 @@
+# Normalize text files: store as LF in the repo, let each OS use its native EOL on checkout.
+* text=auto eol=lf
+
+# Source / config — always LF
+*.py        text eol=lf
+*.toml      text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.cfg       text eol=lf
+*.ini       text eol=lf
+*.sh        text eol=lf
+
+# Windows-only files keep CRLF
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+# Capture fixtures and other binaries — never normalize
+*.pcap      binary
+*.pcapng    binary
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.pdf       binary
+*.zip       binary
+*.gz        binary
+*.7z        binary

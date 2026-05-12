@@ -22,5 +22,8 @@ htmlcov/
 # OS
 .DS_Store
 
+# Claude config
+.claude/
+
 # VSCode
 .vscode/

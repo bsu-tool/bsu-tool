@@ -1,16 +1,35 @@
-"""pcap-ng block reader.
+"""pcap-ng block reader for bsu-tool.
 
-Iterates over the blocks of a pcap-ng file, yielding parsed dataclass
-representations. The reader:
+The reader is intentionally layered: this module decodes pcap-ng *block*
+structure only. URB-level decoding of packet payloads belongs in a
+separate module so the two layers can be tested independently.
 
-* validates the block framing (block-type, leading length, trailing length);
-* tracks the current section's byte order, established by each Section
-  Header Block;
-* parses the well-known block types we model in :mod:`bsu_tool.parser.blocks`;
-* falls back to :class:`UnknownBlock` for anything unrecognized.
+Typical use::
 
-It does **not** decode the contents of packet bodies — for usbmon captures,
-that is the job of the URB decoder layer.
+    from bsu_tool.pcapng_reader import PcapNgReader, EnhancedPacketBlock
+
+    with open("capture.pcapng", "rb") as fp:
+        for block in PcapNgReader(fp):
+            if isinstance(block, EnhancedPacketBlock):
+                ...  # do something with block.packet_data
+
+Block types
+-----------
+Every block we expose is a frozen dataclass — once parsed, blocks are
+immutable. Options are exposed as a tuple of raw :class:`Option` records;
+higher-level code is responsible for interpreting option codes by context
+(option codes are not globally unique — code 2 means something different
+inside an SHB than inside an EPB).
+
+We model the well-known block types we expect to see in usbmon captures
+(Section Header, Interface Description, Enhanced Packet, Simple Packet,
+Interface Statistics) and fall back to :class:`UnknownBlock` for anything
+else, so callers never lose data.
+
+Error types
+-----------
+All parser-level exceptions inherit from :class:`PcapNgError`, so callers
+that just want to report parse failures can catch a single base class.
 
 References
 ----------
@@ -22,62 +41,211 @@ older Wireshark wiki at https://wiki.wireshark.org/Development/PcapNg.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import BinaryIO, Final
+from dataclasses import dataclass
+from typing import BinaryIO, Final, Literal
 
-from .blocks import (
-    Block,
-    ByteOrder,
-    EnhancedPacketBlock,
-    InterfaceDescriptionBlock,
-    InterfaceStatisticsBlock,
-    Option,
-    SectionHeaderBlock,
-    SimplePacketBlock,
-    UnknownBlock,
-)
-from .errors import (
-    InvalidBlockError,
-    TruncatedFileError,
-    UnsupportedVersionError,
+# ---------------------------------------------------------------------------
+# Public type aliases
+# ---------------------------------------------------------------------------
+
+#: Endianness of a section, established by the byte-order magic in its SHB.
+ByteOrder = Literal["little", "big"]
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+
+class PcapNgError(Exception):
+    """Base class for all pcap-ng parser errors."""
+
+
+class TruncatedFileError(PcapNgError):
+    """Raised when the input stream ends in the middle of a block.
+
+    This is distinct from a clean end-of-stream between blocks, which the
+    reader signals via normal iterator termination (``StopIteration``).
+    """
+
+
+class InvalidBlockError(PcapNgError):
+    """Raised when a block is structurally invalid.
+
+    Examples include: a block-total-length that is not a multiple of 4,
+    a leading and trailing total-length that disagree, an option whose
+    declared length runs off the end of the block, or a Section Header
+    Block with an unrecognized byte-order magic.
+    """
+
+
+class UnsupportedVersionError(PcapNgError):
+    """Raised when a Section Header Block declares a major version we do not support.
+
+    We accept pcap-ng major version 1; any other value raises this.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Block dataclasses
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Option:
+    """A single TLV option from a block's options list.
+
+    Options are stored as raw bytes; the parser deliberately does not try
+    to interpret well-known option codes (e.g. ``opt_comment``) because
+    interpretation depends on which block type the option appears in.
+    """
+
+    code: int
+    value: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class SectionHeaderBlock:
+    """Section Header Block (block type ``0x0A0D0D0A``).
+
+    Marks the start of a section. ``section_length`` is signed: a value of
+    -1 means the writer did not record the length (common for live captures).
+    """
+
+    byte_order: ByteOrder
+    major_version: int
+    minor_version: int
+    section_length: int
+    options: tuple[Option, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class InterfaceDescriptionBlock:
+    """Interface Description Block (block type ``0x00000001``).
+
+    Describes one capture interface. ``link_type`` is the LINKTYPE_*
+    value defined by tcpdump.org; usbmon captures use LINKTYPE_USB_LINUX
+    (189) or LINKTYPE_USB_LINUX_MMAPPED (220).
+    """
+
+    link_type: int
+    snap_len: int
+    options: tuple[Option, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class EnhancedPacketBlock:
+    """Enhanced Packet Block (block type ``0x00000006``).
+
+    The standard form for captured packets in modern pcap-ng files. The
+    timestamp is split into a high and low 32-bit word; the units are
+    determined by the ``if_tsresol`` option of the referenced interface
+    (default: microseconds).
+    """
+
+    interface_id: int
+    timestamp_high: int
+    timestamp_low: int
+    captured_len: int
+    original_len: int
+    packet_data: bytes
+    options: tuple[Option, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SimplePacketBlock:
+    """Simple Packet Block (block type ``0x00000003``).
+
+    A stripped-down packet block with no timestamp and no interface id —
+    it implicitly belongs to interface 0. Rare in usbmon captures but
+    cheap to support.
+    """
+
+    original_len: int
+    packet_data: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class InterfaceStatisticsBlock:
+    """Interface Statistics Block (block type ``0x00000005``).
+
+    Per-interface counters (packets received, dropped, etc.) emitted at
+    capture stop time. The actual statistics live in the options.
+    """
+
+    interface_id: int
+    timestamp_high: int
+    timestamp_low: int
+    options: tuple[Option, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class UnknownBlock:
+    """A block whose type we do not specifically model.
+
+    The body is exposed verbatim (with its trailing total-length stripped)
+    so that callers can implement support for additional block types
+    without modifying the parser.
+    """
+
+    block_type: int
+    body: bytes
+
+
+#: Tagged union of every block type the parser can yield.
+Block = (
+    SectionHeaderBlock
+    | InterfaceDescriptionBlock
+    | EnhancedPacketBlock
+    | SimplePacketBlock
+    | InterfaceStatisticsBlock
+    | UnknownBlock
 )
 
-# --- Block-type identifiers ------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Block-type identifiers
+# ---------------------------------------------------------------------------
 
 #: Section Header Block. The byte sequence ``0a 0d 0d 0a`` is a palindrome,
 #: so we can recognize the SHB before we know the section's byte order.
-BLOCK_TYPE_SHB: Final[int] = 0x0A0D0D0A
-SHB_TYPE_BYTES: Final[bytes] = b"\x0a\x0d\x0d\x0a"
+_BLOCK_TYPE_SHB: Final[int] = 0x0A0D0D0A
+_SHB_TYPE_BYTES: Final[bytes] = b"\x0a\x0d\x0d\x0a"
 
-BLOCK_TYPE_IDB: Final[int] = 0x00000001
-BLOCK_TYPE_SPB: Final[int] = 0x00000003
-BLOCK_TYPE_ISB: Final[int] = 0x00000005
-BLOCK_TYPE_EPB: Final[int] = 0x00000006
+_BLOCK_TYPE_IDB: Final[int] = 0x00000001
+_BLOCK_TYPE_SPB: Final[int] = 0x00000003
+_BLOCK_TYPE_ISB: Final[int] = 0x00000005
+_BLOCK_TYPE_EPB: Final[int] = 0x00000006
 
-# --- Byte-order magic ------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Byte-order magic
+# ---------------------------------------------------------------------------
 
 #: Byte-order magic as it appears on the wire when the section is little-endian.
-BOM_LITTLE: Final[bytes] = b"\x4d\x3c\x2b\x1a"
+_BOM_LITTLE: Final[bytes] = b"\x4d\x3c\x2b\x1a"
 #: Byte-order magic as it appears on the wire when the section is big-endian.
-BOM_BIG: Final[bytes] = b"\x1a\x2b\x3c\x4d"
+_BOM_BIG: Final[bytes] = b"\x1a\x2b\x3c\x4d"
 
-# --- Versions and option marker -------------------------------------------
+# ---------------------------------------------------------------------------
+# Version and option constants
+# ---------------------------------------------------------------------------
 
-SUPPORTED_MAJOR: Final[int] = 1
+_SUPPORTED_MAJOR: Final[int] = 1
 
 #: Option code that terminates an options list (``opt_endofopt``).
-OPT_ENDOFOPT: Final[int] = 0
+_OPT_ENDOFOPT: Final[int] = 0
 
-# --- Minimum block sizes (used for sanity checks) -------------------------
+# ---------------------------------------------------------------------------
+# Minimum block sizes
+# ---------------------------------------------------------------------------
 # Every block has the 12-byte framing: type(4) + length(4) + length(4).
-# The constants below are minimum *body* sizes — i.e. the bytes between
-# the leading and trailing length fields.
+# The constants below are minimum *body* sizes — the bytes between the
+# leading and trailing length fields.
 
-#: Minimum total block size — the 12-byte framing alone, with empty body.
 _MIN_BLOCK_SIZE: Final[int] = 12
 
 # SHB body = BOM(4) + major(2) + minor(2) + section_length(8) = 16 bytes.
 _MIN_SHB_BODY: Final[int] = 16
-#: Minimum total SHB size including framing.
 _MIN_SHB_SIZE: Final[int] = _MIN_BLOCK_SIZE + _MIN_SHB_BODY
 
 # IDB body = link_type(2) + reserved(2) + snap_len(4) = 8 bytes.
@@ -94,12 +262,13 @@ _MIN_SPB_BODY: Final[int] = 4
 _MIN_ISB_BODY: Final[int] = 12
 
 
-def _pad4(n: int) -> int:
-    """Round ``n`` up to the next multiple of 4.
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-    pcap-ng pads variable-length fields (option values, packet data) so
-    that following fields stay 32-bit aligned.
-    """
+
+def _pad4(n: int) -> int:
+    """Round ``n`` up to the next multiple of 4."""
     return (n + 3) & ~3
 
 
@@ -123,7 +292,7 @@ def _parse_options(data: bytes, byte_order: ByteOrder) -> tuple[Option, ...]:
         length = int.from_bytes(data[pos + 2 : pos + 4], byte_order)
         pos += 4
 
-        if code == OPT_ENDOFOPT and length == 0:
+        if code == _OPT_ENDOFOPT and length == 0:
             return tuple(options)
 
         if pos + length > end:
@@ -133,9 +302,12 @@ def _parse_options(data: bytes, byte_order: ByteOrder) -> tuple[Option, ...]:
         options.append(Option(code=code, value=value))
         pos += _pad4(length)
 
-    # No explicit opt_endofopt — that's permitted; reaching the end of the
-    # options buffer is also a valid terminator.
     return tuple(options)
+
+
+# ---------------------------------------------------------------------------
+# Reader
+# ---------------------------------------------------------------------------
 
 
 class PcapNgReader:
@@ -159,9 +331,7 @@ class PcapNgReader:
 
     def __init__(self, stream: BinaryIO) -> None:
         self._stream = stream
-        # Byte order is unknown until we read the first SHB.
         self._byte_order: ByteOrder | None = None
-        # Tracking the byte offset gives us better error messages.
         self._offset = 0
 
     @property
@@ -180,13 +350,12 @@ class PcapNgReader:
     def __next__(self) -> Block:
         type_bytes = self._stream.read(4)
         if len(type_bytes) == 0:
-            # Clean end-of-stream between blocks — done.
             raise StopIteration
         if len(type_bytes) < 4:
             raise TruncatedFileError(f"at offset {self._offset}: truncated block type ({len(type_bytes)} of 4 bytes)")
         self._offset += 4
 
-        if type_bytes == SHB_TYPE_BYTES:
+        if type_bytes == _SHB_TYPE_BYTES:
             return self._read_shb()
 
         if self._byte_order is None:
@@ -195,8 +364,6 @@ class PcapNgReader:
         block_type = int.from_bytes(type_bytes, self._byte_order)
         return self._read_generic_block(block_type)
 
-    # ---------------------------------------------------------------- helpers
-
     def _read_exact(self, n: int) -> bytes:
         """Read exactly ``n`` bytes or raise :class:`TruncatedFileError`."""
         data = self._stream.read(n)
@@ -204,8 +371,6 @@ class PcapNgReader:
             raise TruncatedFileError(f"at offset {self._offset}: expected {n} bytes, got {len(data)}")
         self._offset += n
         return data
-
-    # ---------------------------------------------------------------- SHB
 
     def _read_shb(self) -> SectionHeaderBlock:
         """Read the rest of a Section Header Block.
@@ -216,14 +381,13 @@ class PcapNgReader:
         """
         block_start = self._offset - 4
 
-        # We need the byte-order magic to interpret the total-length field,
-        # so we read the next 8 bytes (length + BOM) and resolve the BOM first.
+        # Read the next 8 bytes (length + BOM) to resolve byte order first.
         head = self._read_exact(8)
         bom = head[4:8]
 
-        if bom == BOM_LITTLE:
+        if bom == _BOM_LITTLE:
             byte_order: ByteOrder = "little"
-        elif bom == BOM_BIG:
+        elif bom == _BOM_BIG:
             byte_order = "big"
         else:
             raise InvalidBlockError(f"at offset {block_start}: invalid byte-order magic {bom.hex()}")
@@ -236,12 +400,11 @@ class PcapNgReader:
         if total_length % 4 != 0:
             raise InvalidBlockError(f"at offset {block_start}: SHB total length {total_length} is not a multiple of 4")
 
-        # We've consumed 4 (type) + 4 (length) + 4 (BOM) = 12 bytes so far.
+        # Consumed: 4 (type) + 4 (length) + 4 (BOM) = 12 bytes so far.
         rest = self._read_exact(total_length - 12)
 
         major = int.from_bytes(rest[0:2], byte_order)
         minor = int.from_bytes(rest[2:4], byte_order)
-        # section_length is signed: -1 means "not specified".
         section_length = int.from_bytes(rest[4:12], byte_order, signed=True)
 
         options_data = rest[12:-4]
@@ -251,11 +414,10 @@ class PcapNgReader:
                 f"at offset {block_start}: SHB trailing length {trailing_length} != leading length {total_length}"
             )
 
-        if major != SUPPORTED_MAJOR:
+        if major != _SUPPORTED_MAJOR:
             raise UnsupportedVersionError(f"at offset {block_start}: unsupported pcap-ng version {major}.{minor}")
 
         options = _parse_options(options_data, byte_order)
-        # The byte order of the new section now applies to subsequent blocks.
         self._byte_order = byte_order
 
         return SectionHeaderBlock(
@@ -265,8 +427,6 @@ class PcapNgReader:
             section_length=section_length,
             options=options,
         )
-
-    # ---------------------------------------------------------------- generic
 
     def _read_generic_block(self, block_type: int) -> Block:
         """Read a non-SHB block.
@@ -290,7 +450,6 @@ class PcapNgReader:
                 f"at offset {block_start}: block total length {total_length} is not a multiple of 4"
             )
 
-        # Body + trailing total-length = total_length - 8.
         body_with_trailer = self._read_exact(total_length - 8)
         body = body_with_trailer[:-4]
         trailing_length = int.from_bytes(body_with_trailer[-4:], byte_order)
@@ -309,33 +468,24 @@ class PcapNgReader:
         block_start: int,
     ) -> Block:
         """Dispatch a validated block body to its type-specific parser."""
-        if block_type == BLOCK_TYPE_IDB:
+        if block_type == _BLOCK_TYPE_IDB:
             return self._parse_idb(body, byte_order, block_start)
-        if block_type == BLOCK_TYPE_EPB:
+        if block_type == _BLOCK_TYPE_EPB:
             return self._parse_epb(body, byte_order, block_start)
-        if block_type == BLOCK_TYPE_SPB:
+        if block_type == _BLOCK_TYPE_SPB:
             return self._parse_spb(body, byte_order, block_start)
-        if block_type == BLOCK_TYPE_ISB:
+        if block_type == _BLOCK_TYPE_ISB:
             return self._parse_isb(body, byte_order, block_start)
         return UnknownBlock(block_type=block_type, body=bytes(body))
-
-    # ---------------------------------------------------------------- IDB
 
     @staticmethod
     def _parse_idb(body: bytes, byte_order: ByteOrder, block_start: int) -> InterfaceDescriptionBlock:
         if len(body) < _MIN_IDB_BODY:
             raise InvalidBlockError(f"at offset {block_start}: IDB body too small ({len(body)} bytes)")
         link_type = int.from_bytes(body[0:2], byte_order)
-        # body[2:4] is reserved; specification says it MUST be ignored.
         snap_len = int.from_bytes(body[4:8], byte_order)
         options = _parse_options(body[8:], byte_order)
-        return InterfaceDescriptionBlock(
-            link_type=link_type,
-            snap_len=snap_len,
-            options=options,
-        )
-
-    # ---------------------------------------------------------------- EPB
+        return InterfaceDescriptionBlock(link_type=link_type, snap_len=snap_len, options=options)
 
     @staticmethod
     def _parse_epb(body: bytes, byte_order: ByteOrder, block_start: int) -> EnhancedPacketBlock:
@@ -371,24 +521,14 @@ class PcapNgReader:
             options=options,
         )
 
-    # ---------------------------------------------------------------- SPB
-
     @staticmethod
     def _parse_spb(body: bytes, byte_order: ByteOrder, block_start: int) -> SimplePacketBlock:
         if len(body) < _MIN_SPB_BODY:
             raise InvalidBlockError(f"at offset {block_start}: SPB body too small ({len(body)} bytes)")
         original_len = int.from_bytes(body[0:4], byte_order)
-        # The SPB does not record a separate captured length: the captured
-        # data simply fills the rest of the body, up to ``original_len``
-        # bytes (the body itself is padded to a multiple of 4).
         captured = min(original_len, len(body) - 4)
         packet_data = bytes(body[4 : 4 + captured])
-        return SimplePacketBlock(
-            original_len=original_len,
-            packet_data=packet_data,
-        )
-
-    # ---------------------------------------------------------------- ISB
+        return SimplePacketBlock(original_len=original_len, packet_data=packet_data)
 
     @staticmethod
     def _parse_isb(body: bytes, byte_order: ByteOrder, block_start: int) -> InterfaceStatisticsBlock:
@@ -404,3 +544,21 @@ class PcapNgReader:
             timestamp_low=timestamp_low,
             options=options,
         )
+
+
+__all__ = [
+    "Block",
+    "ByteOrder",
+    "EnhancedPacketBlock",
+    "InterfaceDescriptionBlock",
+    "InterfaceStatisticsBlock",
+    "InvalidBlockError",
+    "Option",
+    "PcapNgError",
+    "PcapNgReader",
+    "SectionHeaderBlock",
+    "SimplePacketBlock",
+    "TruncatedFileError",
+    "UnknownBlock",
+    "UnsupportedVersionError",
+]

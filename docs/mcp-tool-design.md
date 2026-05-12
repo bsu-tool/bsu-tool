@@ -8,21 +8,18 @@ Goal: inspect a USB capture end to end and produce a concise protocol analysis s
 
 Suggested workflow:
 
-1. Call `load_capture` to load the capture file.
-2. Call `list_devices` to identify candidate devices.
-3. Choose the target device using packet count, endpoints seen, transfer types, and first/last seen packet indexes.
-4. Use `get_packets` to inspect filtered packet-level evidence.
-5. Narrow packet inspection by device, endpoint, direction, transfer type, URB event, and packet index range.
-6. Separate standard enumeration traffic from runtime communication when possible.
-7. Use packet-level evidence to summarize likely device behavior.
-
-If supporting tools are available, they may also be used to inspect endpoint activity, decode control transfers, infer traffic phases, and record analysis markers.
+1. Call `load_capture` with a `.pcapng` path.
+2. Call `list_devices` to identify USB devices in the capture.
+3. Select the target device using `bus_num` / `dev_num`, endpoints seen, packet counts, and any visible descriptor data.
+4. Call `get_packets` with a narrow filter: target device, endpoint, direction, transfer type, URB event, and packet index range.
+5. Separate enumeration traffic from runtime communication when the evidence supports it.
+6. Summarize likely device behavior using packet-level evidence.
 
 Final response should include:
 
 - target device
 - relevant endpoints and transfer types
-- notable packet observations or repeated payload previews
+- notable packets or repeated payload previews
 - likely runtime behavior
 - packet-level evidence
 - uncertainties or missing evidence
@@ -54,17 +51,23 @@ Schemas, field names, and return structures may change as the CLI, parser, and s
 
 ---
 
-## Scope
+## Current Implementation Alignment
 
-This document defines an initial MCP tool interface design for Milestone 2.
+This document separates fields into:
 
-Minimum tools required by the issue:
+- **Minimum**: required for the first MCP implementation pass.
+- **Decoder-backed**: depends on URB decoding work.
+- **Extension**: useful later, but not required for issue #14.
+- **Future**: later planned analysis tools, typically Milestone 3.
+- **Stretch**: optional work beyond the core planned interface.
+
+The minimum contract required by issue #14 is limited to:
 
 - `load_capture`
 - `list_devices`
 - `get_packets`
 
-Candidate supporting tools for the full interface direction:
+Candidate and future supporting tools that show the broader interface direction:
 
 - `mark_session_marker`
 - `list_session_markers`
@@ -73,7 +76,7 @@ Candidate supporting tools for the full interface direction:
 - `infer_traffic_phase`
 - `summarize_device_activity`
 
-Only the minimum tools are required for the first implementation pass. Supporting tools may be revised, deferred, merged, or removed as the parser, CLI, and session model become clearer.
+Fields related to descriptors, transfer type inference, endpoint direction, URB events, setup summaries, traffic phases, and command/response relationships should not be treated as required until the corresponding parser, decoder, or session model work exists.
 
 ---
 
@@ -96,60 +99,71 @@ MCP protocol errors should be reserved for invalid MCP requests, unknown tools, 
 
 ---
 
+## Tool Overview
+
+| Tool | Level | Depends on | Purpose |
+|---|---|---|---|
+| `load_capture` | Minimum | MCP skeleton, `pcap-ng` reader | Load and validate a capture file. |
+| `list_devices` | Minimum | `load_capture`, session model; richer fields depend on URB decoder | List USB devices observed in the capture. |
+| `get_packets` | Minimum | `load_capture`; richer filters and fields depend on URB decoder | Return packet-level evidence with filters. |
+| `mark_session_marker` | Extension | marker system | Save a named marker at a packet index. |
+| `list_session_markers` | Extension | marker system | List saved analysis markers. |
+| `list_endpoints` | Extension | `list_devices` data | Summarize endpoint activity for one device. |
+| `get_control_transfer_details` | Extension | URB decoder | Decode setup fields for a control transfer. |
+| `infer_traffic_phase` | Future | analysis heuristics | Estimate enumeration/runtime regions. |
+| `summarize_device_activity` | Future | packet analysis | Summarize device activity without creating a protocol hypothesis. |
+| `get_packet_sequence` | Future | packet store | Return a continuous packet window. |
+| `find_command_response_pairs` | Future | protocol analysis | Identify likely command/response pairs. |
+| `export_skeleton_code` | Stretch | protocol hypothesis | Generate Python or Rust communication skeleton code. |
+
+---
+
 ## Shared Conventions
 
-### Stable identifiers
+### Identifiers
 
-| Field | Meaning |
-|---|---|
-| `capture_id` | Stable ID for the loaded capture |
-| `device_id` | Stable ID for a discovered USB device |
-| `packet_index` | Capture-order packet index assigned by `bsu-tool` |
-| `urb_id` | Stable ID for a decoded USB Request Block |
-| `endpoint_address` | USB endpoint address, formatted as a hex string such as `0x00`, `0x01`, or `0x81` |
-| `interface_id` | `pcapng` interface identifier used by packet blocks |
-| `section_index` | `pcapng` section index when available |
-| `marker_id` | Stable ID for a saved analysis marker |
+| Field | Type | Level | Meaning |
+|---|---|---|---|
+| `capture_id` | `str` | Minimum | Stable ID for a loaded capture. |
+| `device_id` | `str` | Minimum | Stable ID for an observed USB device. |
+| `packet_index` | `int` | Minimum | Capture-order packet index assigned by `bsu-tool`. |
+| `urb_id` | `str` | Decoder-backed | URB identifier decoded from usbmon packet data. |
+| `endpoint_address` | `str` | Decoder-backed | Hex endpoint address, e.g. `0x00`, `0x01`, `0x81`. |
+| `interface_id` | `int` | Minimum | `pcap-ng` interface ID for packet blocks. |
+| `section_index` | `int` | Extension | `pcap-ng` section index when tracked. |
+| `marker_id` | `str` | Extension | Stable ID for a saved analysis marker. |
 
-For non-control endpoints, `endpoint_address` includes the direction bit, such as `0x01` for OUT and `0x81` for IN.
+`device_id` is a tool/session-level stable identifier derived from the device record.
 
-### Common enums
+Use `bus_num` and `dev_num` for USB topology because those names match the current session model.
+
+### Enums
 
 ```json
 {
-  "direction": ["in", "out"],
-  "transfer_type": ["control", "bulk", "interrupt"],
-  "urb_event": ["submit", "complete", "error"],
+  "direction": ["in", "out", "unknown"],
+  "transfer_type": ["control", "bulk", "interrupt", "unknown"],
+  "urb_event": ["submit", "complete", "error", "unknown"],
   "traffic_phase": ["any", "enumeration", "runtime", "unknown"]
 }
 ```
 
-### `pcapng` traceability fields
-
-The interface should not expose raw parser internals, but packet results should remain traceable to the source capture.
-
-Traceability fields may include:
-
-- `section_count`
-- `interface_count`
-- `interfaces`
-- `section_index`
-- `interface_id`
-- `linktype`
-- `timestamp_resolution`
-- `pcapng_block_type`
-- `pcap_captured_length`
-- `pcap_original_length`
+Output values may use `unknown` when decoded USB fields are not available yet. Input filters do not need to support `unknown` unless explicitly specified.
 
 ### Pagination
 
 List-returning tools should support:
 
-| Field | Default | Maximum |
-|---|---:|---:|
-| `offset` | `0` | — |
-| `limit` | `100` | `1000` |
-| `data_preview_bytes` | `32` | `256` |
+| Field | Type | Default | Maximum |
+|---|---:|---:|---:|
+| `offset` | `int` | `0` | — |
+| `limit` | `int` | `100` | `1000` |
+
+Packet-returning tools may additionally support payload preview controls:
+
+| Field | Type | Default | Maximum |
+|---|---:|---:|---:|
+| `data_preview_bytes` | `int` | `32` | `256` |
 
 ### Standard success shape
 
@@ -207,25 +221,6 @@ Initial error codes:
 - `PAGE_LIMIT_EXCEEDED`
 - `FEATURE_NOT_IMPLEMENTED`
 - `INTERNAL_ERROR`
-
----
-
-## Tool Overview
-
-| Tool | Scope | Purpose |
-|---|---|---|
-| `load_capture` | Minimum design | Load a USB capture into the active analysis session |
-| `list_devices` | Minimum design | List USB devices discovered in the capture |
-| `get_packets` | Minimum design | Return packet-level evidence with filters |
-| `mark_session_marker` | Candidate session support | Save analysis markers or hypotheses |
-| `list_session_markers` | Candidate session support | List saved markers in the active analysis session |
-| `list_endpoints` | Candidate support | Summarize endpoint activity for a selected device |
-| `get_control_transfer_details` | Candidate support | Decode control transfer setup fields |
-| `infer_traffic_phase` | Candidate support | Estimate enumeration/runtime traffic regions |
-| `summarize_device_activity` | Candidate support | Produce a compact activity summary, not a protocol hypothesis |
-| `get_packet_sequence` | Future / Milestone 3 | Return continuous packet sequences |
-| `find_command_response_pairs` | Future / Milestone 3 | Identify likely command/response pairs |
-| `export_skeleton_code` | Stretch goal | Generate communication skeleton code |
 
 ---
 
@@ -301,7 +296,7 @@ Initial error codes:
             "items": { "type": "string" }
           }
         },
-        "required": ["capture_id", "capture_format", "packet_count", "device_count"]
+        "required": ["capture_id", "capture_format", "packet_count"]
       }
     },
     "required": ["ok", "tool_name", "capture_id", "summary", "data"]
@@ -400,8 +395,8 @@ Example `structuredContent.data`:
               "type": "object",
               "properties": {
                 "device_id": { "type": "string" },
-                "bus": { "type": "integer" },
-                "address": { "type": "integer" },
+                "bus_num": { "type": "integer" },
+                "dev_num": { "type": "integer" },
                 "vendor_id": { "type": ["string", "null"] },
                 "product_id": { "type": ["string", "null"] },
                 "manufacturer": { "type": ["string", "null"] },
@@ -419,7 +414,7 @@ Example `structuredContent.data`:
                 "last_seen_index": { "type": "integer" },
                 "descriptor_summary": { "type": ["string", "null"] }
               },
-              "required": ["device_id", "bus", "address", "packet_count", "endpoints_seen", "transfer_types_seen"]
+              "required": ["device_id", "bus_num", "dev_num", "packet_count"]
             }
           }
         },
@@ -445,8 +440,8 @@ Example `structuredContent.data`:
   "devices": [
     {
       "device_id": "dev_01",
-      "bus": 1,
-      "address": 4,
+      "bus_num": 1,
+      "dev_num": 4,
       "vendor_id": "0x1234",
       "product_id": "0xabcd",
       "manufacturer": "Acme",
@@ -534,8 +529,8 @@ Example `structuredContent.data`:
                 "timestamp_us": { "type": "integer" },
                 "urb_id": { "type": "string" },
                 "device_id": { "type": "string" },
-                "bus": { "type": "integer" },
-                "address": { "type": "integer" },
+                "bus_num": { "type": "integer" },
+                "dev_num": { "type": "integer" },
                 "endpoint_address": { "type": "string" },
                 "endpoint_number": { "type": "integer" },
                 "direction": { "type": "string" },
@@ -549,7 +544,7 @@ Example `structuredContent.data`:
                 "data_preview": { "type": ["string", "null"] },
                 "setup_summary": { "type": ["object", "null"] }
               },
-              "required": ["packet_index", "timestamp_us", "urb_id", "device_id", "endpoint_address", "transfer_type", "urb_event"]
+              "required": ["packet_index", "timestamp_us"]
             }
           }
         },
@@ -571,7 +566,6 @@ get_packets(
     direction="in",
     transfer_type="bulk",
     urb_event="complete",
-    traffic_phase="runtime",
     offset=0,
     limit=100,
     include_data_preview=True,
@@ -592,8 +586,8 @@ Example `structuredContent.data`:
       "timestamp_us": 421231,
       "urb_id": "urb_7f2b0010",
       "device_id": "dev_01",
-      "bus": 1,
-      "address": 4,
+      "bus_num": 1,
+      "dev_num": 4,
       "endpoint_address": "0x81",
       "endpoint_number": 1,
       "direction": "in",
@@ -619,30 +613,34 @@ The following tools are included to show the intended full interface direction. 
 
 ## `mark_session_marker`
 
-Status: Candidate session support.
+Status: Extension.
 
-Purpose: save an analysis marker, observation, or hypothesis in the active session.
+Purpose: save a named analysis marker at a packet index in the active session.
 
-Likely inputs:
+Likely minimum inputs aligned with the current marker issue:
 
 - `capture_id`
 - `name`
 - `packet_index`
+- `note`
+
+Possible extension inputs:
+
 - `timestamp_us`
 - `device_id`
-- `description`
 - `tags`
 
-At least one of `packet_index`, `timestamp_us`, or `device_id` should be provided when possible.
+Likely minimum output:
 
-Likely output:
-
-- `marker_id`
 - `name`
 - `packet_index`
+- `note`
+
+Possible extension output:
+
+- `marker_id`
 - `timestamp_us`
 - `device_id`
-- `description`
 - `tags`
 
 Example usage:
@@ -651,9 +649,7 @@ Example usage:
 mark_session_marker(
     name="suspected_runtime_loop",
     packet_index=421,
-    device_id="dev_01",
-    description="Possible start of repeated runtime communication.",
-    tags=["hypothesis", "runtime"]
+    note="Possible start of repeated runtime communication."
 )
 ```
 
@@ -661,19 +657,22 @@ mark_session_marker(
 
 ## `list_session_markers`
 
-Status: Candidate session support.
+Status: Extension.
 
 Purpose: list saved markers in the active analysis session.
 
-Likely inputs:
+Likely minimum inputs:
 
 - `capture_id`
+- `offset`
+- `limit`
+
+Possible extension filters:
+
 - `device_id`
 - `tag`
 - `packet_index_min`
 - `packet_index_max`
-- `offset`
-- `limit`
 
 Likely output:
 
@@ -684,8 +683,6 @@ Example usage:
 
 ```python
 list_session_markers(
-    device_id="dev_01",
-    tag="runtime",
     offset=0,
     limit=100
 )
@@ -695,7 +692,7 @@ list_session_markers(
 
 ## `list_endpoints`
 
-Status: Candidate support.
+Status: Extension.
 
 Purpose: summarize endpoint activity for a selected device.
 
@@ -731,7 +728,7 @@ list_endpoints(
 
 ## `get_control_transfer_details`
 
-Status: Candidate support.
+Status: Extension.
 
 Purpose: decode a control transfer setup packet into structured fields.
 
@@ -768,7 +765,7 @@ get_control_transfer_details(
 
 ## `infer_traffic_phase`
 
-Status: Candidate support.
+Status: Future.
 
 Purpose: provide a best-effort heuristic estimate of enumeration and runtime traffic regions for a selected device.
 
@@ -801,7 +798,7 @@ infer_traffic_phase(
 
 ## `summarize_device_activity`
 
-Status: Candidate support.
+Status: Future.
 
 Purpose: return a compact activity summary for one device.
 
@@ -910,7 +907,7 @@ Likely output:
 
 # Example Analysis Workflow
 
-## Minimum first-pass workflow
+## Core analysis workflow once decoder-backed fields are available
 
 ```python
 load_capture(path="/captures/device_trace.pcapng")
@@ -966,7 +963,7 @@ mark_session_marker(
     name="suspected_runtime_loop",
     packet_index=421,
     device_id="dev_01",
-    description="Possible start of repeated runtime communication.",
+    note="Possible start of repeated runtime communication.",
     tags=["hypothesis", "runtime"]
 )
 

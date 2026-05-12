@@ -6,7 +6,7 @@ separate module so the two layers can be tested independently.
 
 Typical use::
 
-    from bsu_tool.parser import PcapNgReader, EnhancedPacketBlock
+    from pcapng.parser import PcapNgReader, EnhancedPacketBlock
 
     with open("capture.pcapng", "rb") as fp:
         for block in PcapNgReader(fp):

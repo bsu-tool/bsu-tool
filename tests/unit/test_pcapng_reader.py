@@ -18,7 +18,7 @@ from typing import Literal
 
 import pytest
 
-from bsu_tool.pcapng import (
+from bsu_tool.pcapng_reader import (
     EnhancedPacketBlock,
     InterfaceDescriptionBlock,
     InterfaceStatisticsBlock,

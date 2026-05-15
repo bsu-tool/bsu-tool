@@ -15,7 +15,7 @@ class LoadCaptureResult:
     """Returned by `load_capture` so Claude knows what landed in the session."""
 
     source: str
-    urb_count: int
+    packet_count: int
     marker_count: int
 
 
@@ -32,6 +32,6 @@ def register(mcp: FastMCP, session: Session) -> None:
         capture = session.load(Path(path))
         return LoadCaptureResult(
             source=str(capture.source),
-            urb_count=len(capture.urbs),
+            packet_count=len(capture.urbs),
             marker_count=len(capture.markers),
         )

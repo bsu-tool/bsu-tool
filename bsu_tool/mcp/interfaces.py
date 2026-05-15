@@ -21,8 +21,8 @@ class RawPacket:
     """A single USB packet record from the pcap-ng reader."""
 
     timestamp: float
-    bus: int
-    device: int
+    bus_num: int
+    dev_num: int
     endpoint: int
     direction: Direction
     transfer_type: TransferType
@@ -38,8 +38,8 @@ class Urb:
     """A decoded USB Request Block."""
 
     timestamp: float
-    bus: int
-    device: int
+    bus_num: int
+    dev_num: int
     endpoint: int
     direction: Direction
     transfer_type: TransferType
@@ -73,8 +73,8 @@ class StubPcapReader:
         """Yield three canned packets: a control request/response and a bulk read."""
         yield RawPacket(
             timestamp=0.000,
-            bus=1,
-            device=4,
+            bus_num=1,
+            dev_num=4,
             endpoint=0,
             direction="out",
             transfer_type="control",
@@ -82,8 +82,8 @@ class StubPcapReader:
         )
         yield RawPacket(
             timestamp=0.001,
-            bus=1,
-            device=4,
+            bus_num=1,
+            dev_num=4,
             endpoint=0,
             direction="in",
             transfer_type="control",
@@ -91,8 +91,8 @@ class StubPcapReader:
         )
         yield RawPacket(
             timestamp=0.010,
-            bus=1,
-            device=4,
+            bus_num=1,
+            dev_num=4,
             endpoint=1,
             direction="in",
             transfer_type="bulk",
@@ -108,8 +108,8 @@ class StubUrbDecoder:
         is_setup = raw.transfer_type == "control" and raw.direction == "out"
         return Urb(
             timestamp=raw.timestamp,
-            bus=raw.bus,
-            device=raw.device,
+            bus_num=raw.bus_num,
+            dev_num=raw.dev_num,
             endpoint=raw.endpoint,
             direction=raw.direction,
             transfer_type=raw.transfer_type,

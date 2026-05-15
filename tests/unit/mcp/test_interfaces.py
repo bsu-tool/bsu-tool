@@ -25,6 +25,8 @@ def test_stub_pcap_reader_yields_three_packets() -> None:
     """StubPcapReader yields the canned three-packet sequence."""
     packets = list(StubPcapReader().read(Path("ignored")))
     assert len(packets) == 3
+    assert packets[0].bus_num == 1
+    assert packets[0].dev_num == 4
 
 
 def test_stub_urb_decoder_handles_control_setup() -> None:
@@ -32,6 +34,8 @@ def test_stub_urb_decoder_handles_control_setup() -> None:
     first = next(iter(StubPcapReader().read(Path("ignored"))))
     urb = StubUrbDecoder().decode(first)
     assert isinstance(urb, Urb)
+    assert urb.bus_num == first.bus_num
+    assert urb.dev_num == first.dev_num
     assert urb.setup == first.payload
     assert urb.data == b""
 

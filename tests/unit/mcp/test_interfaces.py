@@ -1,48 +1,45 @@
-"""Tests for the MCP interfaces module — Protocols and stubs."""
+"""Tests for MCP typed capture models."""
 
-from pathlib import Path
-
-from bsu_tool.mcp.interfaces import (
-    PcapReader,
-    StubPcapReader,
-    StubUrbDecoder,
-    Urb,
-    UrbDecoder,
-)
+from bsu_tool.mcp.interfaces import CaptureInterface, CaptureMetadata, CapturePacket
 
 
-def test_stub_pcap_reader_satisfies_protocol() -> None:
-    """StubPcapReader matches the PcapReader Protocol at runtime."""
-    assert isinstance(StubPcapReader(), PcapReader)
+def test_capture_metadata_contains_load_capture_fields() -> None:
+    """CaptureMetadata carries the Issue #15 load_capture result fields."""
+    interface = CaptureInterface(
+        interface_id=0,
+        link_type=189,
+        snap_len=65535,
+        timestamp_resolution_seconds=0.000001,
+    )
+    metadata = CaptureMetadata(
+        source="/tmp/example.pcapng",
+        file_size_bytes=128,
+        packet_count=2,
+        capture_duration_seconds=0.25,
+        interfaces_seen=(interface,),
+    )
+
+    assert metadata.source == "/tmp/example.pcapng"
+    assert metadata.file_size_bytes == 128
+    assert metadata.packet_count == 2
+    assert metadata.capture_duration_seconds == 0.25
+    assert metadata.interfaces_seen == (interface,)
 
 
-def test_stub_urb_decoder_satisfies_protocol() -> None:
-    """StubUrbDecoder matches the UrbDecoder Protocol at runtime."""
-    assert isinstance(StubUrbDecoder(), UrbDecoder)
+def test_capture_packet_retains_packet_block_bytes() -> None:
+    """CapturePacket stores raw packet bytes without USB semantic decoding."""
+    packet = CapturePacket(
+        interface_id=0,
+        link_type=189,
+        pcap_timestamp_seconds=1.0,
+        pcap_captured_length=3,
+        pcap_original_length=4,
+        packet_data=b"abc",
+    )
 
-
-def test_stub_pcap_reader_yields_three_packets() -> None:
-    """StubPcapReader yields the canned three-packet sequence."""
-    packets = list(StubPcapReader().read(Path("ignored")))
-    assert len(packets) == 3
-    assert packets[0].bus_num == 1
-    assert packets[0].dev_num == 4
-
-
-def test_stub_urb_decoder_handles_control_setup() -> None:
-    """Control-out packets become URBs with setup bytes and empty data."""
-    first = next(iter(StubPcapReader().read(Path("ignored"))))
-    urb = StubUrbDecoder().decode(first)
-    assert isinstance(urb, Urb)
-    assert urb.bus_num == first.bus_num
-    assert urb.dev_num == first.dev_num
-    assert urb.setup == first.payload
-    assert urb.data == b""
-
-
-def test_stub_urb_decoder_handles_bulk_in() -> None:
-    """Bulk-in packets become URBs with no setup and the payload as data."""
-    bulk = list(StubPcapReader().read(Path("ignored")))[2]
-    urb = StubUrbDecoder().decode(bulk)
-    assert urb.setup is None
-    assert urb.data == bulk.payload
+    assert packet.interface_id == 0
+    assert packet.link_type == 189
+    assert packet.pcap_timestamp_seconds == 1.0
+    assert packet.pcap_captured_length == 3
+    assert packet.pcap_original_length == 4
+    assert packet.packet_data == b"abc"

@@ -315,6 +315,38 @@ def test_unknown_transfer_type_byte_raises() -> None:
         decode_urb(_packet(h), LINKTYPE_USB_LINUX)
 
 
+def test_captured_length_exceeds_available_data_raises() -> None:
+    # The usbmon header's captured_length is a separate claim from the pcap-ng
+    # block's own captured_len. The two can disagree when a capture is taken
+    # with a pcap-ng snaplen shorter than the data phase: pcap-ng truncates
+    # the payload but the inner usbmon header is not rewritten. Without the
+    # check, Python's forgiving slice semantics would silently return a short
+    # buffer instead of surfacing the inconsistency.
+    payload = b"\xab" * 36
+    h = _hdr(xfer=_BULK, event=_C, epnum=0x81, length=200, captured_length=200)
+    with pytest.raises(MalformedUsbmonHeaderError, match="captured_length"):
+        decode_urb(_packet(h, data=payload), LINKTYPE_USB_LINUX)
+
+
+def test_captured_length_exceeds_available_data_mmapped_raises() -> None:
+    # Same check, applied to the 64-byte mmapped header layout.
+    payload = b"\xab" * 36
+    h = _hdr(xfer=_BULK, event=_C, epnum=0x81, length=200, captured_length=200)
+    with pytest.raises(MalformedUsbmonHeaderError, match="captured_length"):
+        decode_urb(
+            _packet(h, LINKTYPE_USB_LINUX_MMAPPED, data=payload),
+            LINKTYPE_USB_LINUX_MMAPPED,
+        )
+
+
+def test_captured_length_exceeds_available_data_off_by_one_raises() -> None:
+    # Boundary case: header claims one more byte than is actually present.
+    payload = b"\xab" * 36
+    h = _hdr(xfer=_BULK, event=_C, epnum=0x81, length=37, captured_length=37)
+    with pytest.raises(MalformedUsbmonHeaderError, match="captured_length"):
+        decode_urb(_packet(h, data=payload), LINKTYPE_USB_LINUX)
+
+
 # --- UnsupportedTransferTypeError tests --------------------------------------
 
 

@@ -253,7 +253,13 @@ def decode_urb(packet_data: bytes, link_type: int) -> UrbRecord:
 
     setup: bytes | None = setup_bytes if transfer_type == "control" and flag_setup == _FLAG_SETUP_PRESENT else None
 
-    data = packet_data[header_size : header_size + captured_length]
+    data_end = header_size + captured_length
+    if data_end > len(packet_data):
+        raise MalformedUsbmonHeaderError(
+            f"usbmon header declares captured_length={captured_length} "
+            f"but only {len(packet_data) - header_size} data bytes are available"
+        )
+    data = packet_data[header_size:data_end]
 
     return UrbRecord(
         urb_id=urb_id,

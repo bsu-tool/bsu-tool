@@ -14,6 +14,7 @@ in tests/int/ once we have reference captures from the hardware.
 from __future__ import annotations
 
 import io
+import pathlib
 from typing import Literal
 
 import pytest
@@ -449,3 +450,84 @@ def test_isb_body_too_small() -> None:
     data = _build_shb("little") + bad
     with pytest.raises(InvalidBlockError, match="ISB body too small"):
         list(PcapNgReader(io.BytesIO(data)))
+
+
+# --- Tests: real capture file (goodix_enroll_sanitized.pcapng) ------------
+
+# LINKTYPE_USB_LINUX_MMAPPED as seen in usbmon captures from modern kernels.
+_LINKTYPE_USB_LINUX_MMAPPED = 220
+
+_CAPTURE_SANITIZED = (
+    pathlib.Path(__file__).parent.parent.parent / "test_data" / "captures" / "goodix_enroll_sanitized.pcapng"
+)
+
+
+@pytest.fixture
+def goodix_sanitized_blocks() -> list[object]:
+    """Return all blocks from the sanitized Goodix capture."""
+    from bsu_tool.pcapng_reader import PcapNgReader
+
+    with _CAPTURE_SANITIZED.open("rb") as fp:
+        return list(PcapNgReader(fp))
+
+
+def test_goodix_sanitized_capture_file_exists() -> None:
+    """Sanity-check that the sanitized capture file is present in the repository."""
+    assert _CAPTURE_SANITIZED.is_file(), f"capture not found: {_CAPTURE_SANITIZED}"
+
+
+def test_goodix_sanitized_parses_without_error() -> None:
+    """The sanitized capture file must parse completely without raising any exception."""
+    from bsu_tool.pcapng_reader import PcapNgReader
+
+    with _CAPTURE_SANITIZED.open("rb") as fp:
+        list(PcapNgReader(fp))  # must not raise
+
+
+def test_goodix_sanitized_block_sequence(goodix_sanitized_blocks: list[object]) -> None:
+    """The sanitized capture contains exactly: 1 SHB, 1 IDB, 30 EPBs, 1 ISB."""
+    from bsu_tool.pcapng_reader import InterfaceStatisticsBlock
+
+    shbs = [b for b in goodix_sanitized_blocks if isinstance(b, SectionHeaderBlock)]
+    idbs = [b for b in goodix_sanitized_blocks if isinstance(b, InterfaceDescriptionBlock)]
+    epbs = [b for b in goodix_sanitized_blocks if isinstance(b, EnhancedPacketBlock)]
+    isbs = [b for b in goodix_sanitized_blocks if isinstance(b, InterfaceStatisticsBlock)]
+
+    assert len(shbs) == 1
+    assert len(idbs) == 1
+    assert len(epbs) == 30
+    assert len(isbs) == 1
+
+
+def test_goodix_sanitized_shb(goodix_sanitized_blocks: list[object]) -> None:
+    """The SHB is little-endian, version 1.0, with all three options redacted."""
+    shb = goodix_sanitized_blocks[0]
+    assert isinstance(shb, SectionHeaderBlock)
+    assert shb.byte_order == "little"
+    assert shb.major_version == 1
+    assert shb.minor_version == 0
+    assert shb.section_length == -1
+    assert len(shb.options) == 3
+    for opt in shb.options:
+        assert opt.value == b"[redacted]"
+
+
+def test_goodix_sanitized_idb(goodix_sanitized_blocks: list[object]) -> None:
+    """The IDB describes a usbmon interface with LINKTYPE_USB_LINUX_MMAPPED."""
+    idb = goodix_sanitized_blocks[1]
+    assert isinstance(idb, InterfaceDescriptionBlock)
+    assert idb.link_type == _LINKTYPE_USB_LINUX_MMAPPED
+    name_opts = [opt for opt in idb.options if opt.code == 2]
+    assert name_opts, "IDB missing if_name option"
+    assert name_opts[0].value == b"usbmon1"
+
+
+def test_goodix_sanitized_epbs(goodix_sanitized_blocks: list[object]) -> None:
+    """All EPBs belong to interface 0 and have consistent captured/original lengths."""
+    epbs = [b for b in goodix_sanitized_blocks if isinstance(b, EnhancedPacketBlock)]
+    assert epbs
+    for epb in epbs:
+        assert epb.interface_id == 0
+        assert epb.captured_len == epb.original_len, "unexpected truncation"
+        assert len(epb.packet_data) == epb.captured_len
+        assert epb.captured_len > 0

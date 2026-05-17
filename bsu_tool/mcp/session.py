@@ -15,6 +15,13 @@ from bsu_tool.pcapng_reader import (
     SectionHeaderBlock,
     SimplePacketBlock,
 )
+from bsu_tool.urb_decoder import (
+    UnsupportedTransferTypeError,
+    UrbRecord,
+    UrbTransaction,
+    decode_urb,
+    pair_urbs,
+)
 
 _PCAPNG_SUFFIX: Final[str] = ".pcapng"
 _IF_TSRESOL_OPTION: Final[int] = 9
@@ -43,6 +50,8 @@ class Capture:
     source: Path
     metadata: CaptureMetadata
     packets: tuple[CapturePacket, ...]
+    records: tuple[UrbRecord, ...]
+    transactions: tuple[UrbTransaction, ...]
     markers: list[Marker] = field(default_factory=_empty_markers)
 
 
@@ -88,7 +97,14 @@ class Session:
             capture_duration_seconds=_capture_duration(packet_timestamps),
             interfaces_seen=tuple(interfaces_seen),
         )
-        self.capture = Capture(source=source, metadata=metadata, packets=tuple(packets))
+        records = _decode_supported_packets(packets)
+        self.capture = Capture(
+            source=source,
+            metadata=metadata,
+            packets=tuple(packets),
+            records=records,
+            transactions=tuple(pair_urbs(records)),
+        )
         return self.capture
 
     def add_marker(self, name: str, timestamp: float, note: str | None = None) -> Marker:
@@ -177,3 +193,13 @@ def _capture_duration(timestamps: list[float]) -> float | None:
     if not timestamps:
         return None
     return max(timestamps) - min(timestamps)
+
+
+def _decode_supported_packets(packets: list[CapturePacket]) -> tuple[UrbRecord, ...]:
+    records: list[UrbRecord] = []
+    for packet in packets:
+        try:
+            records.append(decode_urb(packet.packet_data, packet.link_type))
+        except UnsupportedTransferTypeError:
+            continue
+    return tuple(records)

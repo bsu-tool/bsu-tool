@@ -1,10 +1,17 @@
 """Tests for the MCP session container."""
 
+import struct
 from pathlib import Path
 
 import pytest
 
 from bsu_tool.mcp.session import Marker, Session
+
+_USBMON_HEADER_FORMAT = "<QBBBBHBBqiiII8s"
+_SUBMISSION = 0x53
+_COMPLETION = 0x43
+_BULK = 3
+_INTERRUPT = 1
 
 
 def _pad4(data: bytes) -> bytes:
@@ -53,13 +60,44 @@ def _build_epb(*, timestamp_low: int, packet_data: bytes, interface_id: int = 0)
     return _wrap(0x00000006, body)
 
 
-def _capture_bytes() -> bytes:
-    return (
-        _build_shb()
-        + _build_idb(snap_len=64)
-        + _build_epb(timestamp_low=1_000_000, packet_data=b"a")
-        + _build_epb(timestamp_low=1_250_000, packet_data=b"bc")
+def _usbmon_packet(
+    *,
+    urb_id: int = 1,
+    event: int = _SUBMISSION,
+    transfer_type: int = _BULK,
+    endpoint: int = 0x01,
+    data: bytes = b"",
+) -> bytes:
+    header = struct.pack(
+        _USBMON_HEADER_FORMAT,
+        urb_id,
+        event,
+        transfer_type,
+        endpoint,
+        4,
+        1,
+        0,
+        0,
+        100,
+        0,
+        0,
+        len(data),
+        len(data),
+        b"\x00" * 8,
     )
+    return header + data
+
+
+def _capture_bytes(packet_data: tuple[bytes, ...] | None = None) -> bytes:
+    if packet_data is None:
+        packet_data = (
+            _usbmon_packet(event=_SUBMISSION, endpoint=0x01, data=b"a"),
+            _usbmon_packet(event=_COMPLETION, endpoint=0x81, data=b"bc"),
+        )
+    data = _build_shb() + _build_idb(snap_len=64)
+    for index, packet in enumerate(packet_data):
+        data += _build_epb(timestamp_low=1_000_000 + index * 250_000, packet_data=packet)
+    return data
 
 
 def _write_capture(tmp_path: Path, name: str = "capture.pcapng") -> Path:
@@ -88,9 +126,13 @@ def test_load_reads_pcapng_metadata(tmp_path: Path) -> None:
     assert capture.metadata.interfaces_seen[0].snap_len == 64
     assert len(capture.packets) == 2
     assert capture.packets[0].link_type == 189
-    assert capture.packets[0].packet_data == b"a"
+    assert capture.packets[0].packet_data.endswith(b"a")
     assert capture.packets[1].pcap_timestamp_seconds is not None
     assert abs(capture.packets[1].pcap_timestamp_seconds - 1.25) < 0.000001
+    assert len(capture.records) == 2
+    assert capture.records[0].bus_num == 1
+    assert capture.records[0].dev_num == 4
+    assert len(capture.transactions) == 1
 
 
 def test_load_replaces_previous_capture(tmp_path: Path) -> None:
@@ -116,6 +158,18 @@ def test_load_rejects_missing_file(tmp_path: Path) -> None:
     """Session.load raises FileNotFoundError for a missing pcap-ng file."""
     with pytest.raises(FileNotFoundError):
         Session().load(tmp_path / "missing.pcapng")
+
+
+def test_load_skips_unsupported_transfers(tmp_path: Path) -> None:
+    """Session.load keeps metadata while skipping unsupported decoded records."""
+    path = tmp_path / "interrupt.pcapng"
+    path.write_bytes(_capture_bytes((_usbmon_packet(transfer_type=_INTERRUPT),)))
+
+    capture = Session().load(path)
+
+    assert capture.metadata.packet_count == 1
+    assert len(capture.records) == 0
+    assert len(capture.transactions) == 0
 
 
 def test_add_marker_requires_loaded_capture() -> None:

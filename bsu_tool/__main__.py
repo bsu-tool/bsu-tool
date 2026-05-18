@@ -13,7 +13,7 @@ from bsu_tool.pcapng_reader import (
     PcapNgError,
     PcapNgReader,
 )
-from bsu_tool.session import CaptureSession, USBDevice
+from bsu_tool.session import CaptureSession, USBDevice, USBEndpoint
 
 # ---------------------------------------------------------------------------
 # Link-layer type constants
@@ -68,8 +68,8 @@ def _parse_session(path: Path) -> CaptureSession:
         ValueError: If the link-layer type is not a supported usbmon type.
 
     """
-    # (bus_num, dev_num) -> set of endpoint numbers seen
-    devices: dict[tuple[int, int], set[int]] = {}
+    # (bus_num, dev_num) -> {endpoint -> packet_count}
+    devices: dict[tuple[int, int], dict[int, int]] = {}
     packet_count: int = 0
     link_type: int | None = None
 
@@ -98,11 +98,21 @@ def _parse_session(path: Path) -> CaptureSession:
                     )
                     key = (bus_num, dev_num)
                     if key not in devices:
-                        devices[key] = set()
-                    devices[key].add(endpoint)
+                        devices[key] = {}
+                    devices[key][endpoint] = devices[key].get(endpoint, 0) + 1
 
-    usb_devices = [USBDevice(bus_num=k[0], dev_num=k[1], endpoints=sorted(v)) for k, v in sorted(devices.items())]
-
+    usb_devices = [
+        USBDevice(
+            bus_num=k[0],
+            dev_num=k[1],
+            endpoints=[
+                USBEndpoint(number=ep, packet_count=count)
+                for ep, count in sorted(v.items())
+            ],
+        )
+        for k, v in sorted(devices.items())
+    ]
+    
     return CaptureSession(
         filepath=str(path),
         devices=usb_devices,
@@ -136,7 +146,7 @@ def _print_session(session: CaptureSession) -> None:
         print(f"  Device {device.bus_num:03d}:{device.dev_num:03d}")
         if device.endpoints:
             for ep in device.endpoints:
-                print(f"    Endpoint 0x{ep:02X}")
+                print(f"    Endpoint 0x{ep.number:02X}  ({ep.packet_count} packets)")
         else:
             print("    No endpoints observed.")
         print()

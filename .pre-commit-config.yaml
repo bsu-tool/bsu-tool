@@ -12,5 +12,4 @@ repos:
       - id: pyright
         additional_dependencies:
           - "mcp>=1.0"
-        additional_dependencies: 
           - "pytest>=8.0"

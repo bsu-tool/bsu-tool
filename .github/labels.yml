@@ -37,3 +37,15 @@
 - name: milestone-4
   color: "b4befe"
   description: "Milestone 4 — Polish + Delivery (Weeks 16-20)"
+
+- name: low-prio
+  color: "eed49f"
+  description: "Low Priority"
+  
+- name: med-prio
+  color: "f5a97f"
+  description: "Medium Priority"
+  
+- name: high-prio
+  color: "ed8796"
+  description: "High Priority"

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "bsu-tool": {
+      "command": ".venv/Scripts/bsu-tool.exe",
+      "args": ["mcp"]
+    }
+  }
+}

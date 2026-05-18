@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Behavioral Sleuth for USB — CLI tool and MCP server for USB protocol analysis"
 requires-python = ">=3.11"
 license = "MIT OR Apache-2.0"
-dependencies = []
+dependencies = ["mcp>=1.0"]
 
 [tool.setuptools.packages.find]
 include = ["bsu_tool*"]
@@ -17,7 +17,7 @@ dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
     "pyright>=1.1",
-    "ruff>=0.4",
+    "ruff>=0.15",
     "pre-commit>=3.0",
 ]
 
@@ -31,6 +31,9 @@ omit = ["bsu_tool/__main__.py"]
 
 [tool.coverage.report]
 show_missing = true
+
+[tool.ruff]
+line-length = 120
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "ANN"]

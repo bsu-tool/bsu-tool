@@ -69,10 +69,28 @@ fi
 
 # ── OS detect ────────────────────────────────────────────────────────────────
 case "$(uname -s)" in
-    Darwin*|Linux*)      ACTIVATE=".venv/bin/activate" ;;
-    MINGW*|MSYS*|CYGWIN*) ACTIVATE=".venv/Scripts/activate" ;;
+    Darwin*|Linux*)
+        ACTIVATE=".venv/bin/activate"
+        VENV_PYTHONS=(".venv/bin/python")
+        ;;
+    MINGW*|MSYS*|CYGWIN*)
+        ACTIVATE=".venv/Scripts/activate"
+        VENV_PYTHONS=(".venv/Scripts/python.exe" ".venv/Scripts/python")
+        ;;
     *) fail "Unsupported OS: $(uname -s)" ;;
 esac
+
+VENV_PYTHON=""
+find_venv_python() {
+    VENV_PYTHON=""
+    for candidate in "${VENV_PYTHONS[@]}"; do
+        if [[ -f "$candidate" ]]; then
+            VENV_PYTHON="$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
 
 # ── Virtual environment ───────────────────────────────────────────────────────
 if [[ -d ".venv" ]]; then
@@ -81,18 +99,7 @@ if [[ -d ".venv" ]]; then
         rm -rf .venv
     else
         # Validate existing venv by checking its Python binary exists
-        VENV_PYTHONS=(".venv/bin/python")
-        if [[ "$ACTIVATE" == *Scripts* ]]; then
-            VENV_PYTHONS=(".venv/Scripts/python.exe" ".venv/Scripts/python")
-        fi
-        VENV_HEALTHY=0
-        for VENV_PYTHON in "${VENV_PYTHONS[@]}"; do
-            if [[ -f "$VENV_PYTHON" ]]; then
-                VENV_HEALTHY=1
-                break
-            fi
-        done
-        if [[ "$VENV_HEALTHY" -eq 0 ]]; then
+        if ! find_venv_python; then
             warn ".venv exists but appears corrupted (no Python binary). Recreating..."
             rm -rf .venv
         else
@@ -107,22 +114,24 @@ if [[ ! -d ".venv" ]]; then
     ok "Virtual environment created."
 fi
 
+find_venv_python || fail ".venv was created but no Python binary was found."
+
 # shellcheck source=/dev/null
 source "$ACTIVATE"
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
 info "Upgrading pip..."
-pip install --quiet --upgrade pip
+"$VENV_PYTHON" -m pip install --quiet --upgrade pip
 
 info "Installing package + dev dependencies..."
-pip install -e ".[dev]"
+"$VENV_PYTHON" -m pip install -e ".[dev]"
 ok "Dependencies installed."
 
 # ── Pre-commit ────────────────────────────────────────────────────────────────
 if [[ ! -d ".git" ]]; then
     warn "No .git directory found — skipping pre-commit install (not a git repo)."
-elif command -v pre-commit &>/dev/null; then
-    pre-commit install
+elif "$VENV_PYTHON" -m pre_commit --version &>/dev/null; then
+    "$VENV_PYTHON" -m pre_commit install
     ok "Pre-commit hooks installed."
 else
     warn "pre-commit not found after install — check [project.optional-dependencies] dev in pyproject.toml"
@@ -138,7 +147,7 @@ fi
 
 # ── Smoke test ────────────────────────────────────────────────────────────────
 info "Verifying install..."
-if python -c "import bsu_tool" 2>/dev/null; then
+if "$VENV_PYTHON" -c "import bsu_tool" 2>/dev/null; then
     ok "bsu_tool imports successfully."
 else
     warn "Could not import bsu_tool — package may not have installed correctly."

@@ -6,10 +6,12 @@ from pathlib import Path
 import pytest
 
 from bsu_tool.mcp.session import Marker, Session
+from bsu_tool.pcapng_reader import PcapNgError
 
 _USBMON_HEADER_FORMAT = "<QBBBBHBBqiiII8s"
 _SUBMISSION = 0x53
 _COMPLETION = 0x43
+_CONTROL = 2
 _BULK = 3
 _INTERRUPT = 1
 
@@ -66,6 +68,10 @@ def _usbmon_packet(
     event: int = _SUBMISSION,
     transfer_type: int = _BULK,
     endpoint: int = 0x01,
+    dev_num: int = 4,
+    bus_num: int = 1,
+    flag_setup: int = 0,
+    setup: bytes = b"\x00" * 8,
     data: bytes = b"",
 ) -> bytes:
     header = struct.pack(
@@ -74,18 +80,52 @@ def _usbmon_packet(
         event,
         transfer_type,
         endpoint,
-        4,
-        1,
-        0,
+        dev_num,
+        bus_num,
+        flag_setup,
         0,
         100,
         0,
         0,
         len(data),
         len(data),
-        b"\x00" * 8,
+        setup,
     )
     return header + data
+
+
+def _get_descriptor_setup(descriptor_type: int, descriptor_index: int, length: int) -> bytes:
+    return bytes((0x80, 0x06, descriptor_index, descriptor_type, 0x09, 0x04, length & 0xFF, length >> 8))
+
+
+def _device_descriptor(*, vendor_id: int, product_id: int, manufacturer_index: int, product_index: int) -> bytes:
+    return bytes(
+        (
+            18,
+            1,
+            0,
+            2,
+            0xFF,
+            0,
+            0,
+            64,
+            vendor_id & 0xFF,
+            vendor_id >> 8,
+            product_id & 0xFF,
+            product_id >> 8,
+            0,
+            1,
+            manufacturer_index,
+            product_index,
+            0,
+            1,
+        )
+    )
+
+
+def _string_descriptor(value: str) -> bytes:
+    payload = value.encode("utf-16-le")
+    return bytes((len(payload) + 2, 3)) + payload
 
 
 def _capture_bytes(packet_data: tuple[bytes, ...] | None = None) -> bytes:
@@ -160,6 +200,32 @@ def test_load_rejects_missing_file(tmp_path: Path) -> None:
         Session().load(tmp_path / "missing.pcapng")
 
 
+def test_load_rejects_malformed_pcapng_without_replacing_capture(tmp_path: Path) -> None:
+    """Session.load leaves the active capture untouched when parsing fails."""
+    session = Session()
+    first = session.load(_write_capture(tmp_path, "first.pcapng"))
+    malformed = tmp_path / "malformed.pcapng"
+    malformed.write_bytes(b"nope")
+
+    with pytest.raises(PcapNgError):
+        session.load(malformed)
+
+    assert session.capture is first
+
+
+def test_load_rejects_packet_with_unknown_interface(tmp_path: Path) -> None:
+    """Session.load rejects packet blocks that reference a missing interface."""
+    path = tmp_path / "bad-interface.pcapng"
+    path.write_bytes(
+        _build_shb()
+        + _build_idb(snap_len=64)
+        + _build_epb(timestamp_low=1_000_000, packet_data=_usbmon_packet(), interface_id=1)
+    )
+
+    with pytest.raises(ValueError, match="unknown interface_id 1"):
+        Session().load(path)
+
+
 def test_load_skips_unsupported_transfers(tmp_path: Path) -> None:
     """Session.load keeps metadata while skipping unsupported decoded records."""
     path = tmp_path / "interrupt.pcapng"
@@ -170,6 +236,89 @@ def test_load_skips_unsupported_transfers(tmp_path: Path) -> None:
     assert capture.metadata.packet_count == 1
     assert len(capture.records) == 0
     assert len(capture.transactions) == 0
+
+
+def test_list_devices_returns_empty_for_unsupported_only_capture(tmp_path: Path) -> None:
+    """list_devices returns an empty tuple when no packets decode into records."""
+    path = tmp_path / "interrupt-only.pcapng"
+    path.write_bytes(_capture_bytes((_usbmon_packet(transfer_type=_INTERRUPT),)))
+    session = Session()
+    session.load(path)
+
+    assert session.list_devices() == ()
+
+
+def test_list_devices_requires_loaded_capture() -> None:
+    """list_devices raises RuntimeError if no capture has been loaded."""
+    with pytest.raises(RuntimeError):
+        Session().list_devices()
+
+
+def test_list_devices_summarizes_multiple_devices(tmp_path: Path) -> None:
+    """Session.list_devices returns typed summaries for multiple devices."""
+    setup_device = _get_descriptor_setup(descriptor_type=1, descriptor_index=0, length=18)
+    setup_manufacturer = _get_descriptor_setup(descriptor_type=3, descriptor_index=1, length=255)
+    setup_product = _get_descriptor_setup(descriptor_type=3, descriptor_index=2, length=255)
+    descriptor = _device_descriptor(vendor_id=0x27C6, product_id=0x533C, manufacturer_index=1, product_index=2)
+    path = tmp_path / "multi-device.pcapng"
+    path.write_bytes(
+        _capture_bytes(
+            (
+                _usbmon_packet(urb_id=1, endpoint=0x01, dev_num=4, data=b"a"),
+                _usbmon_packet(urb_id=1, event=_COMPLETION, endpoint=0x81, dev_num=4, data=b"bc"),
+                _usbmon_packet(urb_id=2, endpoint=0x02, dev_num=7, data=b"d"),
+                _usbmon_packet(urb_id=3, transfer_type=_CONTROL, endpoint=0x80, dev_num=7, setup=setup_device),
+                _usbmon_packet(
+                    urb_id=3,
+                    event=_COMPLETION,
+                    transfer_type=_CONTROL,
+                    endpoint=0x80,
+                    dev_num=7,
+                    flag_setup=0x3E,
+                    data=descriptor,
+                ),
+                _usbmon_packet(urb_id=4, transfer_type=_CONTROL, endpoint=0x80, dev_num=7, setup=setup_manufacturer),
+                _usbmon_packet(
+                    urb_id=4,
+                    event=_COMPLETION,
+                    transfer_type=_CONTROL,
+                    endpoint=0x80,
+                    dev_num=7,
+                    flag_setup=0x3E,
+                    data=_string_descriptor("Goodix"),
+                ),
+                _usbmon_packet(urb_id=5, transfer_type=_CONTROL, endpoint=0x80, dev_num=7, setup=setup_product),
+                _usbmon_packet(
+                    urb_id=5,
+                    event=_COMPLETION,
+                    transfer_type=_CONTROL,
+                    endpoint=0x80,
+                    dev_num=7,
+                    flag_setup=0x3E,
+                    data=_string_descriptor("Fingerprint Reader"),
+                ),
+            )
+        )
+    )
+
+    session = Session()
+    capture = session.load(path)
+    device_summaries = session.list_devices()
+
+    assert len(capture.records) == 9
+    assert capture.metadata.packet_count == 9
+    assert [device.device_id for device in device_summaries] == ["dev_001_004", "dev_001_007"]
+    assert device_summaries[0].packet_count == 2
+    assert device_summaries[0].endpoints_seen == ("0x01", "0x81")
+    assert device_summaries[0].transfer_types_seen == ("bulk",)
+    assert device_summaries[1].packet_count == 7
+    assert device_summaries[1].endpoints_seen == ("0x00", "0x02")
+    assert device_summaries[1].transfer_types_seen == ("control", "bulk")
+    assert device_summaries[1].vendor_id == "0x27c6"
+    assert device_summaries[1].product_id == "0x533c"
+    assert device_summaries[1].manufacturer == "Goodix"
+    assert device_summaries[1].product == "Fingerprint Reader"
+    assert device_summaries[1].descriptor_summary == "Goodix Fingerprint Reader (0x27c6:0x533c)"
 
 
 def test_add_marker_requires_loaded_capture() -> None:

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
 
-from bsu_tool.mcp.interfaces import CaptureInterface, CaptureMetadata, CapturePacket
+from bsu_tool.mcp.interfaces import CaptureInterface, CaptureMetadata, CapturePacket, DeviceSummary
 from bsu_tool.pcapng_reader import (
     EnhancedPacketBlock,
     InterfaceDescriptionBlock,
@@ -16,6 +16,7 @@ from bsu_tool.pcapng_reader import (
     SimplePacketBlock,
 )
 from bsu_tool.urb_decoder import (
+    TransferType,
     UnsupportedTransferTypeError,
     UrbRecord,
     UrbTransaction,
@@ -28,6 +29,11 @@ _IF_TSRESOL_OPTION: Final[int] = 9
 _DEFAULT_TIMESTAMP_RESOLUTION_SECONDS: Final[float] = 1 / 1_000_000
 _BINARY_RESOLUTION_FLAG: Final[int] = 0x80
 _RESOLUTION_VALUE_MASK: Final[int] = 0x7F
+_GET_DESCRIPTOR_REQUEST: Final[int] = 0x06
+_DEVICE_DESCRIPTOR_TYPE: Final[int] = 0x01
+_STRING_DESCRIPTOR_TYPE: Final[int] = 0x03
+_ENDPOINT_IN_FLAG: Final[int] = 0x80
+_TRANSFER_TYPE_ORDER: Final[tuple[TransferType, ...]] = ("control", "bulk")
 
 
 @dataclass(frozen=True)
@@ -43,6 +49,18 @@ def _empty_markers() -> list[Marker]:
     return []
 
 
+def _empty_endpoint_addresses() -> set[int]:
+    return set()
+
+
+def _empty_transfer_types() -> set[TransferType]:
+    return set()
+
+
+def _empty_string_descriptors() -> dict[int, str]:
+    return {}
+
+
 @dataclass
 class Capture:
     """Loaded state for a single pcap-ng file."""
@@ -53,6 +71,22 @@ class Capture:
     records: tuple[UrbRecord, ...]
     transactions: tuple[UrbTransaction, ...]
     markers: list[Marker] = field(default_factory=_empty_markers)
+
+
+@dataclass
+class _DeviceAccumulator:
+    bus_num: int
+    dev_num: int
+    packet_count: int = 0
+    endpoint_addresses: set[int] = field(default_factory=_empty_endpoint_addresses)
+    transfer_types: set[TransferType] = field(default_factory=_empty_transfer_types)
+    vendor_id: str | None = None
+    product_id: str | None = None
+    manufacturer: str | None = None
+    product: str | None = None
+    manufacturer_index: int | None = None
+    product_index: int | None = None
+    string_descriptors: dict[int, str] = field(default_factory=_empty_string_descriptors)
 
 
 @dataclass
@@ -114,6 +148,12 @@ class Session:
         marker = Marker(name=name, timestamp=timestamp, note=note)
         self.capture.markers.append(marker)
         return marker
+
+    def list_devices(self) -> tuple[DeviceSummary, ...]:
+        """Return USB devices observed in the active capture."""
+        if self.capture is None:
+            raise RuntimeError("No capture loaded. Call load_capture() first.")
+        return _summarize_devices(self.capture.records, self.capture.transactions)
 
 
 def _validate_capture_path(path: Path) -> Path:
@@ -203,3 +243,158 @@ def _decode_supported_packets(packets: list[CapturePacket]) -> tuple[UrbRecord, 
         except UnsupportedTransferTypeError:
             continue
     return tuple(records)
+
+
+def _summarize_devices(
+    records: tuple[UrbRecord, ...],
+    transactions: tuple[UrbTransaction, ...],
+) -> tuple[DeviceSummary, ...]:
+    devices: dict[tuple[int, int], _DeviceAccumulator] = {}
+    for record in records:
+        accumulator = _device_accumulator(devices, record.bus_num, record.dev_num)
+        accumulator.packet_count += 1
+        accumulator.endpoint_addresses.add(_endpoint_address(record))
+        accumulator.transfer_types.add(record.transfer_type)
+
+    for transaction in transactions:
+        _apply_descriptor_info(devices, transaction)
+
+    return tuple(
+        _device_summary(accumulator)
+        for _, accumulator in sorted(devices.items(), key=lambda item: (item[0][0], item[0][1]))
+    )
+
+
+def _device_accumulator(
+    devices: dict[tuple[int, int], _DeviceAccumulator],
+    bus_num: int,
+    dev_num: int,
+) -> _DeviceAccumulator:
+    key = (bus_num, dev_num)
+    accumulator = devices.get(key)
+    if accumulator is None:
+        accumulator = _DeviceAccumulator(bus_num=bus_num, dev_num=dev_num)
+        devices[key] = accumulator
+    return accumulator
+
+
+def _endpoint_address(record: UrbRecord) -> int:
+    if record.endpoint == 0:
+        return 0
+    if record.direction == "in":
+        return record.endpoint | _ENDPOINT_IN_FLAG
+    return record.endpoint
+
+
+def _apply_descriptor_info(
+    devices: dict[tuple[int, int], _DeviceAccumulator],
+    transaction: UrbTransaction,
+) -> None:
+    submission = transaction.submission
+    completion = transaction.completion
+    if submission is None or completion is None or submission.setup is None:
+        return
+    accumulator = devices.get((submission.bus_num, submission.dev_num))
+    if accumulator is None:
+        return
+
+    descriptor_type = _requested_descriptor_type(submission.setup)
+    descriptor_index = submission.setup[2]
+    if descriptor_type == _DEVICE_DESCRIPTOR_TYPE:
+        _apply_device_descriptor(accumulator, completion.data)
+        return
+    if descriptor_type == _STRING_DESCRIPTOR_TYPE and descriptor_index > 0:
+        descriptor = _decode_string_descriptor(completion.data)
+        if descriptor is not None:
+            accumulator.string_descriptors[descriptor_index] = descriptor
+
+
+def _requested_descriptor_type(setup: bytes) -> int | None:
+    if len(setup) != 8 or setup[1] != _GET_DESCRIPTOR_REQUEST:
+        return None
+    return setup[3]
+
+
+def _apply_device_descriptor(accumulator: _DeviceAccumulator, data: bytes) -> None:
+    if len(data) < 18 or data[1] != _DEVICE_DESCRIPTOR_TYPE:
+        return
+    accumulator.vendor_id = _format_usb_id(data[8], data[9])
+    accumulator.product_id = _format_usb_id(data[10], data[11])
+    accumulator.manufacturer_index = _descriptor_string_index(data[14])
+    accumulator.product_index = _descriptor_string_index(data[15])
+
+
+def _format_usb_id(low: int, high: int) -> str:
+    return f"0x{((high << 8) | low):04x}"
+
+
+def _descriptor_string_index(value: int) -> int | None:
+    if value == 0:
+        return None
+    return value
+
+
+def _decode_string_descriptor(data: bytes) -> str | None:
+    if len(data) < 2 or data[1] != _STRING_DESCRIPTOR_TYPE:
+        return None
+    descriptor_length = min(data[0], len(data))
+    if descriptor_length <= 2:
+        return None
+    payload = data[2:descriptor_length]
+    if len(payload) % 2 != 0:
+        payload = payload[:-1]
+    try:
+        decoded = payload.decode("utf-16-le")
+    except UnicodeDecodeError:
+        return None
+    decoded = decoded.rstrip("\x00")
+    if decoded == "":
+        return None
+    return decoded
+
+
+def _device_summary(accumulator: _DeviceAccumulator) -> DeviceSummary:
+    manufacturer = _descriptor_string(accumulator, accumulator.manufacturer_index)
+    product = _descriptor_string(accumulator, accumulator.product_index)
+    return DeviceSummary(
+        device_id=_device_id(accumulator.bus_num, accumulator.dev_num),
+        bus_num=accumulator.bus_num,
+        dev_num=accumulator.dev_num,
+        packet_count=accumulator.packet_count,
+        endpoints_seen=tuple(f"0x{endpoint:02x}" for endpoint in sorted(accumulator.endpoint_addresses)),
+        transfer_types_seen=_sorted_transfer_types(accumulator.transfer_types),
+        vendor_id=accumulator.vendor_id,
+        product_id=accumulator.product_id,
+        manufacturer=manufacturer,
+        product=product,
+        descriptor_summary=_descriptor_summary(accumulator, manufacturer, product),
+    )
+
+
+def _descriptor_string(accumulator: _DeviceAccumulator, index: int | None) -> str | None:
+    if index is None:
+        return None
+    return accumulator.string_descriptors.get(index)
+
+
+def _sorted_transfer_types(transfer_types: set[TransferType]) -> tuple[TransferType, ...]:
+    return tuple(transfer_type for transfer_type in _TRANSFER_TYPE_ORDER if transfer_type in transfer_types)
+
+
+def _device_id(bus_num: int, dev_num: int) -> str:
+    return f"dev_{bus_num:03d}_{dev_num:03d}"
+
+
+def _descriptor_summary(
+    accumulator: _DeviceAccumulator,
+    manufacturer: str | None,
+    product: str | None,
+) -> str | None:
+    if accumulator.vendor_id is None and accumulator.product_id is None:
+        return None
+    label = "USB device"
+    if manufacturer is not None and product is not None:
+        label = f"{manufacturer} {product}"
+    elif product is not None:
+        label = product
+    return f"{label} ({accumulator.vendor_id}:{accumulator.product_id})"

@@ -1,6 +1,6 @@
 """In-memory data structures for parsed USB capture sessions."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass

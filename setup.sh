@@ -129,7 +129,7 @@ fi
 
 # ── Smoke test ────────────────────────────────────────────────────────────────
 info "Verifying install..."
-if "$PYTHON" -c "import bsu_tool" 2>/dev/null; then
+if python -c "import bsu_tool" 2>/dev/null; then
     ok "bsu_tool imports successfully."
 else
     warn "Could not import bsu_tool — package may not have installed correctly."

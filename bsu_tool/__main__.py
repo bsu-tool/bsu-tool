@@ -105,14 +105,11 @@ def _parse_session(path: Path) -> CaptureSession:
         USBDevice(
             bus_num=k[0],
             dev_num=k[1],
-            endpoints=[
-                USBEndpoint(number=ep, packet_count=count)
-                for ep, count in sorted(v.items())
-            ],
+            endpoints=[USBEndpoint(number=ep, packet_count=count) for ep, count in sorted(v.items())],
         )
         for k, v in sorted(devices.items())
     ]
-    
+
     return CaptureSession(
         filepath=str(path),
         devices=usb_devices,

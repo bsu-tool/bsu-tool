@@ -9,8 +9,8 @@ class USBEndpoint:
 
     number: int
     packet_count: int
-    
-    
+
+
 @dataclass
 class USBDevice:
     """A USB device observed in a parsed capture."""

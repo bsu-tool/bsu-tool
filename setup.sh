@@ -81,9 +81,18 @@ if [[ -d ".venv" ]]; then
         rm -rf .venv
     else
         # Validate existing venv by checking its Python binary exists
-        VENV_PYTHON=".venv/bin/python"
-        [[ "$ACTIVATE" == *Scripts* ]] && VENV_PYTHON=".venv/Scripts/python"
-        if [[ ! -x "$VENV_PYTHON" ]]; then
+        VENV_PYTHONS=(".venv/bin/python")
+        if [[ "$ACTIVATE" == *Scripts* ]]; then
+            VENV_PYTHONS=(".venv/Scripts/python.exe" ".venv/Scripts/python")
+        fi
+        VENV_HEALTHY=0
+        for VENV_PYTHON in "${VENV_PYTHONS[@]}"; do
+            if [[ -f "$VENV_PYTHON" ]]; then
+                VENV_HEALTHY=1
+                break
+            fi
+        done
+        if [[ "$VENV_HEALTHY" -eq 0 ]]; then
             warn ".venv exists but appears corrupted (no Python binary). Recreating..."
             rm -rf .venv
         else

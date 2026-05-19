@@ -1,6 +1,6 @@
 """Tests for MCP typed capture models."""
 
-from bsu_tool.mcp.interfaces import CaptureInterface, CaptureMetadata, CapturePacket
+from bsu_tool.mcp.interfaces import CaptureInterface, CaptureMetadata, CapturePacket, DeviceSummary
 
 
 def test_capture_metadata_contains_load_capture_fields() -> None:
@@ -43,3 +43,27 @@ def test_capture_packet_retains_packet_block_bytes() -> None:
     assert packet.pcap_captured_length == 3
     assert packet.pcap_original_length == 4
     assert packet.packet_data == b"abc"
+
+
+def test_device_summary_contains_list_devices_fields() -> None:
+    """DeviceSummary carries the Issue #16 list_devices result fields."""
+    device = DeviceSummary(
+        device_id="dev_001_004",
+        bus_num=1,
+        dev_num=4,
+        packet_count=5,
+        endpoints_seen=("0x00", "0x81"),
+        transfer_types_seen=("control", "bulk"),
+        vendor_id="0x27c6",
+        product_id="0x533c",
+        manufacturer="Goodix",
+        product="Fingerprint Reader",
+        descriptor_summary="Goodix Fingerprint Reader (0x27c6:0x533c)",
+    )
+
+    assert device.bus_num == 1
+    assert device.dev_num == 4
+    assert device.packet_count == 5
+    assert device.endpoints_seen == ("0x00", "0x81")
+    assert device.transfer_types_seen == ("control", "bulk")
+    assert device.vendor_id == "0x27c6"

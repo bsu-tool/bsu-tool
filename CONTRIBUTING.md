@@ -7,18 +7,14 @@ Requires Python 3.11+.
 ```bash
 git clone https://github.com/bsu-tool/bsu-tool.git
 cd bsu-tool
+./setup.sh
+```
 
-python -m venv .venv
+Then activate your environment:
 
-# PowerShell
-.venv\Scripts\Activate.ps1
-# Git Bash (Windows)
-source .venv/Scripts/activate
-# Linux / Mac
-source .venv/bin/activate
-
-pip install -e ".[dev]"
-pre-commit install
+```bash
+source .venv/bin/activate        # Linux / Mac
+source .venv/Scripts/activate    # Git Bash (Windows)
 ```
 
 Re-activate the venv at the start of every session. Rerun `pip install -e ".[dev]"` after any changes to `pyproject.toml`.

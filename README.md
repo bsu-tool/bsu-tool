@@ -9,17 +9,16 @@ Portland State University CS Capstone Project — sponsored by Bart Massey.
 Requires Python 3.11+.
 
 ```bash
-python -m venv .venv
+git clone https://github.com/bsu-tool/bsu-tool.git
+cd bsu-tool
+./setup.sh
+```
 
-# PowerShell
-.venv\Scripts\Activate.ps1
-# Git Bash (Windows)
-source .venv/Scripts/activate
-# Linux / Mac
-source .venv/bin/activate
+Then activate your environment:
 
-pip install -e ".[dev]"
-pre-commit install
+```bash
+source .venv/bin/activate        # Linux / Mac
+source .venv/Scripts/activate    # Git Bash (Windows)
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow, branching conventions, code standards, and testing guide.

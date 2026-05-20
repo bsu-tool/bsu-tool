@@ -10,7 +10,6 @@ def test_capture_session_stores_capture_metadata() -> None:
         USBEndpoint(number=1, packet_count=20),
         USBEndpoint(number=129, packet_count=12),
     ]
-
     device = USBDevice(bus_num=1, dev_num=7, endpoints=endpoints)
     session = CaptureSession(
         filepath="/captures/sample.pcapng",

@@ -145,6 +145,33 @@ elif [[ -f ".env" ]]; then
     ok ".env already exists."
 fi
 
+# ── MCP config (.mcp.json) — generated per-OS ─────────────────────────────────
+# .mcp.json is gitignored because the launch command differs by platform
+# (.venv/bin/python vs .venv/Scripts/python.exe). Generate it from $VENV_PYTHON
+# so Claude Code can start the bundled MCP server on any OS.
+write_mcp_config() {
+    cat > ".mcp.json" <<EOF
+{
+  "mcpServers": {
+    "bsu-tool": {
+      "command": "$VENV_PYTHON",
+      "args": ["-m", "bsu_tool", "mcp"]
+    }
+  }
+}
+EOF
+}
+
+if [[ -f ".mcp.json" && "$FORCE" -ne 1 ]] && grep -qF "\"$VENV_PYTHON\"" ".mcp.json"; then
+    ok ".mcp.json already targets this platform, leaving as-is."
+else
+    if [[ -f ".mcp.json" && "$FORCE" -ne 1 ]]; then
+        warn ".mcp.json targets another platform or is stale — regenerating."
+    fi
+    write_mcp_config
+    ok ".mcp.json generated → $VENV_PYTHON -m bsu_tool mcp"
+fi
+
 # ── Smoke test ────────────────────────────────────────────────────────────────
 info "Verifying install..."
 if "$VENV_PYTHON" -c "import bsu_tool" 2>/dev/null; then
@@ -158,5 +185,7 @@ echo ""
 ok "Setup complete."
 info "Activate your environment:"
 info "  source $ACTIVATE"
+info ""
+info "In Claude Code, run /mcp to (re)connect the bsu-tool MCP server."
 info ""
 info "To force a clean reinstall: ./setup.sh --force"

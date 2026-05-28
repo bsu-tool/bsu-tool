@@ -25,5 +25,8 @@ htmlcov/
 # Claude config
 .claude/
 
+# MCP config — generated per-OS by setup.sh (command path differs by platform)
+.mcp.json
+
 # VSCode
 .vscode/

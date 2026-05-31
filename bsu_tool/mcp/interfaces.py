@@ -41,6 +41,14 @@ class CaptureMetadata:
 
 
 @dataclass(frozen=True, slots=True)
+class EndpointSummary:
+    """A USB endpoint observed in a loaded capture."""
+
+    address: str
+    packet_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class DeviceSummary:
     """A USB device observed in a loaded capture."""
 
@@ -48,7 +56,7 @@ class DeviceSummary:
     bus_num: int
     dev_num: int
     packet_count: int
-    endpoints_seen: tuple[str, ...]
+    endpoints_seen: tuple[EndpointSummary, ...]
     transfer_types_seen: tuple[TransferType, ...]
     vendor_id: str | None = None
     product_id: str | None = None

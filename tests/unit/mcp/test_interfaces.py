@@ -1,6 +1,6 @@
 """Tests for MCP typed capture models."""
 
-from bsu_tool.mcp.interfaces import CaptureInterface, CaptureMetadata, CapturePacket, DeviceSummary
+from bsu_tool.mcp.interfaces import CaptureInterface, CaptureMetadata, CapturePacket, DeviceSummary, EndpointSummary
 
 
 def test_capture_metadata_contains_load_capture_fields() -> None:
@@ -52,7 +52,10 @@ def test_device_summary_contains_list_devices_fields() -> None:
         bus_num=1,
         dev_num=4,
         packet_count=5,
-        endpoints_seen=("0x00", "0x81"),
+        endpoints_seen=(
+            EndpointSummary(address="0x00", packet_count=3),
+            EndpointSummary(address="0x81", packet_count=2),
+        ),
         transfer_types_seen=("control", "bulk"),
         vendor_id="0x27c6",
         product_id="0x533c",
@@ -64,6 +67,9 @@ def test_device_summary_contains_list_devices_fields() -> None:
     assert device.bus_num == 1
     assert device.dev_num == 4
     assert device.packet_count == 5
-    assert device.endpoints_seen == ("0x00", "0x81")
+    assert device.endpoints_seen == (
+        EndpointSummary(address="0x00", packet_count=3),
+        EndpointSummary(address="0x81", packet_count=2),
+    )
     assert device.transfer_types_seen == ("control", "bulk")
     assert device.vendor_id == "0x27c6"

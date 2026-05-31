@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
-from bsu_tool.mcp.session import Session
 from bsu_tool.mcp.tools import register_all
+from bsu_tool.session import Session
 
 
 def build_server(session: Session | None = None) -> FastMCP:

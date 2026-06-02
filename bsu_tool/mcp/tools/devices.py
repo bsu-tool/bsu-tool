@@ -8,7 +8,7 @@ from typing import Final
 from mcp.server.fastmcp import FastMCP
 
 from bsu_tool.mcp.interfaces import DeviceSummary
-from bsu_tool.mcp.session import Session
+from bsu_tool.session import Session
 
 _DEFAULT_LIMIT: Final[int] = 100
 _MAX_LIMIT: Final[int] = 1000

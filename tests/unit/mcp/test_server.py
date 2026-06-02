@@ -7,7 +7,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
 from bsu_tool.mcp.server import build_server
-from bsu_tool.mcp.session import Session
+from bsu_tool.session import Session
 
 
 def test_build_server_default_session() -> None:

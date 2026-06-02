@@ -8,7 +8,7 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 from bsu_tool.mcp.interfaces import CaptureInterface
-from bsu_tool.mcp.session import Session
+from bsu_tool.session import Session
 
 
 @dataclass(frozen=True, slots=True)

@@ -5,8 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from bsu_tool.mcp.session import Marker, Session
+from bsu_tool.mcp.interfaces import EndpointSummary
 from bsu_tool.pcapng_reader import PcapNgError
+from bsu_tool.session import Marker, Session
 
 _USBMON_HEADER_FORMAT = "<QBBBBHBBqiiII8s"
 _SUBMISSION = 0x53
@@ -309,10 +310,16 @@ def test_list_devices_summarizes_multiple_devices(tmp_path: Path) -> None:
     assert capture.metadata.packet_count == 9
     assert [device.device_id for device in device_summaries] == ["dev_001_004", "dev_001_007"]
     assert device_summaries[0].packet_count == 2
-    assert device_summaries[0].endpoints_seen == ("0x01", "0x81")
+    assert device_summaries[0].endpoints_seen == (
+        EndpointSummary(address="0x01", packet_count=1),
+        EndpointSummary(address="0x81", packet_count=1),
+    )
     assert device_summaries[0].transfer_types_seen == ("bulk",)
     assert device_summaries[1].packet_count == 7
-    assert device_summaries[1].endpoints_seen == ("0x00", "0x02")
+    assert device_summaries[1].endpoints_seen == (
+        EndpointSummary(address="0x00", packet_count=6),
+        EndpointSummary(address="0x02", packet_count=1),
+    )
     assert device_summaries[1].transfer_types_seen == ("control", "bulk")
     assert device_summaries[1].vendor_id == "0x27c6"
     assert device_summaries[1].product_id == "0x533c"
@@ -325,14 +332,14 @@ def test_add_marker_requires_loaded_capture() -> None:
     """add_marker raises RuntimeError if no capture has been loaded."""
     session = Session()
     with pytest.raises(RuntimeError):
-        session.add_marker(name="x", timestamp=0.0)
+        session.add_marker(name="x", timestamp=0.0, packet_index=0)
 
 
 def test_add_marker_appends_to_capture(tmp_path: Path) -> None:
     """add_marker stores a Marker on the active capture and returns it."""
     session = Session()
     session.load(_write_capture(tmp_path))
-    marker = session.add_marker(name="press_button", timestamp=0.05, note="hi")
+    marker = session.add_marker(name="press_button", timestamp=0.05, packet_index=1, note="hi")
 
     assert isinstance(marker, Marker)
     assert session.capture is not None

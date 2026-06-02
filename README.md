@@ -21,6 +21,8 @@ source .venv/bin/activate        # Linux / Mac
 source .venv/Scripts/activate    # Git Bash (Windows)
 ```
 
+The MCP server config (`.mcp.json`) is generated per-OS by `setup.sh` and is gitignored, since the launch command differs between platforms (`.venv/bin/python` vs `.venv/Scripts/python.exe`). In Claude Code, run `/mcp` to connect.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow, branching conventions, code standards, and testing guide.
 
 ## Documentation

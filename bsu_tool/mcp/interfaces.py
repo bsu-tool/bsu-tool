@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from bsu_tool.urb_decoder import TransferType
+from bsu_tool.urb_decoder import Direction, EventType, TransferType
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,3 +63,42 @@ class DeviceSummary:
     manufacturer: str | None = None
     product: str | None = None
     descriptor_summary: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PacketRecord:
+    """A decoded URB packet exposed by get_packets.
+
+    This is a flat, self-contained view built from a :class:`~bsu_tool.urb_decoder.UrbRecord`.
+    It intentionally does not extend ``UrbRecord``; binary payloads are rendered as
+    hex strings so the record is trivially serializable over MCP.
+    """
+
+    index: int
+    urb_id: int
+    event_type: EventType
+    transfer_type: TransferType
+    direction: Direction
+    device_id: str
+    bus_num: int
+    dev_num: int
+    endpoint_address: str
+    status: int
+    length: int
+    captured_length: int
+    data_length: int
+    data_preview: str | None
+    setup: str | None
+    timestamp: float
+
+
+@dataclass(frozen=True, slots=True)
+class PacketSelection:
+    """All decoded packets matching a get_packets filter, plus the capture total.
+
+    ``total_count`` counts every decoded record in the capture, independent of the
+    filter, so it can differ from ``len(matches)``.
+    """
+
+    matches: tuple[PacketRecord, ...]
+    total_count: int

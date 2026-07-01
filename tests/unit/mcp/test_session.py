@@ -328,6 +328,128 @@ def test_list_devices_summarizes_multiple_devices(tmp_path: Path) -> None:
     assert device_summaries[1].descriptor_summary == "Goodix Fingerprint Reader (0x27c6:0x533c)"
 
 
+def _multi_device_packets() -> tuple[bytes, ...]:
+    return (
+        _usbmon_packet(urb_id=1, endpoint=0x01, dev_num=4, data=b"a"),
+        _usbmon_packet(urb_id=1, event=_COMPLETION, endpoint=0x81, dev_num=4, data=b"bc"),
+        _usbmon_packet(
+            urb_id=2, transfer_type=_CONTROL, endpoint=0x80, dev_num=7, setup=b"\x80\x06\x00\x01\x00\x00\x12\x00"
+        ),
+        _usbmon_packet(urb_id=2, event=_COMPLETION, transfer_type=_CONTROL, endpoint=0x80, dev_num=7, data=b"xyz"),
+        _usbmon_packet(urb_id=3, endpoint=0x02, dev_num=7, data=b"d"),
+    )
+
+
+def test_get_packets_requires_loaded_capture() -> None:
+    """get_packets raises RuntimeError if no capture has been loaded."""
+    with pytest.raises(RuntimeError):
+        Session().get_packets()
+
+
+def test_get_packets_returns_typed_records(tmp_path: Path) -> None:
+    """get_packets returns typed PacketRecord objects with decoded fields and previews."""
+    path = tmp_path / "packets.pcapng"
+    path.write_bytes(_capture_bytes(_multi_device_packets()))
+    session = Session()
+    session.load(path)
+
+    selection = session.get_packets()
+
+    assert selection.total_count == 5
+    assert len(selection.matches) == 5
+    first = selection.matches[0]
+    assert first.index == 0
+    assert first.device_id == "dev_001_004"
+    assert first.transfer_type == "bulk"
+    assert first.direction == "out"
+    assert first.endpoint_address == "0x01"
+    assert first.event_type == "submission"
+    assert first.data_length == 1
+    assert first.data_preview == b"a".hex()
+    assert first.setup is None
+    control = selection.matches[2]
+    assert control.transfer_type == "control"
+    assert control.endpoint_address == "0x00"
+    assert control.setup == b"\x80\x06\x00\x01\x00\x00\x12\x00".hex()
+
+
+def test_get_packets_empty_data_has_no_preview(tmp_path: Path) -> None:
+    """A packet with no captured data reports data_preview None."""
+    path = tmp_path / "empty.pcapng"
+    path.write_bytes(_capture_bytes((_usbmon_packet(urb_id=1, endpoint=0x01, dev_num=4, data=b""),)))
+    session = Session()
+    session.load(path)
+
+    (packet,) = session.get_packets().matches
+    assert packet.data_length == 0
+    assert packet.data_preview is None
+
+
+def test_get_packets_filters_by_device(tmp_path: Path) -> None:
+    """device_id narrows matches while total_count stays at the full decoded count."""
+    path = tmp_path / "multi.pcapng"
+    path.write_bytes(_capture_bytes(_multi_device_packets()))
+    session = Session()
+    session.load(path)
+
+    selection = session.get_packets(device_id="dev_001_007")
+
+    assert selection.total_count == 5
+    assert len(selection.matches) == 3
+    assert {packet.device_id for packet in selection.matches} == {"dev_001_007"}
+
+
+def test_get_packets_filters_by_endpoint_direction_and_type(tmp_path: Path) -> None:
+    """Endpoint, direction, transfer-type, and event filters compose."""
+    path = tmp_path / "multi.pcapng"
+    path.write_bytes(_capture_bytes(_multi_device_packets()))
+    session = Session()
+    session.load(path)
+
+    assert len(session.get_packets(endpoint="0x81").matches) == 1
+    assert len(session.get_packets(endpoint="81").matches) == 1
+    assert len(session.get_packets(direction="in").matches) == 3
+    assert len(session.get_packets(transfer_type="control").matches) == 2
+    assert len(session.get_packets(event_type="completion").matches) == 2
+    combined = session.get_packets(device_id="dev_001_007", transfer_type="bulk", direction="out")
+    assert len(combined.matches) == 1
+    assert combined.matches[0].endpoint_address == "0x02"
+
+
+def test_get_packets_rejects_invalid_endpoint(tmp_path: Path) -> None:
+    """A non-hexadecimal endpoint filter raises ValueError."""
+    path = tmp_path / "multi.pcapng"
+    path.write_bytes(_capture_bytes(_multi_device_packets()))
+    session = Session()
+    session.load(path)
+
+    with pytest.raises(ValueError, match="hexadecimal"):
+        session.get_packets(endpoint="zz")
+    with pytest.raises(ValueError, match="single-byte"):
+        session.get_packets(endpoint="0x181")
+    with pytest.raises(ValueError, match="single-byte"):
+        session.get_packets(endpoint="-1")
+
+
+def test_get_packets_excludes_interrupt(tmp_path: Path) -> None:
+    """Interrupt packets never appear in the decoded record stream."""
+    path = tmp_path / "interrupt.pcapng"
+    path.write_bytes(
+        _capture_bytes(
+            (
+                _usbmon_packet(urb_id=1, endpoint=0x01, dev_num=4, data=b"a"),
+                _usbmon_packet(urb_id=2, transfer_type=_INTERRUPT, endpoint=0x83, dev_num=4, data=b"z"),
+            )
+        )
+    )
+    session = Session()
+    session.load(path)
+
+    selection = session.get_packets()
+    assert selection.total_count == 1
+    assert selection.matches[0].transfer_type == "bulk"
+
+
 def test_add_marker_requires_loaded_capture() -> None:
     """add_marker raises RuntimeError if no capture has been loaded."""
     session = Session()

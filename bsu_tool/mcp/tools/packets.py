@@ -40,8 +40,19 @@ def register(mcp: FastMCP, session: Session) -> None:
     ) -> GetPacketsResult:
         """Retrieve decoded Control and Bulk URB packets from the active capture.
 
-        Filters (device_id, endpoint, direction, transfer_type, event_type) narrow
-        the result; pagination (offset, limit) selects a slice of the matches.
+        Filters compose — a packet must satisfy all that are given. Two need
+        explaining beyond their schema:
+
+        - device_id: a ``dev_bbb_ddd`` id from list_devices.
+        - endpoint: a decimal endpoint number such as ``"3"`` or ``"15"``. A
+          ``0x``-prefixed address like ``"0x83"`` is also accepted (its endpoint
+          number is used; direction bit ignored). Direction is orthogonal — use
+          ``direction`` for IN/OUT.
+
+        Pagination (offset, limit) slices the matches. The result reports both
+        ``match_count`` (packets passing the filter) and ``total_count`` (all
+        decoded packets). Each returned packet's ``endpoint_address`` is the full
+        USB address, whereas ``endpoint`` filters by number.
         """
         validate_pagination(offset, limit)
         selection = session.get_packets(
@@ -51,13 +62,14 @@ def register(mcp: FastMCP, session: Session) -> None:
             transfer_type=transfer_type,
             event_type=event_type,
         )
+        match_count = len(selection.matches)
         page = selection.matches[offset : offset + limit]
         return GetPacketsResult(
             packets=page,
             total_count=selection.total_count,
-            match_count=len(selection.matches),
+            match_count=match_count,
             offset=offset,
             limit=limit,
             returned_count=len(page),
-            has_more=offset + len(page) < len(selection.matches),
+            has_more=offset + len(page) < match_count,
         )

@@ -82,11 +82,11 @@ class PacketRecord:
     device_id: str
     bus_num: int
     dev_num: int
-    endpoint_address: str
+    endpoint_address: str  # full USB address incl. direction bit, e.g. "0x83" (EP3 IN)
+    endpoint_number: int  # bare endpoint number 0-15
     status: int
-    length: int
-    captured_length: int
-    data_length: int
+    length: int  # URB-reported full data length; exceeds data_length when truncated
+    data_length: int  # bytes actually captured
     data_preview: str | None
     setup: str | None
     timestamp: float

@@ -363,6 +363,7 @@ def test_get_packets_returns_typed_records(tmp_path: Path) -> None:
     assert first.transfer_type == "bulk"
     assert first.direction == "out"
     assert first.endpoint_address == "0x01"
+    assert first.endpoint_number == 1
     assert first.event_type == "submission"
     assert first.data_length == 1
     assert first.data_preview == b"a".hex()
@@ -406,8 +407,16 @@ def test_get_packets_filters_by_endpoint_direction_and_type(tmp_path: Path) -> N
     session = Session()
     session.load(path)
 
-    assert len(session.get_packets(endpoint="0x81").matches) == 1
-    assert len(session.get_packets(endpoint="81").matches) == 1
+    # endpoint 1 appears as an OUT submission and an IN completion, so filtering
+    # by number matches both; a full address filters by number too; direction narrows.
+    assert len(session.get_packets(endpoint="1").matches) == 2
+    assert len(session.get_packets(endpoint="0x81").matches) == 2
+    in_packet = session.get_packets(endpoint="1", direction="in")
+    assert len(in_packet.matches) == 1
+    assert in_packet.matches[0].endpoint_address == "0x81"
+    out_packet = session.get_packets(endpoint="0x81", direction="out")
+    assert len(out_packet.matches) == 1
+    assert out_packet.matches[0].endpoint_address == "0x01"
     assert len(session.get_packets(direction="in").matches) == 3
     assert len(session.get_packets(transfer_type="control").matches) == 2
     assert len(session.get_packets(event_type="completion").matches) == 2
@@ -416,19 +425,19 @@ def test_get_packets_filters_by_endpoint_direction_and_type(tmp_path: Path) -> N
     assert combined.matches[0].endpoint_address == "0x02"
 
 
-def test_get_packets_rejects_invalid_endpoint(tmp_path: Path) -> None:
-    """A non-hexadecimal endpoint filter raises ValueError."""
-    path = tmp_path / "multi.pcapng"
-    path.write_bytes(_capture_bytes(_multi_device_packets()))
+def test_get_packets_endpoint_number_is_decimal(tmp_path: Path) -> None:
+    """endpoint "15" means endpoint 15 (decimal), not 0x15 (=21 -> 5); addresses use 0x."""
+    path = tmp_path / "ep15.pcapng"
+    path.write_bytes(_capture_bytes((_usbmon_packet(endpoint=0x0F, dev_num=4, data=b"z"),)))
     session = Session()
     session.load(path)
 
-    with pytest.raises(ValueError, match="hexadecimal"):
-        session.get_packets(endpoint="zz")
-    with pytest.raises(ValueError, match="single-byte"):
-        session.get_packets(endpoint="0x181")
-    with pytest.raises(ValueError, match="single-byte"):
-        session.get_packets(endpoint="-1")
+    assert len(session.get_packets(endpoint="15").matches) == 1  # decimal 15 -> endpoint 15
+    assert len(session.get_packets(endpoint="0x8f").matches) == 1  # address low nibble = 15
+    assert len(session.get_packets(endpoint="5").matches) == 0  # not misparsed as 0x15 -> 5
+    for bad in ("zz", "0xzz", "16", "0x1ff"):
+        with pytest.raises(ValueError):
+            session.get_packets(endpoint=bad)
 
 
 def test_get_packets_excludes_interrupt(tmp_path: Path) -> None:

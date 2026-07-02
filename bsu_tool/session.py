@@ -43,6 +43,7 @@ _GET_DESCRIPTOR_REQUEST: Final[int] = 0x06
 _DEVICE_DESCRIPTOR_TYPE: Final[int] = 0x01
 _STRING_DESCRIPTOR_TYPE: Final[int] = 0x03
 _ENDPOINT_IN_FLAG: Final[int] = 0x80
+_ENDPOINT_NUMBER_MASK: Final[int] = 0x0F
 _TRANSFER_TYPE_ORDER: Final[tuple[TransferType, ...]] = ("control", "bulk")
 _DATA_PREVIEW_BYTES: Final[int] = 32
 
@@ -184,7 +185,10 @@ class Session:
 
         Args:
             device_id: Restrict to one device by its ``dev_bbb_ddd`` id.
-            endpoint: Restrict to one endpoint address, e.g. ``"0x81"`` or ``"1"``.
+            endpoint: Restrict to one endpoint number in decimal, e.g. ``"3"`` or
+                ``"15"``. A ``0x``-prefixed full address such as ``"0x83"`` is also
+                accepted — only its endpoint number (low nibble) is used, the
+                direction bit is ignored. Use ``direction`` to select IN or OUT.
             direction: Restrict to ``"in"`` or ``"out"`` transfers.
             transfer_type: Restrict to ``"control"`` or ``"bulk"`` transfers.
             event_type: Restrict to ``"submission"``, ``"completion"``, or ``"error"``.
@@ -195,11 +199,11 @@ class Session:
 
         Raises:
             RuntimeError: No capture has been loaded.
-            ValueError: ``endpoint`` is not a valid endpoint address.
+            ValueError: ``endpoint`` is not a valid endpoint number or address.
         """
         if self.capture is None:
             raise RuntimeError("No capture loaded. Call load_capture() first.")
-        endpoint_address = _normalize_endpoint(endpoint)
+        endpoint_number = _normalize_endpoint(endpoint)
         records = self.capture.records
         matches = tuple(
             _packet_record(index, record)
@@ -207,7 +211,7 @@ class Session:
             if _record_matches(
                 record,
                 device_id=device_id,
-                endpoint_address=endpoint_address,
+                endpoint_number=endpoint_number,
                 direction=direction,
                 transfer_type=transfer_type,
                 event_type=event_type,
@@ -316,9 +320,9 @@ def _packet_record(index: int, record: UrbRecord) -> PacketRecord:
         bus_num=record.bus_num,
         dev_num=record.dev_num,
         endpoint_address=f"0x{_endpoint_address(record):02x}",
+        endpoint_number=record.endpoint,
         status=record.status,
         length=record.length,
-        captured_length=record.captured_length,
         data_length=len(record.data),
         data_preview=_data_preview(record.data),
         setup=record.setup.hex() if record.setup is not None else None,
@@ -332,30 +336,41 @@ def _data_preview(data: bytes) -> str | None:
     return data[:_DATA_PREVIEW_BYTES].hex()
 
 
-def _normalize_endpoint(endpoint: str | None) -> str | None:
+def _normalize_endpoint(endpoint: str | None) -> int | None:
     if endpoint is None:
         return None
+    text = endpoint.lower()
+    if text.startswith("0x"):  # full USB address; keep the endpoint number (low nibble)
+        try:
+            address = int(text, 16)
+        except ValueError as error:
+            raise ValueError(f"endpoint address must be hexadecimal, got {endpoint!r}") from error
+        if not 0 <= address <= 0xFF:
+            raise ValueError(f"endpoint address must be in 0x00-0xff, got {endpoint!r}")
+        return address & _ENDPOINT_NUMBER_MASK
     try:
-        value = int(endpoint, 16)
+        number = int(text, 10)
     except ValueError as error:
-        raise ValueError(f"endpoint must be a hexadecimal address, got {endpoint!r}") from error
-    if not 0 <= value <= 0xFF:
-        raise ValueError(f"endpoint must be a single-byte address in 0x00-0xff, got {endpoint!r}")
-    return f"0x{value:02x}"
+        raise ValueError(
+            f"endpoint must be a decimal number 0-15 or a 0x-prefixed address, got {endpoint!r}"
+        ) from error
+    if not 0 <= number <= _ENDPOINT_NUMBER_MASK:
+        raise ValueError(f"endpoint number must be 0-15, got {endpoint!r}")
+    return number
 
 
 def _record_matches(
     record: UrbRecord,
     *,
     device_id: str | None,
-    endpoint_address: str | None,
+    endpoint_number: int | None,
     direction: Direction | None,
     transfer_type: TransferType | None,
     event_type: EventType | None,
 ) -> bool:
     if device_id is not None and _device_id(record.bus_num, record.dev_num) != device_id:
         return False
-    if endpoint_address is not None and f"0x{_endpoint_address(record):02x}" != endpoint_address:
+    if endpoint_number is not None and record.endpoint != endpoint_number:
         return False
     if direction is not None and record.direction != direction:
         return False

@@ -196,5 +196,5 @@ def test_reemitted_capture_decodes_identically(
     original_records = _decode_all(original_epbs, link_type)
     reemitted_records = _decode_all(reemitted_epbs, link_type)
 
-    assert len(reemitted_records) == 249  # 253 EPBs minus 4 out-of-scope interrupts
+    assert len(reemitted_records) == 253  # all EPBs decode; only isochronous is out of scope
     assert reemitted_records == original_records

@@ -33,10 +33,9 @@ Design choices
   A SIGINT mid-capture leaves a structurally valid file with every block
   that completed before the signal.
 
-The byte order is little-endian on the wire. The pcap-ng spec permits
-big-endian sections, but every modern tool (tshark, Wireshark, scapy)
-writes little-endian and there is no reason to do otherwise on the
-platforms bsu-tool targets.
+Byte order is little-endian on the wire. The spec permits big-endian
+sections, but every modern tool (tshark, Wireshark, scapy) writes
+little-endian, so we do too.
 """
 
 from __future__ import annotations

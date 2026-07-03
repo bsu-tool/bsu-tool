@@ -77,9 +77,8 @@ def run_sniff(bus: int, device: int | None, output: Path) -> None:
     except UsbmonIoctlError as exc:
         _die(str(exc))
 
-    # Clear the progress line before printing the final stats, since
-    # the progress line is a single carriage-return-overwritten line
-    # and the final stats are multi-line.
+    # End the carriage-return-overwritten progress line before the
+    # multi-line final stats.
     print(file=sys.stderr)
     _print_final_stats(stats)
 

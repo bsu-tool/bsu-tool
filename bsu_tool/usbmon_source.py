@@ -1,38 +1,30 @@
 """Raw event source for Linux usbmon character devices.
 
 Wraps ``/dev/usbmonN`` for one USB bus and yields ``(header, data)``
-tuples of raw bytes — one per URB event delivered by the kernel.
-Does no parsing, no filtering by transfer type, and no pcap-ng
-encoding; those are upper layers' concerns.
+tuples of raw bytes — one per URB event. No parsing, filtering, or
+pcap-ng encoding; those are upper layers' concerns.
 
-Three behaviors worth understanding before reading the code:
+Three behaviors worth knowing:
 
-1. **Filler packets are dropped here.** The kernel emits events with
-   ``event_type == 0x40`` ('@') as ring-buffer slot padding. They are
-   not real URBs and would fail to decode downstream. This module is
-   the single gatekeeper that drops them.
+1. **Filler packets are dropped here.** The kernel emits ``0x40`` ('@')
+   events as ring-buffer padding; they aren't real URBs and fail to
+   decode downstream. This module is the sole gatekeeper that drops them.
 
-2. **Iteration blocks but is interruptible.** Each ``__next__`` waits
-   up to ``poll_timeout_ms`` for the kernel to produce an event. If
-   the caller's ``stop_event`` is set during a wait, iteration stops
-   cleanly at the next timeout boundary — so worst-case stop latency
-   is bounded by ``poll_timeout_ms`` regardless of bus activity.
+2. **Iteration blocks but is interruptible.** Each ``__next__`` waits up
+   to ``poll_timeout_ms`` for an event; if ``stop_event`` is set during a
+   wait, iteration stops at the next timeout boundary, so stop latency is
+   bounded by ``poll_timeout_ms`` regardless of bus traffic.
 
-3. **Errors are mapped to typed exceptions at open time.** A missing
-   device node (common on WSL2 where bus numbers shift between
-   reboots) raises :class:`UsbmonBusNotAvailableError` with a hint
-   about which buses *are* available. Permission failures raise
-   :class:`UsbmonPermissionError` with the conventional fix.
+3. **Open errors map to typed exceptions.** A missing node (common on
+   WSL2) raises :class:`UsbmonBusNotAvailableError` listing available
+   buses; permission failures raise :class:`UsbmonPermissionError`.
 
-The kernel-side ABI is documented in ``Documentation/usb/usbmon.rst``
-in the Linux source tree. The relevant pieces:
+Kernel ABI (``Documentation/usb/usbmon.rst``):
 
-* ``MON_IOCX_GETX`` (ioctl request ``_IOW(0x92, 10, struct mon_get_arg)``)
-  fetches one event, copying 64 bytes of header into ``hdr`` and up to
-  ``alloc`` bytes of captured data into ``data``. Returns 0 on success
-  or sets errno on failure (EINTR is the common non-fatal case).
-* ``struct mon_get_arg { struct mon_bin_hdr *hdr; void *data; size_t alloc; }``
-  — three pointer/size_t fields, native alignment.
+* ``MON_IOCX_GETX`` = ``_IOW(0x92, 10, struct mon_get_arg)`` fetches one
+  event, copying 64 header bytes into ``hdr`` and up to ``alloc`` data
+  bytes into ``data``. EINTR is the common non-fatal failure.
+* ``struct mon_get_arg { struct mon_bin_hdr *hdr; void *data; size_t alloc; }``.
 """
 
 from __future__ import annotations
@@ -51,16 +43,16 @@ from typing import Final
 # Constants — usbmon ABI
 # ---------------------------------------------------------------------------
 
-#: Header size returned by MON_IOCX_GETX. Matches struct mon_bin_hdr in
-#: the kernel; also matches HEADER_SIZE_USB_LINUX_MMAPPED in urb_decoder.
+#: Header size from MON_IOCX_GETX. Matches struct mon_bin_hdr and
+#: HEADER_SIZE_USB_LINUX_MMAPPED in urb_decoder.
 _HEADER_SIZE: Final = 64
 
-#: Maximum captured data per event. 65535 matches tshark's snap-len
-#: default and is larger than any single USB transfer we expect.
+#: Max captured data per event. Matches tshark's default snap-len and
+#: exceeds any single USB transfer we expect.
 _DATA_BUFFER_SIZE: Final = 65535
 
-#: usbmon event-type byte for ring-buffer filler. Real events use
-#: 0x53/0x43/0x45 ('S'/'C'/'E'). Anything else is junk to be dropped.
+#: Event-type byte for ring-buffer filler. Real events use 'S'/'C'/'E'
+#: (0x53/0x43/0x45); anything else is junk to drop.
 _FILLER_EVENT_BYTE: Final = 0x40  # '@'
 
 #: Offset of the event-type byte within the header.
@@ -70,18 +62,16 @@ _EVENT_TYPE_OFFSET: Final = 8
 # Constants — ioctl encoding
 # ---------------------------------------------------------------------------
 #
-# Linux ioctl request numbers pack direction, type, command, and size
-# into a 32-bit integer. The encoding (from include/uapi/asm-generic/ioctl.h):
+# Linux ioctl request numbers pack direction, size, type, and command into a
+# 32-bit integer (include/uapi/asm-generic/ioctl.h):
 #
 #     bits 31-30: direction (00 none, 01 write, 10 read, 11 read/write)
 #     bits 29-16: argument size in bytes
 #     bits 15-8:  type ("magic" byte, 0x92 for usbmon)
 #     bits 7-0:   command number
 #
-# MON_IOCX_GETX is defined as _IOW(MON_IOC_MAGIC, 10, struct mon_get_arg).
-# _IOW means direction=01 (write: userspace → kernel passes the arg).
-# The size is sizeof(struct mon_get_arg), which on 64-bit Linux is 24
-# bytes (two pointers + size_t).
+# MON_IOCX_GETX = _IOW(0x92, 10, struct mon_get_arg): direction=write (arg
+# passed userspace → kernel), size = sizeof(mon_get_arg) = 24 on 64-bit.
 
 _IOC_NRBITS: Final = 8
 _IOC_TYPEBITS: Final = 8
@@ -102,9 +92,8 @@ class _MonGetArg(ctypes.Structure):
     """ctypes layout of ``struct mon_get_arg``.
 
     Field order and types must match the kernel's UAPI header exactly.
-    On 64-bit Linux, ``c_void_p`` is 8 bytes and ``c_size_t`` is 8 bytes,
-    giving a struct size of 24 bytes — which is what gets encoded into
-    the ioctl request number.
+    On 64-bit Linux this is 24 bytes (two 8-byte pointers + 8-byte size_t),
+    the size encoded into the ioctl request number.
     """
 
     _fields_ = [
@@ -138,17 +127,16 @@ class UsbmonError(Exception):
 class UsbmonBusNotAvailableError(UsbmonError):
     """Raised when ``/dev/usbmonN`` does not exist for the requested bus.
 
-    On WSL2 and other dynamic environments, bus numbers can shift between
-    reboots or when devices are attached/detached. The error message
-    includes the list of currently-available bus numbers as a hint.
+    Bus numbers can shift between reboots or replugs (notably on WSL2);
+    the message lists the currently-available bus numbers as a hint.
     """
 
 
 class UsbmonPermissionError(UsbmonError):
     """Raised when the user lacks permission to open ``/dev/usbmonN``.
 
-    The device is conventionally owned by ``root:usbmon`` with mode 0640;
-    fix by running as root or by adding the user to the ``usbmon`` group.
+    The node is conventionally ``root:usbmon`` mode 0640; fix by running as
+    root or adding the user to the ``usbmon`` group.
     """
 
 
@@ -169,21 +157,16 @@ class UsbmonIoctlError(UsbmonError):
 class UsbmonSource:
     """Iterable over raw events from one usbmon character device.
 
-    Use as a context manager so the underlying file descriptor is closed
-    on exit::
+    Use as a context manager so the file descriptor is closed on exit::
 
         with UsbmonSource(bus_number=3, stop_event=stop) as source:
             for header, data in source:
                 ...
 
-    Each iteration of ``__next__`` blocks for up to ``poll_timeout_ms``
-    waiting for an event. If ``stop_event`` is set during a wait, the
-    iterator raises ``StopIteration`` at the next timeout boundary —
-    so worst-case stop latency is bounded by ``poll_timeout_ms``
-    regardless of bus traffic.
-
-    Filler events (kernel ring-buffer padding) are silently dropped;
-    they are not real URBs.
+    Each ``__next__`` blocks up to ``poll_timeout_ms`` for an event; if
+    ``stop_event`` is set during a wait, iteration ends (``StopIteration``)
+    at the next timeout boundary, bounding stop latency by
+    ``poll_timeout_ms``. Filler events (ring-buffer padding) are dropped.
     """
 
     __slots__ = (
@@ -211,15 +194,13 @@ class UsbmonSource:
         self._stop_event = stop_event
         self._poll_timeout_ms = poll_timeout_ms
 
-        # File descriptor is opened in __enter__, not __init__. Construct-
-        # ing a source object should not have system-level side effects.
+        # Opened in __enter__, not __init__: constructing a source should have
+        # no system-level side effects.
         self._fd: int | None = None
         self._poller: select.poll | None = None
 
-        # Persistent ctypes buffers — allocated once, reused for every
-        # ioctl call. The kernel writes into these buffers each call;
-        # we copy out the bytes we care about and hand the buffers
-        # back to the kernel on the next iteration.
+        # Persistent ctypes buffers, allocated once and reused for every ioctl.
+        # The kernel writes into them each call; we copy out the bytes we want.
         self._hdr_buf = (ctypes.c_ubyte * _HEADER_SIZE)()
         self._data_buf = (ctypes.c_ubyte * _DATA_BUFFER_SIZE)()
         self._hdr_ptr = ctypes.cast(self._hdr_buf, ctypes.c_void_p)
@@ -265,21 +246,19 @@ class UsbmonSource:
             if self._stop_event.is_set():
                 raise StopIteration
 
-            # poll() may itself be interrupted by EINTR; treat that as
-            # "wake up and check the stop flag", same as a timeout.
+            # EINTR from poll() means "wake and re-check the stop flag", same
+            # as a timeout.
             try:
                 ready = self._poller.poll(self._poll_timeout_ms)
             except InterruptedError:
                 continue
 
             if not ready:
-                # Timeout. Loop back to check the stop flag.
-                continue
+                continue  # timeout; re-check stop flag
 
             event = self._fetch_event()
             if event is None:
-                # Filler packet or EINTR during ioctl. Loop again.
-                continue
+                continue  # filler packet or EINTR during ioctl
             return event
 
     # -- internals ---------------------------------------------------------
@@ -287,11 +266,11 @@ class UsbmonSource:
     def _fetch_event(self) -> tuple[bytes, bytes] | None:
         """Issue one MON_IOCX_GETX ioctl and return its bytes, or None.
 
-        Returns None for filler packets (drop and retry) and for EINTR
-        (caller's stop-flag check will pick up Ctrl+C on the next loop).
-        Any other ioctl failure raises :class:`UsbmonIoctlError`.
+        Returns None for filler packets (drop and retry) and for EINTR (the
+        caller's stop-flag check picks up Ctrl+C next loop). Other ioctl
+        failures raise :class:`UsbmonIoctlError`.
         """
-        assert self._fd is not None  # invariant: only called between __enter__/__exit__
+        assert self._fd is not None  # only called between __enter__/__exit__
 
         arg = _MonGetArg(
             hdr=self._hdr_ptr,
@@ -310,16 +289,13 @@ class UsbmonSource:
                 f"MON_IOCX_GETX failed on {self._device_path}: {os.strerror(exc.errno) if exc.errno else exc}"
             ) from exc
 
-        # Drop ring-buffer filler events. These are not real URBs and
-        # would fail to decode downstream.
+        # Drop ring-buffer filler; not real URBs, would fail to decode.
         if self._hdr_buf[_EVENT_TYPE_OFFSET] == _FILLER_EVENT_BYTE:
             return None
 
         header_bytes = bytes(self._hdr_buf)
-        # The kernel populates `len_cap` (bytes 36-39 of the header) with
-        # the actual captured data length. Slice the data buffer to that
-        # length so callers never see uninitialized tail bytes from
-        # earlier events.
+        # Slice the data buffer to len_cap (header bytes 36-39, the captured
+        # length) so callers never see stale tail bytes from earlier events.
         len_cap = int.from_bytes(header_bytes[36:40], "little", signed=False)
         captured = min(len_cap, _DATA_BUFFER_SIZE)
         data_bytes = bytes(self._data_buf[:captured])
@@ -349,11 +325,10 @@ class UsbmonSource:
 
 
 def _list_available_buses() -> list[int]:
-    """Return sorted list of bus numbers with a /dev/usbmonN device node.
+    """Return sorted bus numbers that have a /dev/usbmonN node.
 
-    Used to make the "bus not found" error message actually useful.
-    Returns an empty list if /dev doesn't exist or no usbmon nodes are
-    present (which usually means the usbmon kernel module isn't loaded).
+    Feeds the "bus not found" error message. Empty if /dev is absent or has
+    no usbmon nodes (usually meaning the usbmon module isn't loaded).
     """
     buses: list[int] = []
     try:

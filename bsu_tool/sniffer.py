@@ -1,31 +1,15 @@
-"""Orchestration layer for USB traffic capture to pcap-ng files.
+"""Orchestrate USB traffic capture to pcap-ng files.
 
-Wires three modules together:
+Wires :class:`~bsu_tool.usbmon_source.UsbmonSource` (raw events from one
+``/dev/usbmonN``) to :class:`~bsu_tool.pcapng_writer.PcapNgWriter`
+(Enhanced Packet Blocks), filtering by device number and tracking stats.
 
-* :class:`bsu_tool.usbmon_source.UsbmonSource` produces raw events
-  from one ``/dev/usbmonN`` device.
-* :class:`bsu_tool.pcapng_writer.PcapNgWriter` encodes those events as
-  pcap-ng Enhanced Packet Blocks.
-* This module filters by device number and tracks per-capture stats.
-
-The public entry point, :func:`capture`, takes everything by argument —
-no globals, no signal handling, no printing. The CLI ties stop to SIGINT
-and progress to stderr; the MCP server (Milestone 2) will tie them to
-its own stop tool call and notification channel. Same library function,
-two drivers.
-
-The output file is opened with mode ``"xb"``: the OS atomically refuses
-the open if the path already exists, so two concurrent captures cannot
-race and clobber each other. If the path exists, :class:`FileExistsError`
-propagates to the caller; translating that to a CLI error message is
-the caller's concern.
-
-:func:`capture` blocks until its stop event is set — the right shape for
-a CLI bound to Ctrl+C, the wrong shape for an interactive driver (an MCP
-tool call, say) that must start the capture, return so the user can be
-told to act, then stop it later. :class:`CaptureController` bridges the
-two: it runs ``capture`` on a daemon thread and exposes :meth:`start`
-and :meth:`stop`, so both drivers share the same underlying function.
+:func:`capture` takes everything by argument — no globals, signals, or
+printing — and blocks until its stop event is set. That fits a CLI bound
+to Ctrl+C but not an interactive driver (an MCP tool) that must start,
+return so the user can act, then stop later. :class:`CaptureController`
+bridges the gap by running ``capture`` on a daemon thread. Same library
+function, two drivers.
 """
 
 from __future__ import annotations
@@ -44,8 +28,8 @@ from bsu_tool.usbmon_source import UsbmonSource
 # Constants
 # ---------------------------------------------------------------------------
 
-#: Offset of the device-number byte in the 64-byte usbmon header.
-#: Matches the layout documented in urb_decoder.py.
+#: Offset of the device-number byte in the 64-byte usbmon header
+#: (layout documented in urb_decoder.py).
 _DEVNUM_OFFSET: int = 11
 
 # ---------------------------------------------------------------------------
@@ -57,27 +41,18 @@ _DEVNUM_OFFSET: int = 11
 class CaptureStats:
     """Running statistics for a capture session.
 
-    A single :class:`CaptureStats` instance is created at the start of a
-    capture and mutated in place as events arrive. The optional progress
-    callback receives the *same* instance on every tick, so observers
-    see live values rather than stale snapshots — useful for a CLI
-    counter that overwrites the same line, less useful if the observer
-    wants to compare two points in time (which would need a manual copy).
+    Created once at the start of a capture and mutated in place as events
+    arrive. The progress callback receives the *same* instance every tick,
+    so it sees live values, not snapshots (copy manually to compare two
+    points in time).
 
-    Field meanings:
-
-    * ``seen`` — events delivered by the kernel and not dropped as
-      filler. Includes events from devices the user did not ask for.
-    * ``matched`` — events that passed the device-number filter and
-      were written to the output file.
-    * ``elapsed_seconds`` — wall-clock seconds since the capture began.
-      Updated on every progress tick and on final stats; not updated
-      between ticks.
-    * ``output_path`` and ``output_bytes`` — where the file ended up
-      and how big it is. ``output_bytes`` is the writer's running byte
-      total; for an interrupted capture, this is approximate (the OS
-      may have buffered writes), but it's correct after the file is
-      closed.
+    * ``seen`` — non-filler events from the kernel, including devices the
+      user did not ask for.
+    * ``matched`` — events that passed the device filter and were written.
+    * ``elapsed_seconds`` — wall-clock since start; updated each tick.
+    * ``output_path`` / ``output_bytes`` — the file and its size.
+      ``output_bytes`` is the writer's running total (approximate mid-
+      capture due to buffering; exact once the file is closed).
     """
 
     output_path: Path
@@ -87,9 +62,8 @@ class CaptureStats:
     output_bytes: int = 0
 
 
-# Type alias for the optional progress callback. Called periodically
-# during capture with the running stats. The callback runs on the
-# capture thread, so it must be cheap and non-blocking.
+# Optional progress callback: invoked periodically with running stats.
+# Runs on the capture thread, so it must be cheap and non-blocking.
 ProgressCallback = Callable[[CaptureStats], None]
 
 
@@ -98,10 +72,9 @@ ProgressCallback = Callable[[CaptureStats], None]
 # ---------------------------------------------------------------------------
 
 
-#: Minimum wall-clock interval between progress callback invocations.
-#: A capture under heavy load can produce thousands of events per second;
-#: calling the progress callback on every event would dominate the hot
-#: path with formatting/printing work that nobody wants done 10,000x/sec.
+#: Minimum interval between progress callbacks. Heavy captures produce
+#: thousands of events per second; calling back on every one would swamp
+#: the hot path with formatting/printing work.
 _PROGRESS_INTERVAL_SECONDS: float = 0.2
 
 
@@ -116,53 +89,41 @@ def capture(
 ) -> CaptureStats:
     """Capture USB traffic from one bus (optionally one device) to a pcap-ng file.
 
-    Reads events from ``/dev/usbmon{bus}``, keeps those whose device
-    number matches ``device`` (or *all* of them in bus-only mode), and
-    writes them to ``output_path`` as Enhanced Packet Blocks. Runs until
-    ``stop_event`` is set.
+    Reads events from ``/dev/usbmon{bus}``, keeps those matching ``device``
+    (or all of them in bus-only mode), and writes them to ``output_path``
+    as Enhanced Packet Blocks. Runs until ``stop_event`` is set.
 
     Parameters
     ----------
     bus:
         usbmon bus number (the N in ``/dev/usbmonN``).
     device:
-        USB device number on that bus, as shown by ``lsusb``. Pass
-        ``None`` for *bus-only* capture: every non-filler event on the
-        bus is written, regardless of device address. Bus-only is the
-        right choice when the device's address is unknown or will change
-        during the capture — enumeration (a device answers at address 0
-        before ``SET_ADDRESS``, then at its assigned address), a
-        replug/reset, or a mode switch into a bootloader. Note that
-        ``0`` is a real address (the default address during enumeration),
-        *not* a wildcard; only ``None`` means "all devices". In bus-only
-        mode ``matched`` equals ``seen`` (the device-address mismatch is
-        the only reason an event is skipped).
+        USB device number on that bus (as shown by ``lsusb``), or ``None``
+        for *bus-only* capture (write every non-filler event regardless of
+        address). Use bus-only when the address is unknown or will change —
+        enumeration, replug/reset, or a switch into a bootloader. ``0`` is
+        a real address (the enumeration default), *not* a wildcard; only
+        ``None`` means "all devices". In bus-only mode ``matched == seen``.
     output_path:
-        Destination file. Opened with ``"xb"`` — the open fails if the
-        file already exists. Resolved against the current working
-        directory at open time.
+        Destination file, opened with ``"xb"`` — the open fails if it
+        already exists. Resolved against the cwd at open time.
     stop_event:
-        Set by the caller to stop the capture. Stop latency is bounded
-        by ``UsbmonSource``'s poll timeout (~100 ms).
+        Set by the caller to stop the capture. Latency is bounded by
+        ``UsbmonSource``'s poll timeout (~100 ms).
     ready_event:
-        Optional event set once the output file is open and the usbmon
-        device is being polled — i.e. the moment the capture is actually
-        live and will not miss subsequent traffic. A caller running this
-        function on a background thread can wait on it to learn when it
-        is safe to tell the user to operate the device. Because it is set
-        only *after* the open and the ``UsbmonSource`` enter succeed, a
-        caller that sees it set knows no startup exception was raised;
-        conversely, if the function returns or raises before setting it,
-        the capture never went live.
+        Optional event set once the file is open and the device is being
+        polled — i.e. the capture is live and will not miss traffic. Set
+        only *after* startup succeeds, so a caller that sees it set knows
+        no startup exception was raised; if this returns or raises before
+        setting it, the capture never went live.
     on_progress:
-        Optional callback invoked periodically with running stats.
-        Runs on the capture thread; should not block.
+        Optional callback invoked periodically with running stats. Runs on
+        the capture thread; should not block.
 
     Returns
     -------
     CaptureStats
-        Final stats, with ``elapsed_seconds`` and ``output_bytes``
-        reflecting the completed capture.
+        Final stats for the completed capture.
 
     Raises
     ------
@@ -177,9 +138,8 @@ def capture(
     start_time = time.monotonic()
     last_progress_time = start_time
 
-    # Open with "xb": fails atomically if the path already exists. This
-    # is the entire reason the caller doesn't need to do its own check —
-    # an existence test followed by an open would race.
+    # "xb" fails atomically if the path exists, so the caller needn't do
+    # its own check-then-open (which would race).
     with output_path.open("xb") as out_fp:
         writer = PcapNgWriter(out_fp)
         writer.write_section_header()
@@ -188,10 +148,8 @@ def capture(
         )
 
         with UsbmonSource(bus_number=bus, stop_event=stop_event) as source:
-            # The file is open and the usbmon device is registered for
-            # polling: the capture is live. Signal any waiter (e.g. a
-            # controller running this on a background thread) that it is
-            # now safe to instruct the user to operate the device.
+            # File open and device polling: the capture is live. Signal any
+            # waiter that it's now safe to tell the user to operate the device.
             if ready_event is not None:
                 ready_event.set()
 
@@ -199,11 +157,8 @@ def capture(
                 stats.seen += 1
 
                 if device is not None and header[_DEVNUM_OFFSET] != device:
-                    # Different device on the same bus (skipped only when a
-                    # specific device was requested; bus-only capture keeps
-                    # everything). Maybe update the progress UI so a wrong
-                    # --device shows a climbing "seen" against a stuck
-                    # "matched", then move on.
+                    # Another device on the bus. Still tick progress so a wrong
+                    # --device shows climbing "seen" against stuck "matched".
                     now = time.monotonic()
                     if on_progress is not None and now - last_progress_time >= _PROGRESS_INTERVAL_SECONDS:
                         stats.elapsed_seconds = now - start_time
@@ -212,12 +167,9 @@ def capture(
                         last_progress_time = now
                     continue
 
-                # The pcap-ng EPB timestamp and the usbmon header's
-                # ts_sec/ts_usec are independent fields. They should
-                # agree, so we compute the EPB timestamp from the
-                # usbmon header rather than calling time.time() —
-                # that way a downstream reader sees consistent values
-                # whether it reads the EPB header or the URB header.
+                # Derive the EPB timestamp from the usbmon header rather than
+                # time.time(), so a reader sees consistent values whether it
+                # reads the EPB header or the URB header.
                 ts_sec = int.from_bytes(header[16:24], "little", signed=True)
                 ts_usec = int.from_bytes(header[24:28], "little", signed=True)
                 timestamp_us = ts_sec * 1_000_000 + ts_usec
@@ -237,8 +189,8 @@ def capture(
                     on_progress(stats)
                     last_progress_time = now
 
-    # Final update happens after the file is closed so output_bytes
-    # reflects the true file size, not a possibly-still-buffered tell().
+    # Final update after close, so output_bytes is the true file size
+    # rather than a possibly-still-buffered tell().
     stats.elapsed_seconds = time.monotonic() - start_time
     stats.output_bytes = output_path.stat().st_size
     return stats
@@ -248,41 +200,25 @@ def capture(
 # Start/stop controller
 # ---------------------------------------------------------------------------
 #
-# :func:`capture` runs a loop until its stop event is set and only returns
-# afterward. That is the right shape for a CLI bound to Ctrl+C, but the wrong
-# shape for an interactive driver — an MCP tool call, say — that must:
+# :class:`CaptureController` adapts :func:`capture` (which blocks until stopped)
+# to an interactive driver that must start the capture, return so the user can
+# act, then stop it and collect stats. It runs ``capture`` on a daemon thread,
+# owns the stop and readiness events, and exposes :meth:`start`/:meth:`stop`.
 #
-#   1. start the capture, then *return* so the user can be told to act,
-#   2. let the user operate the device,
-#   3. stop the capture and collect the stats and output path.
-#
-# :class:`CaptureController` bridges the two. It runs ``capture`` on a daemon
-# thread, owns the stop and readiness events, and exposes :meth:`start` and
-# :meth:`stop`. :meth:`start` does not return until the capture is verifiably
-# live (so the caller never instructs the user to act on a capture that has not
-# begun, or that already failed to begin); :meth:`stop` sets the stop event,
-# joins the thread, and returns the final :class:`CaptureStats`.
-#
-# Startup errors raised inside ``capture`` — :class:`FileExistsError`,
-# :class:`~bsu_tool.usbmon_source.UsbmonPermissionError`,
-# :class:`~bsu_tool.usbmon_source.UsbmonBusNotAvailableError` — happen on the
-# capture thread. :meth:`start` re-raises them in the caller's thread before
-# returning, so the caller sees the same exceptions it would from a direct
-# ``capture`` call. Errors raised *after* the capture went live (a mid-capture
-# ``ENODEV``, for instance) surface from :meth:`stop` instead.
-#
-# The controller drives a single capture per instance. Call :meth:`start`
-# once; calling it again — before or after :meth:`stop` — raises
+# :meth:`start` returns only once the capture is verifiably live, so the caller
+# never tells the user to act on a capture that hasn't begun. Startup errors
+# (FileExistsError, UsbmonPermissionError, UsbmonBusNotAvailableError) are
+# re-raised from :meth:`start`; errors after the capture went live surface from
+# :meth:`stop`. One capture per instance — a second :meth:`start` raises
 # :class:`CaptureStateError`.
 
 #: Default ceiling on how long :meth:`CaptureController.start` waits for the
-#: capture to go live. Opening ``/dev/usbmonN`` (``O_RDONLY``) and the file
-#: (``"xb"``) should take milliseconds; this only guards against a pathological
-#: hang so the caller is never blocked indefinitely.
+#: capture to go live. Startup should take milliseconds; this only guards
+#: against a pathological hang.
 _DEFAULT_READY_TIMEOUT_SECONDS: float = 5.0
 
-#: Granularity of the start-time wait loop. Small enough that a fast startup
-#: failure is noticed promptly, large enough not to busy-spin.
+#: Poll granularity of the start-time wait loop: prompt enough to notice a fast
+#: startup failure, coarse enough not to busy-spin.
 _READY_POLL_SECONDS: float = 0.05
 
 
@@ -345,28 +281,26 @@ class CaptureController:
         """Start the capture and return once it is live.
 
         Spawns a daemon thread running :func:`capture` and blocks until the
-        capture has opened its output file and begun polling the usbmon
-        device — at which point it is safe to instruct the user to operate the
-        device. If the capture fails to start (file exists, permission denied,
-        bus unavailable, ...), the original exception is re-raised here.
+        output file is open and the device is being polled — the point at
+        which it is safe to tell the user to operate the device. Startup
+        failures are re-raised here.
 
         Parameters
         ----------
         bus:
             usbmon bus number (the N in ``/dev/usbmonN``).
         device:
-            USB device number on that bus, as shown by ``lsusb``, or
-            ``None`` for bus-only capture (keep every device on the bus).
-            See :func:`capture` for when bus-only is the right choice.
+            USB device number on that bus (as shown by ``lsusb``), or ``None``
+            for bus-only capture. See :func:`capture`.
         output_path:
             Destination pcap-ng file. Must not already exist.
         on_progress:
-            Optional progress callback, forwarded to ``capture``. Runs on the
+            Optional progress callback forwarded to ``capture``. Runs on the
             capture thread; must not block.
         ready_timeout:
-            Maximum seconds to wait for the capture to go live before giving
-            up. Exceeding it raises :class:`TimeoutError` (the background
-            thread is left running; call :meth:`stop` to wind it down).
+            Max seconds to wait for the capture to go live; exceeding it raises
+            :class:`TimeoutError` (the thread keeps running — call :meth:`stop`
+            to wind it down).
 
         Raises
         ------
@@ -400,9 +334,9 @@ class CaptureController:
         self._thread = Thread(target=_run, name="bsu-capture", daemon=True)
         self._thread.start()
 
-        # Wait for whichever happens first: the capture goes live (_ready), or
-        # the thread finishes (_finished) — the latter means it failed before
-        # going live, since a live capture only finishes once stopped.
+        # Wait for whichever comes first: the capture goes live (_ready), or
+        # the thread finishes (_finished) — finishing first means it failed
+        # before going live, since a live capture only finishes once stopped.
         deadline_reached = not self._wait_ready(ready_timeout)
         if self._ready.is_set():
             return
@@ -416,8 +350,7 @@ class CaptureController:
     def stop(self) -> CaptureStats:
         """Stop the capture, wait for the thread, and return final stats.
 
-        Signals the capture to stop, joins the background thread, and returns
-        the :class:`CaptureStats` the capture produced. If the capture raised
+        Signals the capture to stop and joins the thread. If the capture raised
         after going live, that exception is re-raised here.
 
         Raises

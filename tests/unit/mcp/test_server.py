@@ -71,6 +71,30 @@ def test_get_packets_rejects_invalid_pagination() -> None:
         asyncio.run(call_tool())
 
 
+def test_build_server_registers_marker_tools() -> None:
+    """build_server registers the Issue #54 add_marker and list_markers tools."""
+
+    async def tool_names() -> set[str]:
+        tools = await build_server().list_tools()
+        return {tool.name for tool in tools}
+
+    names = asyncio.run(tool_names())
+    assert "add_marker" in names
+    assert "list_markers" in names
+
+
+@pytest.mark.parametrize("tool", ["add_marker", "list_markers"])
+def test_marker_tools_without_capture_report_error(tool: str) -> None:
+    """Marker tools fail gracefully when no capture has been loaded."""
+
+    async def call_tool() -> None:
+        arguments = {"name": "x", "packet_index": 0} if tool == "add_marker" else {}
+        await build_server().call_tool(tool, arguments)
+
+    with pytest.raises(ToolError, match="No capture loaded"):
+        asyncio.run(call_tool())
+
+
 def test_get_packets_without_capture_reports_error() -> None:
     """get_packets fails gracefully when no capture has been loaded."""
 

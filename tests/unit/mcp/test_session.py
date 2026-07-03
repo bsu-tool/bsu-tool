@@ -480,15 +480,72 @@ def test_add_marker_requires_loaded_capture() -> None:
     """add_marker raises RuntimeError if no capture has been loaded."""
     session = Session()
     with pytest.raises(RuntimeError):
-        session.add_marker(name="x", timestamp=0.0, packet_index=0)
+        session.add_marker(name="x", packet_index=0)
 
 
 def test_add_marker_appends_to_capture(tmp_path: Path) -> None:
     """add_marker stores a Marker on the active capture and returns it."""
     session = Session()
     session.load(_write_capture(tmp_path))
-    marker = session.add_marker(name="press_button", timestamp=0.05, packet_index=1, note="hi")
+    marker = session.add_marker(name="press_button", packet_index=1, note="hi")
 
     assert isinstance(marker, Marker)
     assert session.capture is not None
     assert session.capture.markers == [marker]
+    assert marker.note == "hi"
+
+
+def test_add_marker_derives_timestamp_from_packet(tmp_path: Path) -> None:
+    """The marker's timestamp is the decoded record's timestamp at packet_index."""
+    session = Session()
+    capture = session.load(_write_capture(tmp_path))
+
+    marker = session.add_marker(name="m", packet_index=1)
+
+    assert marker.timestamp == capture.records[1].timestamp
+
+
+def test_add_marker_rejects_duplicate_name(tmp_path: Path) -> None:
+    """Marker names are unique per capture — duplicates raise ValueError."""
+    session = Session()
+    session.load(_write_capture(tmp_path))
+    session.add_marker(name="press", packet_index=0)
+
+    with pytest.raises(ValueError, match="'press' already exists"):
+        session.add_marker(name="press", packet_index=1)
+
+
+def test_add_marker_rejects_empty_name(tmp_path: Path) -> None:
+    """An empty marker name raises ValueError."""
+    session = Session()
+    session.load(_write_capture(tmp_path))
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        session.add_marker(name="", packet_index=0)
+
+
+@pytest.mark.parametrize("packet_index", [-1, 2, 100])
+def test_add_marker_rejects_out_of_range_index(tmp_path: Path, packet_index: int) -> None:
+    """packet_index must address a decoded record (capture has 2)."""
+    session = Session()
+    session.load(_write_capture(tmp_path))
+
+    with pytest.raises(ValueError, match="out of range"):
+        session.add_marker(name="m", packet_index=packet_index)
+
+
+def test_list_markers_requires_loaded_capture() -> None:
+    """list_markers raises RuntimeError if no capture has been loaded."""
+    with pytest.raises(RuntimeError):
+        Session().list_markers()
+
+
+def test_list_markers_returns_insertion_order(tmp_path: Path) -> None:
+    """list_markers returns () when empty, then markers in the order added."""
+    session = Session()
+    session.load(_write_capture(tmp_path))
+
+    assert session.list_markers() == ()
+    first = session.add_marker(name="a-start", packet_index=0)
+    second = session.add_marker(name="a-end", packet_index=1)
+    assert session.list_markers() == (first, second)

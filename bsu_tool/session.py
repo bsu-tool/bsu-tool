@@ -154,13 +154,36 @@ class Session:
         )
         return self.capture
 
-    def add_marker(self, name: str, timestamp: float, packet_index: int, note: str | None = None) -> Marker:
-        """Append a named marker to the loaded capture and return it."""
+    def add_marker(self, name: str, packet_index: int, note: str | None = None) -> Marker:
+        """Append a named marker anchored to a decoded packet and return it.
+
+        The marker's timestamp is taken from the decoded record at
+        ``packet_index`` (the same index space ``get_packets`` reports).
+
+        Raises:
+            RuntimeError: No capture has been loaded.
+            ValueError: ``name`` is empty or already used, or ``packet_index``
+                is outside the decoded record range.
+        """
         if self.capture is None:
             raise RuntimeError("No capture loaded. Call load() first.")
-        marker = Marker(name=name, timestamp=timestamp, packet_index=packet_index, note=note)
+        if not name:
+            raise ValueError("marker name must not be empty")
+        if any(marker.name == name for marker in self.capture.markers):
+            raise ValueError(f"marker name {name!r} already exists")
+        records = self.capture.records
+        if not 0 <= packet_index < len(records):
+            raise ValueError(f"packet_index {packet_index} out of range (0..{len(records) - 1})")
+        # Record lookup by index; swap onto the #53 packet store's get_packet() when it lands.
+        marker = Marker(name=name, timestamp=records[packet_index].timestamp, packet_index=packet_index, note=note)
         self.capture.markers.append(marker)
         return marker
+
+    def list_markers(self) -> tuple[Marker, ...]:
+        """Return all markers on the loaded capture in insertion order."""
+        if self.capture is None:
+            raise RuntimeError("No capture loaded. Call load() first.")
+        return tuple(self.capture.markers)
 
     def list_devices(self) -> tuple[DeviceSummary, ...]:
         """Return USB devices observed in the active capture."""

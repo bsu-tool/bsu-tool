@@ -1,5 +1,6 @@
 {
   "pythonVersion": "3.11",
+  "pythonPlatform": "Linux",
   "typeCheckingMode": "strict",
   "include": ["bsu_tool", "tests"]
 }

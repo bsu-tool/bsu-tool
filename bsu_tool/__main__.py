@@ -205,6 +205,27 @@ def main(argv: list[str] | None = None) -> None:
         help="Path to the .pcapng capture file",
     )
 
+    sniff_cmd = subparsers.add_parser(
+        "sniff",
+        help="Capture USB traffic from one device to a pcap-ng file (Linux only)",
+    )
+    sniff_cmd.add_argument(
+        "--bus",
+        type=int,
+        required=True,
+        help="usbmon bus number (the N in /dev/usbmonN), as shown by lsusb",
+    )
+    sniff_cmd.add_argument(
+        "--device",
+        type=int,
+        default=None,
+        help="USB device number on that bus, as shown by lsusb; omit to capture all devices on the bus (bus-only)",
+    )
+    sniff_cmd.add_argument(
+        "output",
+        help="Destination .pcapng file (must not already exist)",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "mcp":
@@ -215,6 +236,16 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "parse":
         sys.exit(_cmd_parse(args.capture))
+
+    if args.command == "sniff":
+        # Lazy import: sniff_command pulls in usbmon_source, whose top-level
+        # `import fcntl` is Linux-only. Importing it here rather than at module
+        # top keeps the `parse` and `mcp` commands working on non-Linux
+        # machines, where fcntl is absent.
+        from bsu_tool.sniff_command import run_sniff
+
+        run_sniff(args.bus, args.device, Path(args.output))
+        return
 
     parser.print_help()
 

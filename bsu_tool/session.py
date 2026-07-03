@@ -6,7 +6,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
 
-from bsu_tool.mcp.interfaces import CaptureInterface, CaptureMetadata, CapturePacket, DeviceSummary, EndpointSummary
+from bsu_tool.mcp.interfaces import (
+    CaptureInterface,
+    CaptureMetadata,
+    CapturePacket,
+    DeviceSummary,
+    EndpointSummary,
+    PacketRecord,
+    PacketSelection,
+)
 from bsu_tool.pcapng_reader import (
     EnhancedPacketBlock,
     InterfaceDescriptionBlock,
@@ -16,6 +24,8 @@ from bsu_tool.pcapng_reader import (
     SimplePacketBlock,
 )
 from bsu_tool.urb_decoder import (
+    Direction,
+    EventType,
     TransferType,
     UnsupportedTransferTypeError,
     UrbRecord,
@@ -33,7 +43,9 @@ _GET_DESCRIPTOR_REQUEST: Final[int] = 0x06
 _DEVICE_DESCRIPTOR_TYPE: Final[int] = 0x01
 _STRING_DESCRIPTOR_TYPE: Final[int] = 0x03
 _ENDPOINT_IN_FLAG: Final[int] = 0x80
+_ENDPOINT_NUMBER_MASK: Final[int] = 0x0F
 _TRANSFER_TYPE_ORDER: Final[tuple[TransferType, ...]] = ("control", "bulk")
+_DATA_PREVIEW_BYTES: Final[int] = 32
 
 
 @dataclass(frozen=True)
@@ -156,6 +168,57 @@ class Session:
             raise RuntimeError("No capture loaded. Call load_capture() first.")
         return _summarize_devices(self.capture.records, self.capture.transactions)
 
+    def get_packets(
+        self,
+        *,
+        device_id: str | None = None,
+        endpoint: str | None = None,
+        direction: Direction | None = None,
+        transfer_type: TransferType | None = None,
+        event_type: EventType | None = None,
+    ) -> PacketSelection:
+        """Return decoded URB packets from the active capture, filtered in place.
+
+        Every keyword narrows the result independently; ``None`` disables that
+        criterion. Only Control and Bulk packets exist in the decoded stream —
+        Interrupt and Isochronous records were dropped at load time.
+
+        Args:
+            device_id: Restrict to one device by its ``dev_bbb_ddd`` id.
+            endpoint: Restrict to one endpoint number in decimal, e.g. ``"3"`` or
+                ``"15"``. A ``0x``-prefixed full address such as ``"0x83"`` is also
+                accepted — only its endpoint number (low nibble) is used, the
+                direction bit is ignored. Use ``direction`` to select IN or OUT.
+            direction: Restrict to ``"in"`` or ``"out"`` transfers.
+            transfer_type: Restrict to ``"control"`` or ``"bulk"`` transfers.
+            event_type: Restrict to ``"submission"``, ``"completion"``, or ``"error"``.
+
+        Returns:
+            A :class:`PacketSelection` whose ``matches`` satisfy every filter and
+            whose ``total_count`` is the number of decoded records in the capture.
+
+        Raises:
+            RuntimeError: No capture has been loaded.
+            ValueError: ``endpoint`` is not a valid endpoint number or address.
+        """
+        if self.capture is None:
+            raise RuntimeError("No capture loaded. Call load_capture() first.")
+        endpoint_number = _normalize_endpoint(endpoint)
+        records = self.capture.records
+        matches = tuple(
+            _packet_record(index, record)
+            for index, record in enumerate(records)
+            if _record_matches(
+                record,
+                device_id=device_id,
+                endpoint_number=endpoint_number,
+                direction=direction,
+                transfer_type=transfer_type,
+                event_type=event_type,
+            )
+        )
+        return PacketSelection(matches=matches, total_count=len(records))
+
 
 def _validate_capture_path(path: Path) -> Path:
     source = path.expanduser().resolve()
@@ -244,6 +307,78 @@ def _decode_supported_packets(packets: list[CapturePacket]) -> tuple[UrbRecord, 
         except UnsupportedTransferTypeError:
             continue
     return tuple(records)
+
+
+def _packet_record(index: int, record: UrbRecord) -> PacketRecord:
+    return PacketRecord(
+        index=index,
+        urb_id=record.urb_id,
+        event_type=record.event_type,
+        transfer_type=record.transfer_type,
+        direction=record.direction,
+        device_id=_device_id(record.bus_num, record.dev_num),
+        bus_num=record.bus_num,
+        dev_num=record.dev_num,
+        endpoint_address=f"0x{_endpoint_address(record):02x}",
+        endpoint_number=record.endpoint,
+        status=record.status,
+        length=record.length,
+        data_length=len(record.data),
+        data_preview=_data_preview(record.data),
+        setup=record.setup.hex() if record.setup is not None else None,
+        timestamp=record.timestamp,
+    )
+
+
+def _data_preview(data: bytes) -> str | None:
+    if not data:
+        return None
+    return data[:_DATA_PREVIEW_BYTES].hex()
+
+
+def _normalize_endpoint(endpoint: str | None) -> int | None:
+    if endpoint is None:
+        return None
+    text = endpoint.lower()
+    if text.startswith("0x"):  # full USB address; keep the endpoint number (low nibble)
+        try:
+            address = int(text, 16)
+        except ValueError as error:
+            raise ValueError(f"endpoint address must be hexadecimal, got {endpoint!r}") from error
+        if not 0 <= address <= 0xFF:
+            raise ValueError(f"endpoint address must be in 0x00-0xff, got {endpoint!r}")
+        return address & _ENDPOINT_NUMBER_MASK
+    try:
+        number = int(text, 10)
+    except ValueError as error:
+        raise ValueError(
+            f"endpoint must be a decimal number 0-15 or a 0x-prefixed address, got {endpoint!r}"
+        ) from error
+    if not 0 <= number <= _ENDPOINT_NUMBER_MASK:
+        raise ValueError(f"endpoint number must be 0-15, got {endpoint!r}")
+    return number
+
+
+def _record_matches(
+    record: UrbRecord,
+    *,
+    device_id: str | None,
+    endpoint_number: int | None,
+    direction: Direction | None,
+    transfer_type: TransferType | None,
+    event_type: EventType | None,
+) -> bool:
+    if device_id is not None and _device_id(record.bus_num, record.dev_num) != device_id:
+        return False
+    if endpoint_number is not None and record.endpoint != endpoint_number:
+        return False
+    if direction is not None and record.direction != direction:
+        return False
+    if transfer_type is not None and record.transfer_type != transfer_type:
+        return False
+    if event_type is not None and record.event_type != event_type:
+        return False
+    return True
 
 
 def _summarize_devices(

@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Final
 
 from mcp.server.fastmcp import FastMCP
 
 from bsu_tool.mcp.interfaces import DeviceSummary
+from bsu_tool.mcp.tools.pagination import DEFAULT_LIMIT, validate_pagination
 from bsu_tool.session import Session
-
-_DEFAULT_LIMIT: Final[int] = 100
-_MAX_LIMIT: Final[int] = 1000
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,10 +30,10 @@ def register(mcp: FastMCP, session: Session) -> None:
     def list_devices(  # pyright: ignore[reportUnusedFunction]
         include_descriptor_summary: bool = True,
         offset: int = 0,
-        limit: int = _DEFAULT_LIMIT,
+        limit: int = DEFAULT_LIMIT,
     ) -> ListDevicesResult:
         """List USB devices observed in the active capture."""
-        _validate_pagination(offset, limit)
+        validate_pagination(offset, limit)
         devices = session.list_devices()
         page = devices[offset : offset + limit]
         if not include_descriptor_summary:
@@ -49,12 +46,3 @@ def register(mcp: FastMCP, session: Session) -> None:
             returned_count=len(page),
             has_more=offset + len(page) < len(devices),
         )
-
-
-def _validate_pagination(offset: int, limit: int) -> None:
-    if offset < 0:
-        raise ValueError("offset must be greater than or equal to 0")
-    if limit < 1:
-        raise ValueError("limit must be greater than or equal to 1")
-    if limit > _MAX_LIMIT:
-        raise ValueError(f"limit must be less than or equal to {_MAX_LIMIT}")

@@ -49,3 +49,33 @@ def test_list_devices_rejects_invalid_pagination(arguments: dict[str, int], mess
 
     with pytest.raises(ToolError, match=message):
         asyncio.run(call_tool())
+
+
+def test_build_server_registers_get_packets_tool() -> None:
+    """build_server registers the Issue #43 get_packets tool."""
+
+    async def tool_names() -> set[str]:
+        tools = await build_server().list_tools()
+        return {tool.name for tool in tools}
+
+    assert "get_packets" in asyncio.run(tool_names())
+
+
+def test_get_packets_rejects_invalid_pagination() -> None:
+    """get_packets is wired to the shared pagination validator (exhaustively tested above)."""
+
+    async def call_tool() -> None:
+        await build_server().call_tool("get_packets", {"offset": -1})
+
+    with pytest.raises(ToolError, match="offset must be greater than or equal to 0"):
+        asyncio.run(call_tool())
+
+
+def test_get_packets_without_capture_reports_error() -> None:
+    """get_packets fails gracefully when no capture has been loaded."""
+
+    async def call_tool() -> None:
+        await build_server().call_tool("get_packets", {})
+
+    with pytest.raises(ToolError, match="No capture loaded"):
+        asyncio.run(call_tool())

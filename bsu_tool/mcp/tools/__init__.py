@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
-from bsu_tool.mcp.tools import capture, devices
+from bsu_tool.mcp.tools import capture, devices, packets
 from bsu_tool.session import Session
 
 
@@ -16,3 +16,4 @@ def register_all(mcp: FastMCP, session: Session) -> None:
     """Register every MCP tool group against the FastMCP instance."""
     capture.register(mcp, session)
     devices.register(mcp, session)
+    packets.register(mcp, session)

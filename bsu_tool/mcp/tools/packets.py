@@ -38,7 +38,7 @@ def register(mcp: FastMCP, session: Session) -> None:
         offset: int = 0,
         limit: int = DEFAULT_LIMIT,
     ) -> GetPacketsResult:
-        """Retrieve decoded Control and Bulk URB packets from the active capture.
+        """Retrieve decoded Control, Bulk, and Interrupt URB packets from the active capture.
 
         Filters compose — a packet must satisfy all that are given. Two need
         explaining beyond their schema:

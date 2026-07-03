@@ -15,13 +15,11 @@ Two operations are exposed:
   :class:`UrbRecord` events in capture order and yields
   :class:`UrbTransaction` objects.
 
-Scope (Milestone 1):
+Scope:
 
-* Control and Bulk transfers are decoded.
-* Interrupt transfers are scheduled for Milestone 2 and intentionally
-  raise :class:`UnsupportedTransferTypeError`.
+* Control, Bulk, and Interrupt transfers are decoded.
 * Isochronous transfers are out of scope for this project entirely and
-  also raise :class:`UnsupportedTransferTypeError`.
+  raise :class:`UnsupportedTransferTypeError`.
 
 64-byte usbmon header layout (LINKTYPE_USB_LINUX_MMAPPED = 220):
 
@@ -67,7 +65,7 @@ from typing import Final, Literal
 # --- Public type aliases ---------------------------------------------------
 
 EventType = Literal["submission", "completion", "error"]
-TransferType = Literal["control", "bulk"]
+TransferType = Literal["control", "bulk", "interrupt"]
 Direction = Literal["in", "out"]
 
 # --- Link-type constants ---------------------------------------------------
@@ -147,10 +145,10 @@ class MalformedUsbmonHeaderError(UrbDecodeError):
 class UnsupportedTransferTypeError(UrbDecodeError):
     """Raised when a URB's transfer type is recognized but out of scope.
 
-    Currently raised for Interrupt (scheduled for Milestone 2) and
-    Isochronous (out of scope for this project). The decoder distinguishes
-    "I know what this is but won't decode it" from "I don't recognize
-    this byte at all" — the latter raises :class:`MalformedUsbmonHeaderError`.
+    Currently raised for Isochronous transfers (out of scope for this
+    project). The decoder distinguishes "I know what this is but won't
+    decode it" from "I don't recognize this byte at all" — the latter
+    raises :class:`MalformedUsbmonHeaderError`.
     """
 
 
@@ -218,8 +216,7 @@ def decode_urb(packet_data: bytes, link_type: int) -> UrbRecord:
         shorter than the declared header size, or the header contains
         an unrecognized event-type or transfer-type byte.
     UnsupportedTransferTypeError
-        The header declares an Interrupt transfer (Milestone 2) or an
-        Isochronous transfer (out of scope).
+        The header declares an Isochronous transfer (out of scope).
     """
     header_size = _header_size_for_link_type(link_type)
     if len(packet_data) < header_size:
@@ -303,18 +300,17 @@ def _decode_event_type(byte: int) -> EventType:
 def _decode_transfer_type(byte: int) -> TransferType:
     """Project a raw transfer-type byte into a typed :data:`TransferType`.
 
-    Raises :class:`UnsupportedTransferTypeError` for Interrupt and
-    Isochronous (recognized but out of scope), and
-    :class:`MalformedUsbmonHeaderError` for any other byte value.
+    Decodes Control, Bulk, and Interrupt. Raises
+    :class:`UnsupportedTransferTypeError` for Isochronous (recognized but
+    out of scope), and :class:`MalformedUsbmonHeaderError` for any other
+    byte value.
     """
     if byte == _XFER_CONTROL:
         return "control"
     if byte == _XFER_BULK:
         return "bulk"
     if byte == _XFER_INTERRUPT:
-        raise UnsupportedTransferTypeError(
-            "interrupt transfers are scheduled for Milestone 2 and are not yet supported"
-        )
+        return "interrupt"
     if byte == _XFER_ISOCHRONOUS:
         raise UnsupportedTransferTypeError("isochronous transfers are out of scope for this project")
     raise MalformedUsbmonHeaderError(f"unknown usbmon transfer-type byte: {byte:#04x}")

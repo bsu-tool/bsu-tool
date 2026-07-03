@@ -22,12 +22,12 @@ def test_get_packets_goodix_capture() -> None:
     capture = session.load(_CAPTURE)
 
     everything = session.get_packets()
-    assert everything.total_count == len(capture.records) == 249
-    assert len(everything.matches) == 249
+    assert everything.total_count == len(capture.records) == 253
+    assert len(everything.matches) == 253
     assert [packet.index for packet in everything.matches[:3]] == [0, 1, 2]
 
     device = session.get_packets(device_id="dev_001_011")
-    assert device.total_count == 249
+    assert device.total_count == 253
     assert 0 < len(device.matches) < everything.total_count
     assert {packet.device_id for packet in device.matches} == {"dev_001_011"}
 
@@ -57,7 +57,7 @@ def test_get_packets_tool_assembles_paginated_result() -> None:
     assert isinstance(block, TextContent)
     payload = json.loads(block.text)
 
-    assert payload["total_count"] == 249
+    assert payload["total_count"] == 253
     assert 0 < payload["match_count"] < payload["total_count"]
     assert payload["returned_count"] == 5
     assert payload["limit"] == 5

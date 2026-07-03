@@ -44,7 +44,7 @@ _DEVICE_DESCRIPTOR_TYPE: Final[int] = 0x01
 _STRING_DESCRIPTOR_TYPE: Final[int] = 0x03
 _ENDPOINT_IN_FLAG: Final[int] = 0x80
 _ENDPOINT_NUMBER_MASK: Final[int] = 0x0F
-_TRANSFER_TYPE_ORDER: Final[tuple[TransferType, ...]] = ("control", "bulk")
+_TRANSFER_TYPE_ORDER: Final[tuple[TransferType, ...]] = ("control", "bulk", "interrupt")
 _DATA_PREVIEW_BYTES: Final[int] = 32
 
 
@@ -180,8 +180,8 @@ class Session:
         """Return decoded URB packets from the active capture, filtered in place.
 
         Every keyword narrows the result independently; ``None`` disables that
-        criterion. Only Control and Bulk packets exist in the decoded stream —
-        Interrupt and Isochronous records were dropped at load time.
+        criterion. Control, Bulk, and Interrupt packets exist in the decoded
+        stream — only Isochronous records are dropped at load time.
 
         Args:
             device_id: Restrict to one device by its ``dev_bbb_ddd`` id.
@@ -190,7 +190,7 @@ class Session:
                 accepted — only its endpoint number (low nibble) is used, the
                 direction bit is ignored. Use ``direction`` to select IN or OUT.
             direction: Restrict to ``"in"`` or ``"out"`` transfers.
-            transfer_type: Restrict to ``"control"`` or ``"bulk"`` transfers.
+            transfer_type: Restrict to ``"control"``, ``"bulk"``, or ``"interrupt"`` transfers.
             event_type: Restrict to ``"submission"``, ``"completion"``, or ``"error"``.
 
         Returns:

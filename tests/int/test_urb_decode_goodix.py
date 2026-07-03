@@ -2,30 +2,28 @@
 
 These tests exercise the full decode pipeline against the sanitized
 goodix_enum_and_enroll capture file.  Unlike the unit tests, which build
-pcap-ng blocks by hand, these tests use a real capture containing control
-and bulk transfers (plus 4 interrupt packets that are skipped as
-out-of-scope for Milestone 1), validating that the two modules compose
+pcap-ng blocks by hand, these tests use a real capture containing control,
+bulk, and interrupt transfers, validating that the two modules compose
 correctly end-to-end.
 
 Capture profile (goodix_enum_and_enroll_sanitized.pcapng):
-    253 EPBs total
-     -4 interrupt (hub port-change notifications, skipped)
-    ---
-    249 decoded URB records
+    253 EPBs total = 253 decoded URB records
+    (no isochronous transfers — the only remaining out-of-scope type)
 
-    Transfer types:   142 control, 107 bulk
-    Event types:      125 submissions, 124 completions
+    Transfer types:   142 control, 107 bulk, 4 interrupt
+    Event types:      127 submissions, 126 completions
     Bus numbers:      {1}
     Device numbers:   {0, 1, 11}
         device  0 — default address (pre-SET_ADDRESS enumeration)
         device  1 — USB hub (port management and interrupt)
         device 11 — Goodix MOC fingerprint reader (Goodix protocol)
 
-    Transactions:     125 total
-        124 fully paired
-          1 orphan submission (bulk IN read queued on EP 0x83 in-flight
-                               at capture end — expected at capture boundaries)
-          0 orphan completions
+    Transactions:     128 total
+        125 fully paired
+          2 orphan submissions (in-flight at capture end — a bulk IN read on
+                                EP 0x83 and an interrupt poll)
+          1 orphan completion  (interrupt completion whose submission was
+                                queued before the capture began)
 """
 
 from __future__ import annotations
@@ -69,7 +67,7 @@ def pipeline() -> tuple[int, list[EnhancedPacketBlock]]:
 
 @pytest.fixture(scope="module")
 def urb_records(pipeline: tuple[int, list[EnhancedPacketBlock]]) -> list[UrbRecord]:
-    """Decode supported EPBs; silently skip interrupt/isochronous transfers."""
+    """Decode supported EPBs; silently skip out-of-scope isochronous transfers."""
     link_type, epbs = pipeline
     records: list[UrbRecord] = []
     for epb in epbs:
@@ -104,7 +102,7 @@ def test_epbs_decode_without_malformed_error(
         try:
             decode_urb(epb.packet_data, link_type)
         except UnsupportedTransferTypeError:
-            pass  # interrupt -- recognized but out of scope for Milestone 1
+            pass  # isochronous -- recognized but out of scope for this project
 
 
 def test_link_type(pipeline: tuple[int, list[EnhancedPacketBlock]]) -> None:
@@ -127,30 +125,31 @@ def test_epb_count(pipeline: tuple[int, list[EnhancedPacketBlock]]) -> None:
 
 
 def test_record_count(urb_records: list[UrbRecord]) -> None:
-    """253 EPBs minus 4 interrupt yields 249 decoded URB records."""
-    assert len(urb_records) == 249
+    """All 253 EPBs decode into URB records (no isochronous to skip)."""
+    assert len(urb_records) == 253
 
 
 def test_transfer_type_counts(urb_records: list[UrbRecord]) -> None:
-    """The decoded records contain 142 control and 107 bulk transfers."""
+    """The decoded records contain 142 control, 107 bulk, and 4 interrupt transfers."""
     ctrl = sum(1 for r in urb_records if r.transfer_type == "control")
     bulk = sum(1 for r in urb_records if r.transfer_type == "bulk")
+    interrupt = sum(1 for r in urb_records if r.transfer_type == "interrupt")
     assert ctrl == 142
     assert bulk == 107
+    assert interrupt == 4
 
 
 def test_submission_completion_counts(urb_records: list[UrbRecord]) -> None:
-    """The capture contains 125 submissions and 124 completions.
+    """The capture contains 127 submissions and 126 completions.
 
-    The single extra submission is a bulk IN read queued on EP 0x83 that
-    was still in-flight when the capture ended (no matching completion
-    packet).  This is normal at capture boundaries and exercises the
-    orphan-submission path in pair_urbs.
+    The submission/completion imbalance comes from transactions straddling
+    the capture boundaries (see test_transaction_pairing_stats), which
+    exercise the orphan-submission and orphan-completion paths in pair_urbs.
     """
     submissions = [r for r in urb_records if r.event_type == "submission"]
     completions = [r for r in urb_records if r.event_type == "completion"]
-    assert len(submissions) == 125
-    assert len(completions) == 124
+    assert len(submissions) == 127
+    assert len(completions) == 126
 
 
 def test_devices_on_single_bus(urb_records: list[UrbRecord]) -> None:
@@ -215,22 +214,23 @@ def test_bulk_records_have_no_setup(urb_records: list[UrbRecord]) -> None:
 
 
 def test_transaction_count(urb_transactions: list[UrbTransaction]) -> None:
-    """pair_urbs must produce exactly 125 transactions from the 249 records."""
-    assert len(urb_transactions) == 125
+    """pair_urbs must produce exactly 128 transactions from the 253 records."""
+    assert len(urb_transactions) == 128
 
 
 def test_transaction_pairing_stats(urb_transactions: list[UrbTransaction]) -> None:
-    """124 fully-paired transactions; 1 orphan submission; 0 orphan completions.
+    """125 fully-paired transactions; 2 orphan submissions; 1 orphan completion.
 
-    The single orphan submission is the bulk IN read in-flight at capture
-    end (see test_submission_completion_counts for details).
+    The orphans are transactions straddling the capture boundaries: a bulk IN
+    read and an interrupt poll still in-flight at capture end, plus an
+    interrupt completion whose submission preceded the capture start.
     """
     paired = sum(1 for t in urb_transactions if t.submission and t.completion)
     orphan_sub = sum(1 for t in urb_transactions if t.submission and not t.completion)
     orphan_cmp = sum(1 for t in urb_transactions if not t.submission and t.completion)
-    assert paired == 124
-    assert orphan_sub == 1
-    assert orphan_cmp == 0
+    assert paired == 125
+    assert orphan_sub == 2
+    assert orphan_cmp == 1
 
 
 def test_paired_urb_ids_match(urb_transactions: list[UrbTransaction]) -> None:

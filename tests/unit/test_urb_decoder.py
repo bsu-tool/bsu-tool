@@ -347,13 +347,13 @@ def test_captured_length_exceeds_available_data_off_by_one_raises() -> None:
         decode_urb(_packet(h, data=payload), LINKTYPE_USB_LINUX)
 
 
-# --- UnsupportedTransferTypeError tests --------------------------------------
+# --- Interrupt + UnsupportedTransferTypeError tests --------------------------
 
 
-def test_interrupt_transfer_raises() -> None:
+def test_interrupt_transfer_decodes() -> None:
     h = _hdr(xfer=_INTR)
-    with pytest.raises(UnsupportedTransferTypeError):
-        decode_urb(_packet(h), LINKTYPE_USB_LINUX)
+    rec = decode_urb(_packet(h), LINKTYPE_USB_LINUX)
+    assert rec.transfer_type == "interrupt"
 
 
 def test_isochronous_transfer_raises() -> None:

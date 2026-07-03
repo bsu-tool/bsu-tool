@@ -15,6 +15,7 @@ _COMPLETION = 0x43
 _CONTROL = 2
 _BULK = 3
 _INTERRUPT = 1
+_ISOCHRONOUS = 0
 
 
 def _pad4(data: bytes) -> bytes:
@@ -228,9 +229,13 @@ def test_load_rejects_packet_with_unknown_interface(tmp_path: Path) -> None:
 
 
 def test_load_skips_unsupported_transfers(tmp_path: Path) -> None:
-    """Session.load keeps metadata while skipping unsupported decoded records."""
-    path = tmp_path / "interrupt.pcapng"
-    path.write_bytes(_capture_bytes((_usbmon_packet(transfer_type=_INTERRUPT),)))
+    """Session.load keeps metadata while skipping unsupported decoded records.
+
+    Isochronous is the only transfer type still out of scope; interrupt is
+    now decoded like control and bulk.
+    """
+    path = tmp_path / "isochronous.pcapng"
+    path.write_bytes(_capture_bytes((_usbmon_packet(transfer_type=_ISOCHRONOUS),)))
 
     capture = Session().load(path)
 
@@ -241,12 +246,24 @@ def test_load_skips_unsupported_transfers(tmp_path: Path) -> None:
 
 def test_list_devices_returns_empty_for_unsupported_only_capture(tmp_path: Path) -> None:
     """list_devices returns an empty tuple when no packets decode into records."""
-    path = tmp_path / "interrupt-only.pcapng"
-    path.write_bytes(_capture_bytes((_usbmon_packet(transfer_type=_INTERRUPT),)))
+    path = tmp_path / "isochronous-only.pcapng"
+    path.write_bytes(_capture_bytes((_usbmon_packet(transfer_type=_ISOCHRONOUS),)))
     session = Session()
     session.load(path)
 
     assert session.list_devices() == ()
+
+
+def test_load_decodes_interrupt_transfers(tmp_path: Path) -> None:
+    """Interrupt transfers are now decoded into records like control and bulk."""
+    path = tmp_path / "interrupt.pcapng"
+    path.write_bytes(_capture_bytes((_usbmon_packet(transfer_type=_INTERRUPT, endpoint=0x81),)))
+
+    capture = Session().load(path)
+
+    assert capture.metadata.packet_count == 1
+    assert len(capture.records) == 1
+    assert capture.records[0].transfer_type == "interrupt"
 
 
 def test_list_devices_requires_loaded_capture() -> None:
@@ -440,8 +457,8 @@ def test_get_packets_endpoint_number_is_decimal(tmp_path: Path) -> None:
             session.get_packets(endpoint=bad)
 
 
-def test_get_packets_excludes_interrupt(tmp_path: Path) -> None:
-    """Interrupt packets never appear in the decoded record stream."""
+def test_get_packets_includes_interrupt(tmp_path: Path) -> None:
+    """Interrupt packets appear in the decoded record stream alongside bulk."""
     path = tmp_path / "interrupt.pcapng"
     path.write_bytes(
         _capture_bytes(
@@ -455,8 +472,8 @@ def test_get_packets_excludes_interrupt(tmp_path: Path) -> None:
     session.load(path)
 
     selection = session.get_packets()
-    assert selection.total_count == 1
-    assert selection.matches[0].transfer_type == "bulk"
+    assert selection.total_count == 2
+    assert [match.transfer_type for match in selection.matches] == ["bulk", "interrupt"]
 
 
 def test_add_marker_requires_loaded_capture() -> None:

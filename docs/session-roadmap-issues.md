@@ -1,5 +1,21 @@
 # Capture Session Roadmap Issues
 
+> **Status note (stale — read before using):** This roadmap predates the MCP
+> session work and its central premise no longer holds. It assumed the legacy
+> `bsu_tool.session.CaptureSession` would become the shared backing store that
+> MCP tools query (see issue 29). In practice the MCP layer grew its own model —
+> `Session` → `Capture` holding `records`/`packets`/`transactions`/`markers`,
+> with `get_packets(device_id=…, endpoint=…, …)` already providing device and
+> endpoint filtering. `CaptureSession` remains CLI-`parse`-summary only.
+>
+> As a result, issues **22–24** (the `USBPacket` model plus `add_packet` /
+> `packets_for_device` / `packets_for_endpoint` on `CaptureSession`) are
+> **obsolete**: their goal — "a backing store for `get_packets`" — is already
+> met by `Session`. Issue **#53** therefore landed as a single non-duplicative
+> accessor, `Session.get_packet(index) -> PacketRecord | None`, rather than a
+> parallel packet store. Treat the rest of this document as historical intent,
+> not a literal spec, until it is rewritten against the `Session`/`Capture` model.
+
 This document outlines future GitHub issues for continuing the capture session work. Each issue is sized for roughly 3-4 days of work, making it realistic to complete about two issues per week.
 
 The roadmap is aligned with:

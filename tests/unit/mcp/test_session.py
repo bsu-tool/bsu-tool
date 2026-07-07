@@ -476,6 +476,39 @@ def test_get_packets_includes_interrupt(tmp_path: Path) -> None:
     assert [match.transfer_type for match in selection.matches] == ["bulk", "interrupt"]
 
 
+def test_get_packet_requires_loaded_capture() -> None:
+    """get_packet raises RuntimeError if no capture has been loaded."""
+    with pytest.raises(RuntimeError):
+        Session().get_packet(0)
+
+
+def test_get_packet_returns_record_at_index(tmp_path: Path) -> None:
+    """get_packet returns the same PacketRecord get_packets reports at that index."""
+    path = tmp_path / "multi.pcapng"
+    path.write_bytes(_capture_bytes(_multi_device_packets()))
+    session = Session()
+    session.load(path)
+
+    matches = session.get_packets().matches
+    assert len(matches) == 5
+    for index, expected in enumerate(matches):
+        packet = session.get_packet(index)
+        assert packet is not None
+        assert packet.index == index
+        assert packet == expected
+
+
+@pytest.mark.parametrize("index", [-1, 5, 100])
+def test_get_packet_out_of_range_returns_none(tmp_path: Path, index: int) -> None:
+    """get_packet returns None for negative or beyond-the-end indexes (capture has 5)."""
+    path = tmp_path / "multi.pcapng"
+    path.write_bytes(_capture_bytes(_multi_device_packets()))
+    session = Session()
+    session.load(path)
+
+    assert session.get_packet(index) is None
+
+
 def test_add_marker_requires_loaded_capture() -> None:
     """add_marker raises RuntimeError if no capture has been loaded."""
     session = Session()

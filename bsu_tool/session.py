@@ -174,7 +174,7 @@ class Session:
         records = self.capture.records
         if not 0 <= packet_index < len(records):
             raise ValueError(f"packet_index {packet_index} out of range (0..{len(records) - 1})")
-        # Record lookup by index; swap onto the #53 packet store's get_packet() when it lands.
+        # Direct record lookup: add_marker raises on a bad index, whereas get_packet() returns None.
         marker = Marker(name=name, timestamp=records[packet_index].timestamp, packet_index=packet_index, note=note)
         self.capture.markers.append(marker)
         return marker
@@ -241,6 +241,31 @@ class Session:
             )
         )
         return PacketSelection(matches=matches, total_count=len(records))
+
+    def get_packet(self, index: int) -> PacketRecord | None:
+        """Return the decoded packet at ``index``, or ``None`` if out of range.
+
+        ``index`` is the capture-order position in the decoded record stream —
+        the same index space :meth:`get_packets` reports and markers anchor to.
+        This is random single-packet access; use :meth:`get_packets` to retrieve
+        filtered collections.
+
+        Args:
+            index: Zero-based position of the decoded packet to retrieve.
+
+        Returns:
+            The :class:`PacketRecord` at ``index``, or ``None`` when ``index`` is
+            negative or beyond the last decoded record.
+
+        Raises:
+            RuntimeError: No capture has been loaded.
+        """
+        if self.capture is None:
+            raise RuntimeError("No capture loaded. Call load_capture() first.")
+        records = self.capture.records
+        if not 0 <= index < len(records):
+            return None
+        return _packet_record(index, records[index])
 
 
 def _validate_capture_path(path: Path) -> Path:

@@ -170,6 +170,9 @@ analysis event stream for a given device. In this document, a sequence becomes a
 ordered tokens found by the algorithm; "pattern" describes that sequence plus metadata
 such as occurrence count, marker correlation, and response-time statistics.
 
+Sequence detection uses n-gram frequency analysis: a sliding window extracts all
+sub-sequences of each length and counts occurrences across the token stream.
+
 **Algorithm:**
 
 1. Flatten all analysis events for a device into an ordered list of tokens (by timestamp).
@@ -213,7 +216,7 @@ Each detected sequence is correlated with analyst markers:
 2. If the nearest marker is within a configurable window (default **2.0 seconds**),
    the occurrence is tagged with that marker's name.
 3. Compute the percentage of occurrences near each marker name.
-4. A sequence is **marker-correlated** by default if ≥ 50% of its occurrences are near
+4. A sequence is **marker-correlated** by default if ≥ 70% of its occurrences are near
    the same marker name, but the raw percentage is always reported so analysts can judge
    borderline cases.
 
@@ -426,7 +429,7 @@ All tunable values are named constants in the engine module (not magic numbers):
 | `MAX_SEQUENCE_WINDOW` | 8 | Maximum token sequence length to search for; configurable per analysis run |
 | `MIN_OCCURRENCE_COUNT` | 2 | Minimum occurrences for a pattern to be reported |
 | `MARKER_CORRELATION_WINDOW_SECONDS` | 2.0 | Max time delta to associate a packet with a marker; configurable per analysis run |
-| `MARKER_CORRELATION_THRESHOLD_PERCENT` | 50.0 | Default percentage needed to call out a marker association; raw percentage is always reported |
+| `MARKER_CORRELATION_THRESHOLD_PERCENT` | 70.0 | Default percentage needed to call out a marker association; raw percentage is always reported |
 | `COMMAND_RESPONSE_TIMEOUT_SECONDS` | 5.0 | Max capture-time gap to pair OUT→IN |
 | `MAX_VARIABLE_VALUES_REPORTED` | 32 | Cap on distinct values stored per variable byte |
 
@@ -456,7 +459,7 @@ Tests go in:
    per analysis run so unknown vendor devices are not truncated by a hardcoded small
    window.
 
-2. **Marker correlation threshold** — default threshold is 50%, configurable per analysis
+2. **Marker correlation threshold** — default threshold is 70%, configurable per analysis
    run. Results report the actual correlation percentage so analysts can evaluate
    borderline matches.
 

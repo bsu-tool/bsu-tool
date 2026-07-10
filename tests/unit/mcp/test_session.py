@@ -5,9 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from bsu_tool.mcp.interfaces import EndpointSummary
+from bsu_tool.mcp.interfaces import CaptureMetadata, EndpointSummary
 from bsu_tool.pcapng_reader import PcapNgError
-from bsu_tool.session import Marker, Session
+from bsu_tool.session import Capture, Marker, Session
+from bsu_tool.urb_decoder import Direction, EventType, TransferType, UrbRecord
 
 _USBMON_HEADER_FORMAT = "<QBBBBHBBqiiII8s"
 _SUBMISSION = 0x53
@@ -328,14 +329,14 @@ def test_list_devices_summarizes_multiple_devices(tmp_path: Path) -> None:
     assert [device.device_id for device in device_summaries] == ["dev_001_004", "dev_001_007"]
     assert device_summaries[0].packet_count == 2
     assert device_summaries[0].endpoints_seen == (
-        EndpointSummary(address="0x01", packet_count=1),
-        EndpointSummary(address="0x81", packet_count=1),
+        EndpointSummary(address="0x01", packet_count=1, byte_count=0),
+        EndpointSummary(address="0x81", packet_count=1, byte_count=2),
     )
     assert device_summaries[0].transfer_types_seen == ("bulk",)
     assert device_summaries[1].packet_count == 7
     assert device_summaries[1].endpoints_seen == (
-        EndpointSummary(address="0x00", packet_count=6),
-        EndpointSummary(address="0x02", packet_count=1),
+        EndpointSummary(address="0x00", packet_count=6, byte_count=70),
+        EndpointSummary(address="0x02", packet_count=1, byte_count=0),
     )
     assert device_summaries[1].transfer_types_seen == ("control", "bulk")
     assert device_summaries[1].vendor_id == "0x27c6"
@@ -727,3 +728,115 @@ def test_packets_between_markers_unknown_device_id_is_empty(tmp_path: Path) -> N
 
     assert span.count == 0
     assert span.packets == ()
+
+
+def _byte_count_record(
+    *,
+    urb_id: int,
+    event_type: EventType,
+    endpoint: int,
+    direction: Direction,
+    length: int,
+    captured_length: int | None = None,
+    transfer_type: TransferType = "bulk",
+    status: int = 0,
+) -> UrbRecord:
+    """Build an in-memory UrbRecord for endpoint byte-count tests (no pcap/hardware)."""
+    captured = length if captured_length is None else captured_length
+    return UrbRecord(
+        urb_id=urb_id,
+        event_type=event_type,
+        transfer_type=transfer_type,
+        direction=direction,
+        bus_num=1,
+        dev_num=4,
+        endpoint=endpoint,
+        status=status,
+        length=length,
+        captured_length=captured,
+        data=b"\x00" * captured,
+        setup=None,
+        timestamp=0.0,
+    )
+
+
+def _endpoint_byte_counts(records: tuple[UrbRecord, ...]) -> dict[str, int]:
+    """Summarize in-memory records via the public Session API and map address -> byte_count."""
+    metadata = CaptureMetadata(
+        source="in-memory",
+        file_size_bytes=0,
+        packet_count=len(records),
+        capture_duration_seconds=None,
+        interfaces_seen=(),
+    )
+    session = Session()
+    session.capture = Capture(
+        source=Path("in-memory.pcapng"),
+        metadata=metadata,
+        packets=(),
+        records=records,
+        transactions=(),
+    )
+    (device,) = session.list_devices()
+    return {endpoint.address: endpoint.byte_count for endpoint in device.endpoints_seen}
+
+
+def test_byte_count_in_endpoint_counts_completion_only() -> None:
+    """An IN endpoint (0x81) tallies bytes on completion; the submission adds nothing."""
+    records = (
+        # Submission carries the requested buffer size (64); it must not be counted.
+        _byte_count_record(urb_id=1, event_type="submission", endpoint=1, direction="in", length=64),
+        _byte_count_record(urb_id=1, event_type="completion", endpoint=1, direction="in", length=16),
+    )
+    assert _endpoint_byte_counts(records) == {"0x81": 16}
+
+
+def test_byte_count_out_endpoint_no_double_count() -> None:
+    """An OUT endpoint (0x01) counts only the completion, so submit+complete is not doubled."""
+    records = (
+        _byte_count_record(urb_id=1, event_type="submission", endpoint=1, direction="out", length=8),
+        _byte_count_record(urb_id=1, event_type="completion", endpoint=1, direction="out", length=8),
+    )
+    assert _endpoint_byte_counts(records) == {"0x01": 8}
+
+
+def test_byte_count_control_endpoint_zero() -> None:
+    """Control endpoint 0 accumulates under address 0x00, on completion events only."""
+    records = (
+        _byte_count_record(
+            urb_id=1, event_type="submission", endpoint=0, direction="out", length=18, transfer_type="control"
+        ),
+        _byte_count_record(
+            urb_id=1, event_type="completion", endpoint=0, direction="in", length=18, transfer_type="control"
+        ),
+    )
+    assert _endpoint_byte_counts(records) == {"0x00": 18}
+
+
+def test_byte_count_lone_submission_adds_zero() -> None:
+    """An in-flight URB seen only as a submission contributes 0 bytes."""
+    records = (_byte_count_record(urb_id=1, event_type="submission", endpoint=1, direction="in", length=64),)
+    assert _endpoint_byte_counts(records) == {"0x81": 0}
+
+
+def test_byte_count_uses_length_not_captured_length() -> None:
+    """Byte volume sums the URB-reported length, not the snaplen-truncated captured_length."""
+    records = (
+        _byte_count_record(
+            urb_id=1, event_type="completion", endpoint=1, direction="in", length=100, captured_length=4
+        ),
+    )
+    assert _endpoint_byte_counts(records) == {"0x81": 100}
+
+
+def test_byte_count_failed_completion_counts_actual_length() -> None:
+    """A failed/partial completion (status != 0) still counts the bytes actually moved.
+
+    usbmon reports length = actual_length on completion even when the URB errored, so a
+    short/aborted transfer contributes the real byte volume, not zero.
+    """
+    records = (
+        _byte_count_record(urb_id=1, event_type="submission", endpoint=1, direction="in", length=64),
+        _byte_count_record(urb_id=1, event_type="completion", endpoint=1, direction="in", length=4, status=-71),
+    )
+    assert _endpoint_byte_counts(records) == {"0x81": 4}

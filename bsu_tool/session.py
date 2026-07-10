@@ -58,6 +58,27 @@ class Marker:
     note: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class MarkerSpan:
+    """Decoded packets recorded strictly between a pair of named markers.
+
+    ``packets`` are the records whose index lies between the two markers'
+    anchor packets, exclusive of the marker-anchored packets themselves. The
+    resolved markers are carried alongside so a caller can see exactly which
+    boundaries produced the span.
+
+    When a ``device_id`` filter is applied, ``packets`` holds only the records
+    in that span belonging to the device and ``count`` is the post-filter total
+    (the number of packets in the span for that device), so pagination against
+    ``count`` stays coherent.
+    """
+
+    start_marker: Marker
+    end_marker: Marker
+    packets: tuple[PacketRecord, ...]
+    count: int
+
+
 def _empty_markers() -> list[Marker]:
     return []
 
@@ -185,6 +206,63 @@ class Session:
             raise RuntimeError("No capture loaded. Call load() first.")
         return tuple(self.capture.markers)
 
+    def packets_between_markers(
+        self,
+        start_name: str,
+        end_name: str,
+        *,
+        device_id: str | None = None,
+    ) -> MarkerSpan:
+        """Return the decoded packets recorded strictly between two named markers.
+
+        The markers bracket a single physical action (see the marker tools): pass
+        the marker added when the action began as ``start_name`` and the one added
+        when it ended as ``end_name``. The returned packets are those whose index
+        lies strictly between the two markers' anchor packets — the marker-anchored
+        packets are the boundaries and are excluded — which isolates the traffic
+        produced by that one action.
+
+        Args:
+            start_name: Name of the marker anchoring the start of the span.
+            end_name: Name of the marker anchoring the end of the span.
+            device_id: Restrict the span to one device by its ``dev_bbb_ddd`` id,
+                mirroring ``get_packets``. ``None`` keeps every device in range. An
+                unknown id matches nothing and yields an empty span (no error). The
+                returned span's ``count`` is the post-filter total.
+
+        Returns:
+            A :class:`MarkerSpan` holding the resolved markers and the packets
+            between them in capture order. The span is empty when the markers are
+            adjacent, anchored to the same packet, when the same marker name is
+            passed for both ends, or when ``device_id`` excludes every packet in
+            range.
+
+        Raises:
+            RuntimeError: No capture has been loaded.
+            ValueError: Either name has no marker, or ``start_name`` is anchored
+                after ``end_name`` (a reversed span).
+        """
+        if self.capture is None:
+            raise RuntimeError("No capture loaded. Call load() first.")
+        markers = self.capture.markers
+        records = self.capture.records
+        start = _find_marker(markers, start_name)
+        end = _find_marker(markers, end_name)
+        if start.packet_index > end.packet_index:
+            raise ValueError(
+                f"start marker {start_name!r} (index {start.packet_index}) is anchored "
+                f"after end marker {end_name!r} (index {end.packet_index})"
+            )
+        # The span is the contiguous decoded-record range strictly between the
+        # two anchors; keep each record's original index and drop any that a
+        # device_id filter excludes so count reflects the post-filter total.
+        packets = tuple(
+            _packet_record(index, records[index])
+            for index in range(start.packet_index + 1, end.packet_index)
+            if device_id is None or _device_id(records[index].bus_num, records[index].dev_num) == device_id
+        )
+        return MarkerSpan(start_marker=start, end_marker=end, packets=packets, count=len(packets))
+
     def list_devices(self) -> tuple[DeviceSummary, ...]:
         """Return USB devices observed in the active capture."""
         if self.capture is None:
@@ -266,6 +344,13 @@ class Session:
         if not 0 <= index < len(records):
             return None
         return _packet_record(index, records[index])
+
+
+def _find_marker(markers: list[Marker], name: str) -> Marker:
+    for marker in markers:
+        if marker.name == name:
+            return marker
+    raise ValueError(f"no marker named {name!r}")
 
 
 def _validate_capture_path(path: Path) -> Path:

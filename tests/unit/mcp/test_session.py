@@ -549,3 +549,148 @@ def test_list_markers_returns_insertion_order(tmp_path: Path) -> None:
     first = session.add_marker(name="a-start", packet_index=0)
     second = session.add_marker(name="a-end", packet_index=1)
     assert session.list_markers() == (first, second)
+
+
+def _span_session(tmp_path: Path) -> Session:
+    """A Session over the 5-packet multi-device capture (indices 0..4)."""
+    path = tmp_path / "span.pcapng"
+    path.write_bytes(_capture_bytes(_multi_device_packets()))
+    session = Session()
+    session.load(path)
+    return session
+
+
+def test_packets_between_markers_requires_loaded_capture() -> None:
+    """packets_between_markers raises RuntimeError if no capture has been loaded."""
+    with pytest.raises(RuntimeError):
+        Session().packets_between_markers("start", "end")
+
+
+def test_packets_between_markers_returns_packets_strictly_between(tmp_path: Path) -> None:
+    """The span is the records between the markers, excluding the marker packets."""
+    session = _span_session(tmp_path)
+    session.add_marker(name="start", packet_index=0)
+    session.add_marker(name="end", packet_index=4)
+
+    span = session.packets_between_markers("start", "end")
+
+    assert span.start_marker.name == "start"
+    assert span.end_marker.name == "end"
+    assert span.count == 3
+    assert [packet.index for packet in span.packets] == [1, 2, 3]
+
+
+def test_packets_between_markers_missing_start(tmp_path: Path) -> None:
+    """An unknown start marker name raises a clear ValueError."""
+    session = _span_session(tmp_path)
+    session.add_marker(name="end", packet_index=4)
+
+    with pytest.raises(ValueError, match="no marker named 'start'"):
+        session.packets_between_markers("start", "end")
+
+
+def test_packets_between_markers_missing_end(tmp_path: Path) -> None:
+    """An unknown end marker name raises a clear ValueError."""
+    session = _span_session(tmp_path)
+    session.add_marker(name="start", packet_index=0)
+
+    with pytest.raises(ValueError, match="no marker named 'end'"):
+        session.packets_between_markers("start", "end")
+
+
+def test_packets_between_markers_rejects_reversed_span(tmp_path: Path) -> None:
+    """A start marker anchored after the end marker raises ValueError."""
+    session = _span_session(tmp_path)
+    session.add_marker(name="start", packet_index=4)
+    session.add_marker(name="end", packet_index=1)
+
+    with pytest.raises(ValueError, match="anchored after"):
+        session.packets_between_markers("start", "end")
+
+
+def test_packets_between_markers_empty_when_adjacent(tmp_path: Path) -> None:
+    """Adjacent markers bound no packets, so the span is empty (not an error)."""
+    session = _span_session(tmp_path)
+    session.add_marker(name="start", packet_index=2)
+    session.add_marker(name="end", packet_index=3)
+
+    span = session.packets_between_markers("start", "end")
+
+    assert span.count == 0
+    assert span.packets == ()
+
+
+def test_packets_between_markers_empty_for_same_name(tmp_path: Path) -> None:
+    """Passing one marker name for both ends yields an empty span, not an error."""
+    session = _span_session(tmp_path)
+    session.add_marker(name="solo", packet_index=2)
+
+    span = session.packets_between_markers("solo", "solo")
+
+    assert span.count == 0
+    assert span.packets == ()
+    assert span.start_marker is span.end_marker
+
+
+def test_packets_between_markers_empty_for_distinct_markers_same_index(tmp_path: Path) -> None:
+    """Two differently named markers on the same packet bound an empty span."""
+    session = _span_session(tmp_path)
+    session.add_marker(name="start", packet_index=2)
+    session.add_marker(name="end", packet_index=2)
+
+    span = session.packets_between_markers("start", "end")
+
+    assert span.count == 0
+    assert span.packets == ()
+
+
+def test_packets_between_markers_spans_multiple_devices(tmp_path: Path) -> None:
+    """The span filters by index only, so it includes every device in range."""
+    session = _span_session(tmp_path)
+    # indices 0..4 across two devices: dev_001_004 at 0..1, dev_001_007 at 2..4.
+    session.add_marker(name="start", packet_index=0)
+    session.add_marker(name="end", packet_index=4)
+
+    span = session.packets_between_markers("start", "end")
+
+    assert [packet.index for packet in span.packets] == [1, 2, 3]
+    assert {packet.device_id for packet in span.packets} == {"dev_001_004", "dev_001_007"}
+
+
+def test_packets_between_markers_filters_by_device(tmp_path: Path) -> None:
+    """device_id keeps only that device's packets in the span; count is post-filter."""
+    session = _span_session(tmp_path)
+    # span 1..3 holds dev_001_004 at index 1 and dev_001_007 at indices 2..3.
+    session.add_marker(name="start", packet_index=0)
+    session.add_marker(name="end", packet_index=4)
+
+    span = session.packets_between_markers("start", "end", device_id="dev_001_007")
+
+    assert span.count == 2
+    assert [packet.index for packet in span.packets] == [2, 3]
+    assert {packet.device_id for packet in span.packets} == {"dev_001_007"}
+
+
+def test_packets_between_markers_device_with_zero_packets_in_span(tmp_path: Path) -> None:
+    """A known device absent from the span yields an empty span, not an error."""
+    session = _span_session(tmp_path)
+    # span 2..3 is all dev_001_007; dev_001_004 exists in the capture but not here.
+    session.add_marker(name="start", packet_index=1)
+    session.add_marker(name="end", packet_index=4)
+
+    span = session.packets_between_markers("start", "end", device_id="dev_001_004")
+
+    assert span.count == 0
+    assert span.packets == ()
+
+
+def test_packets_between_markers_unknown_device_id_is_empty(tmp_path: Path) -> None:
+    """An unknown device_id matches nothing and yields an empty span (as get_packets)."""
+    session = _span_session(tmp_path)
+    session.add_marker(name="start", packet_index=0)
+    session.add_marker(name="end", packet_index=4)
+
+    span = session.packets_between_markers("start", "end", device_id="dev_009_009")
+
+    assert span.count == 0
+    assert span.packets == ()

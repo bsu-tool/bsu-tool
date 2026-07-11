@@ -451,10 +451,20 @@ def test_isb_body_too_small() -> None:
     with pytest.raises(InvalidBlockError, match="ISB body too small"):
         list(PcapNgReader(io.BytesIO(data)))
 
-def test_rejects_pcap_format():
+def test_rejects_pcap_format() -> None:
     """Legacy libpcap (.pcap) files are not supported."""
-    with open("test_data/captures/usb_memory_stick.pcap", "rb") as f:
-        with pytest.raises(InvalidBlockError):
+    capture = (
+        Path(__file__).parent.parent.parent
+        / "test_data"
+        / "captures"
+        / "usb_memory_stick.pcap"
+    )
+
+    with capture.open("rb") as f:
+        with pytest.raises(
+            InvalidBlockError,
+            match="first block is not a Section Header Block",
+        ):
             list(PcapNgReader(f))
 
 # --- Tests: real capture file (goodix_enroll_sanitized.pcapng) ------------

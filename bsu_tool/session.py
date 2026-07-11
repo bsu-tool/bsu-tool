@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from _thread import LockType
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final
+from threading import Lock
+from typing import TYPE_CHECKING, Final
 
 from bsu_tool.mcp.interfaces import (
     CaptureInterface,
@@ -33,6 +35,9 @@ from bsu_tool.urb_decoder import (
     decode_urb,
     pair_urbs,
 )
+
+if TYPE_CHECKING:
+    from bsu_tool.sniffer import CaptureController
 
 _PCAPNG_SUFFIX: Final[str] = ".pcapng"
 _IF_TSRESOL_OPTION: Final[int] = 9
@@ -107,6 +112,14 @@ class Capture:
     markers: list[Marker] = field(default_factory=_empty_markers)
 
 
+@dataclass(frozen=True, slots=True)
+class LiveCapture:
+    """A live capture owned by a session until it is stopped."""
+
+    controller: CaptureController
+    output_path: Path
+
+
 @dataclass
 class _DeviceAccumulator:
     bus_num: int
@@ -128,6 +141,28 @@ class Session:
     """Holds the active loaded capture."""
 
     capture: Capture | None = None
+    live_capture: LiveCapture | None = None
+    _live_capture_lock: LockType = field(default_factory=Lock, init=False, repr=False, compare=False)
+
+    def reserve_live_capture(self, live_capture: LiveCapture) -> None:
+        """Atomically reserve this session for one live capture."""
+        with self._live_capture_lock:
+            if self.live_capture is not None:
+                raise RuntimeError("a capture is already running; call stop_capture first")
+            self.live_capture = live_capture
+
+    def release_live_capture(self, live_capture: LiveCapture) -> None:
+        """Release ``live_capture`` if it still owns this session."""
+        with self._live_capture_lock:
+            if self.live_capture is live_capture:
+                self.live_capture = None
+
+    def pop_live_capture(self) -> LiveCapture | None:
+        """Atomically remove and return the session's live capture."""
+        with self._live_capture_lock:
+            live_capture = self.live_capture
+            self.live_capture = None
+            return live_capture
 
     def load(self, path: Path) -> Capture:
         """Load a pcap-ng capture file and replace the active capture."""

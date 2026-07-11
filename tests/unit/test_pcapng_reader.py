@@ -454,7 +454,7 @@ def test_isb_body_too_small() -> None:
 def test_rejects_pcap_format() -> None:
     """Legacy libpcap (.pcap) files are not supported."""
     capture = (
-        Path(__file__).parent.parent.parent
+        pathlib.Path(__file__).parent.parent.parent
         / "test_data"
         / "captures"
         / "usb_memory_stick.pcap"

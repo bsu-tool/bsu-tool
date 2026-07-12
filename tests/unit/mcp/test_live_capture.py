@@ -24,6 +24,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import TextContent
 
+import bsu_tool.session as session_module
 from bsu_tool.mcp.server import build_server
 from bsu_tool.session import Capture, Session
 from bsu_tool.sniffer import CaptureController, CaptureStateError, CaptureStats, ProgressCallback
@@ -49,6 +50,7 @@ class _FakeController:
     stop_entered: ClassVar[Event | None] = None
     stop_release: ClassVar[Event | None] = None
     running_after_start: ClassVar[bool] = True
+    active_after_stop_error: ClassVar[bool] = False
 
     def __init__(self) -> None:
         self.start_args: tuple[int, int | None, Path] | None = None
@@ -73,6 +75,12 @@ class _FakeController:
             and _FakeController.start_error is None
             and _FakeController.running_after_start
         )
+
+    @property
+    def is_active(self) -> bool:
+        if _FakeController.stop_error is not None:
+            return _FakeController.active_after_stop_error
+        return self.is_running
 
     def stop(self) -> CaptureStats:
         self.stop_calls += 1
@@ -102,6 +110,7 @@ def _fake_controller(monkeypatch: pytest.MonkeyPatch) -> None:  # pyright: ignor
     _FakeController.stop_entered = None
     _FakeController.stop_release = None
     _FakeController.running_after_start = True
+    _FakeController.active_after_stop_error = False
     monkeypatch.setattr("bsu_tool.sniffer.CaptureController", _FakeController)
 
 
@@ -125,6 +134,95 @@ def test_start_capture_starts_controller_and_reports(tmp_path: Path) -> None:
     assert payload == {"bus": 1, "device": None, "output_path": str(out)}
     (controller,) = _FakeController.instances
     assert controller.start_args == (1, None, out)
+
+
+def test_start_capture_normalizes_relative_output_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The stored output path remains stable if later code changes the cwd."""
+    monkeypatch.chdir(tmp_path)
+    server = build_server(session=Session())
+    expected = (tmp_path / "live.pcapng").resolve()
+
+    payload = _call(server, "start_capture", {"bus": 1, "output_path": "live.pcapng"})
+
+    assert payload["output_path"] == str(expected)
+    assert _FakeController.instances[0].start_args == (1, None, expected)
+    _call(server, "stop_capture", {})
+
+
+def test_start_capture_does_not_block_the_event_loop(tmp_path: Path) -> None:
+    """Controller readiness waiting runs outside the MCP event loop."""
+    server = build_server(session=Session())
+    _FakeController.start_entered = Event()
+    _FakeController.start_release = Event()
+
+    async def run_start() -> None:
+        call = asyncio.create_task(
+            server.call_tool(
+                "start_capture",
+                {"bus": 1, "output_path": str(tmp_path / "live.pcapng")},
+            )
+        )
+        assert _FakeController.start_entered is not None
+        assert await asyncio.to_thread(_FakeController.start_entered.wait, _SYNC_TIMEOUT_SECONDS)
+        try:
+            await asyncio.sleep(0)
+            assert not call.done()
+        finally:
+            assert _FakeController.start_release is not None
+            _FakeController.start_release.set()
+        await call
+
+    asyncio.run(run_start())
+    _call(server, "stop_capture", {})
+
+
+def test_cancelled_start_capture_stops_background_controller(tmp_path: Path) -> None:
+    """Cancelling the MCP request cannot leave an orphan capture running."""
+    session = Session()
+    server = build_server(session=session)
+    _FakeController.start_entered = Event()
+    _FakeController.start_release = Event()
+
+    async def cancel_start() -> None:
+        call = asyncio.create_task(
+            server.call_tool(
+                "start_capture",
+                {"bus": 1, "output_path": str(tmp_path / "live.pcapng")},
+            )
+        )
+        assert _FakeController.start_entered is not None
+        assert await asyncio.to_thread(_FakeController.start_entered.wait, _SYNC_TIMEOUT_SECONDS)
+        call.cancel()
+        assert _FakeController.start_release is not None
+        _FakeController.start_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+
+    asyncio.run(cancel_start())
+    assert _FakeController.instances[0].stop_calls == 1
+    assert session.live_capture is None
+
+
+def test_stop_capture_does_not_block_the_event_loop(tmp_path: Path) -> None:
+    """Controller shutdown and auto-load run outside the MCP event loop."""
+    server = build_server(session=Session())
+    _call(server, "start_capture", {"bus": 1, "output_path": str(tmp_path / "live.pcapng")})
+    _FakeController.stop_entered = Event()
+    _FakeController.stop_release = Event()
+
+    async def run_stop() -> None:
+        call = asyncio.create_task(server.call_tool("stop_capture", {}))
+        assert _FakeController.stop_entered is not None
+        assert await asyncio.to_thread(_FakeController.stop_entered.wait, _SYNC_TIMEOUT_SECONDS)
+        try:
+            await asyncio.sleep(0)
+            assert not call.done()
+        finally:
+            assert _FakeController.stop_release is not None
+            _FakeController.stop_release.set()
+        await call
+
+    asyncio.run(run_stop())
 
 
 def test_start_capture_reservation_is_shared_across_servers(tmp_path: Path) -> None:
@@ -169,6 +267,8 @@ def test_start_capture_rejects_second_capture_while_running(tmp_path: Path) -> N
 
     with pytest.raises(ToolError, match="already running"):
         asyncio.run(server.call_tool("start_capture", {"bus": 1, "output_path": str(tmp_path / "b.pcapng")}))
+    with pytest.raises(ToolError, match="while a live capture is active"):
+        asyncio.run(server.call_tool("load_capture", {"path": str(_GOODIX)}))
 
     _call(server, "stop_capture", {})
 
@@ -180,6 +280,7 @@ def test_start_capture_rejects_second_capture_while_running(tmp_path: Path) -> N
         (UsbmonBusNotAvailableError("bus 9 not available"), "usbmon capture could not start"),
         (UsbmonPermissionError("permission denied"), "usbmon capture could not start"),
         (CaptureStateError("capture already started"), "capture could not start"),
+        (RuntimeError("cannot start thread"), "cannot start thread"),
     ],
 )
 def test_start_capture_error_surfaces_and_frees_the_slot(
@@ -224,6 +325,30 @@ def test_start_capture_timeout_reports_cleanup_failure(tmp_path: Path) -> None:
         asyncio.run(server.call_tool("start_capture", {"bus": 1, "output_path": str(tmp_path / "x.pcapng")}))
 
     assert _FakeController.instances[0].stop_calls == 1
+    assert session.live_capture is None
+
+
+def test_start_capture_cleanup_timeout_keeps_slot_reserved_and_can_be_retried(tmp_path: Path) -> None:
+    """A wedged startup returns an error without admitting a second capture."""
+    out = tmp_path / "x.pcapng"
+    _FakeController.start_error = TimeoutError("capture did not go live")
+    _FakeController.stop_error = TimeoutError("capture did not stop within 5.0s")
+    _FakeController.active_after_stop_error = True
+    session = Session()
+    server = build_server(session=session)
+
+    with pytest.raises(ToolError, match="startup timed out and cleanup failed"):
+        asyncio.run(server.call_tool("start_capture", {"bus": 1, "output_path": str(out)}))
+
+    assert session.live_capture is not None
+    with pytest.raises(ToolError, match="still stopping"):
+        asyncio.run(server.call_tool("start_capture", {"bus": 1, "output_path": str(tmp_path / "y.pcapng")}))
+
+    shutil.copyfile(_GOODIX, out)
+    _FakeController.start_error = None
+    _FakeController.stop_error = None
+    _FakeController.active_after_stop_error = False
+    assert _call(server, "stop_capture", {})["packet_count"] == 253
     assert session.live_capture is None
 
 
@@ -289,14 +414,14 @@ def test_stop_capture_keeps_session_reserved_until_autoload_finishes(
     _FakeController.stop_release = Event()
     load_entered = Event()
     load_release = Event()
-    original_load = session.load
+    original_read = session_module._read_capture  # pyright: ignore[reportPrivateUsage]
 
-    def blocking_load(path: Path) -> Capture:
+    def blocking_read(path: Path) -> Capture:
         load_entered.set()
         assert load_release.wait(timeout=_SYNC_TIMEOUT_SECONDS)
-        return original_load(path)
+        return original_read(path)
 
-    monkeypatch.setattr(session, "load", blocking_load)
+    monkeypatch.setattr(session_module, "_read_capture", blocking_read)
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         first_stop = executor.submit(_call, first_server, "stop_capture", {})
@@ -314,13 +439,15 @@ def test_stop_capture_keeps_session_reserved_until_autoload_finishes(
                 asyncio.run(second_server.call_tool("stop_capture", {}))
             _FakeController.stop_release.set()
             assert load_entered.wait(timeout=_SYNC_TIMEOUT_SECONDS)
-            with pytest.raises(ToolError, match="still stopping"):
+            with pytest.raises(ToolError, match="currently loading"):
                 asyncio.run(
                     second_server.call_tool(
                         "start_capture",
                         {"bus": 1, "output_path": str(tmp_path / "b.pcapng")},
                     )
                 )
+            with pytest.raises(ToolError, match="already loading"):
+                asyncio.run(second_server.call_tool("load_capture", {"path": str(_GOODIX)}))
         finally:
             _FakeController.stop_release.set()
             load_release.set()
@@ -328,6 +455,40 @@ def test_stop_capture_keeps_session_reserved_until_autoload_finishes(
 
     assert session.live_capture is None
     _call(second_server, "start_capture", {"bus": 1, "output_path": str(tmp_path / "b.pcapng")})
+
+
+def test_start_capture_rejects_while_capture_file_is_loading(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A manual load reserves the session until its active capture is installed."""
+    session = Session()
+    server = build_server(session=session)
+    load_entered = Event()
+    load_release = Event()
+    original_read = session_module._read_capture  # pyright: ignore[reportPrivateUsage]
+
+    def blocking_read(path: Path) -> Capture:
+        load_entered.set()
+        assert load_release.wait(timeout=_SYNC_TIMEOUT_SECONDS)
+        return original_read(path)
+
+    monkeypatch.setattr(session_module, "_read_capture", blocking_read)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        loading = executor.submit(session.load, _GOODIX)
+        assert load_entered.wait(timeout=_SYNC_TIMEOUT_SECONDS)
+        try:
+            with pytest.raises(ToolError, match="currently loading"):
+                asyncio.run(
+                    server.call_tool(
+                        "start_capture",
+                        {"bus": 1, "output_path": str(tmp_path / "b.pcapng")},
+                    )
+                )
+        finally:
+            load_release.set()
+        assert loading.result(timeout=_SYNC_TIMEOUT_SECONDS).metadata.packet_count == 253
 
 
 def test_start_capture_rejects_non_pcapng_output(tmp_path: Path) -> None:
@@ -363,6 +524,28 @@ def test_stop_capture_error_still_frees_the_slot(tmp_path: Path, error: Exceptio
 
     _FakeController.stop_error = None
     _call(server, "start_capture", {"bus": 1, "output_path": str(tmp_path / "b.pcapng")})
+    _call(server, "stop_capture", {})
+
+
+def test_stop_capture_timeout_keeps_slot_reserved_and_can_be_retried(tmp_path: Path) -> None:
+    """A bounded stop timeout cannot admit another capture and permits a later retry."""
+    session = Session()
+    server = build_server(session=session)
+    _call(server, "start_capture", {"bus": 1, "output_path": str(tmp_path / "a.pcapng")})
+    _FakeController.stop_error = TimeoutError("capture did not stop within 5.0s")
+    _FakeController.active_after_stop_error = True
+
+    with pytest.raises(ToolError, match="did not stop in time"):
+        asyncio.run(server.call_tool("stop_capture", {}))
+
+    assert session.live_capture is not None
+    with pytest.raises(ToolError, match="still stopping"):
+        asyncio.run(server.call_tool("start_capture", {"bus": 1, "output_path": str(tmp_path / "b.pcapng")}))
+
+    _FakeController.stop_error = None
+    _FakeController.active_after_stop_error = False
+    assert _call(server, "stop_capture", {})["packet_count"] == 253
+    assert session.live_capture is None
 
 
 def test_start_capture_waits_for_monkeypatched_capture_readiness(

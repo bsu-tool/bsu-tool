@@ -76,6 +76,8 @@ def register(mcp: FastMCP, session: Session) -> None:
             controller.start(bus=bus, device=device, output_path=destination)
             if not controller.is_running:
                 raise CaptureStateError("capture controller returned before the capture was live")
+            if not session.mark_live_capture_running(live_capture):
+                raise CaptureStateError("capture no longer owns the session after startup")
             capture_started = True
         except TimeoutError as exc:
             try:
@@ -102,27 +104,28 @@ def register(mcp: FastMCP, session: Session) -> None:
         (packet count and device ids). The other analysis tools operate on the
         newly loaded capture from here on.
         """
-        live_capture = session.pop_live_capture()
-        if live_capture is None:
-            raise RuntimeError("no capture is running; call start_capture first")
+        live_capture = session.begin_stop_live_capture()
         controller = live_capture.controller
         output_path = live_capture.output_path
         from bsu_tool.sniffer import CaptureStateError
         from bsu_tool.usbmon_source import UsbmonError
 
         try:
-            stats = controller.stop()
-        except CaptureStateError as exc:
-            raise RuntimeError(f"capture could not stop: {exc}") from exc
-        except UsbmonError as exc:
-            raise RuntimeError(f"usbmon capture failed while stopping: {exc}") from exc
-        capture = session.load(output_path)
-        return StopCaptureResult(
-            output_path=str(output_path),
-            output_bytes=stats.output_bytes,
-            events_seen=stats.seen,
-            events_matched=stats.matched,
-            elapsed_seconds=stats.elapsed_seconds,
-            packet_count=capture.metadata.packet_count,
-            device_ids=tuple(device.device_id for device in session.list_devices()),
-        )
+            try:
+                stats = controller.stop()
+            except CaptureStateError as exc:
+                raise RuntimeError(f"capture could not stop: {exc}") from exc
+            except UsbmonError as exc:
+                raise RuntimeError(f"usbmon capture failed while stopping: {exc}") from exc
+            capture = session.load(output_path)
+            return StopCaptureResult(
+                output_path=str(output_path),
+                output_bytes=stats.output_bytes,
+                events_seen=stats.seen,
+                events_matched=stats.matched,
+                elapsed_seconds=stats.elapsed_seconds,
+                packet_count=capture.metadata.packet_count,
+                device_ids=tuple(device.device_id for device in session.list_devices()),
+            )
+        finally:
+            session.release_live_capture(live_capture)

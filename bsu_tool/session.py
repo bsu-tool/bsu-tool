@@ -6,7 +6,7 @@ from _thread import LockType
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, Literal
 
 from bsu_tool.mcp.interfaces import (
     CaptureInterface,
@@ -120,6 +120,9 @@ class LiveCapture:
     output_path: Path
 
 
+_LiveCapturePhase = Literal["starting", "running", "stopping"]
+
+
 @dataclass
 class _DeviceAccumulator:
     bus_num: int
@@ -142,21 +145,40 @@ class Session:
 
     capture: Capture | None = None
     live_capture: LiveCapture | None = field(default=None, init=False)
+    _live_capture_phase: _LiveCapturePhase | None = field(default=None, init=False, repr=False, compare=False)
     _live_capture_lock: LockType = field(default_factory=Lock, init=False, repr=False, compare=False)
 
     def reserve_live_capture(self, live_capture: LiveCapture) -> None:
         """Atomically reserve this session for one live capture."""
         with self._live_capture_lock:
             if self.live_capture is not None:
+                if self._live_capture_phase == "starting":
+                    raise RuntimeError("a capture is already starting; wait for start_capture to finish")
+                if self._live_capture_phase == "stopping":
+                    raise RuntimeError("a capture is still stopping; wait for stop_capture to finish")
                 raise RuntimeError("a capture is already running; call stop_capture first")
             self.live_capture = live_capture
+            self._live_capture_phase = "starting"
+
+    def mark_live_capture_running(self, live_capture: LiveCapture) -> bool:
+        """Mark an owned capture available for a stop operation."""
+        with self._live_capture_lock:
+            if self.live_capture is not live_capture:
+                return False
+            self._live_capture_phase = "running"
+            return True
 
     def begin_stop_live_capture(self) -> LiveCapture:
-        """Return the live capture currently owned by this session."""
+        """Atomically claim the running capture for one stop operation."""
         with self._live_capture_lock:
             live_capture = self.live_capture
             if live_capture is None:
                 raise RuntimeError("no capture is running; call start_capture first")
+            if self._live_capture_phase == "starting":
+                raise RuntimeError("capture is still starting; wait for start_capture to finish")
+            if self._live_capture_phase == "stopping":
+                raise RuntimeError("capture is already stopping; wait for stop_capture to finish")
+            self._live_capture_phase = "stopping"
             return live_capture
 
     def release_live_capture(self, live_capture: LiveCapture) -> None:
@@ -164,6 +186,7 @@ class Session:
         with self._live_capture_lock:
             if self.live_capture is live_capture:
                 self.live_capture = None
+                self._live_capture_phase = None
 
     def load(self, path: Path) -> Capture:
         """Load a pcap-ng capture file and replace the active capture."""

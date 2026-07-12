@@ -72,15 +72,24 @@ def register(mcp: FastMCP, session: Session) -> None:
         live_capture = LiveCapture(controller=controller, output_path=destination)
         session.reserve_live_capture(live_capture)
         capture_started = False
+        retry_stop = False
         try:
             controller.start(bus=bus, device=device, output_path=destination)
             if not controller.is_running:
                 raise CaptureStateError("capture controller returned before the capture was live")
+            if not session.mark_live_capture_running(live_capture):
+                raise CaptureStateError("capture no longer owns the session after startup")
             capture_started = True
         except TimeoutError as exc:
             try:
                 controller.stop()
             except Exception as cleanup_error:  # noqa: BLE001 - report startup and cleanup failures together
+                retry_stop = controller.is_active
+                if not retry_stop:
+                    raise RuntimeError(
+                        "capture startup timed out and cleanup failed, but the capture is no longer active: "
+                        f"{cleanup_error}"
+                    ) from exc
                 raise RuntimeError(
                     "capture startup timed out and cleanup failed; "
                     f"retry stop_capture before starting another capture: {cleanup_error}"
@@ -94,7 +103,9 @@ def register(mcp: FastMCP, session: Session) -> None:
             raise RuntimeError(f"capture could not start: {exc}") from exc
         finally:
             if not capture_started:
-                if not controller.is_active:
+                if retry_stop or controller.is_active:
+                    session.mark_live_capture_running(live_capture)
+                else:
                     session.release_live_capture(live_capture)
         return StartCaptureResult(bus=bus, device=device, output_path=str(destination))
 
@@ -112,10 +123,12 @@ def register(mcp: FastMCP, session: Session) -> None:
         from bsu_tool.sniffer import CaptureStateError
         from bsu_tool.usbmon_source import UsbmonError
 
+        retry_stop = False
         try:
             try:
                 stats = controller.stop()
             except TimeoutError as exc:
+                retry_stop = True
                 raise RuntimeError(
                     f"capture did not stop in time; retry stop_capture before starting another capture: {exc}"
                 ) from exc
@@ -134,5 +147,7 @@ def register(mcp: FastMCP, session: Session) -> None:
                 device_ids=tuple(device.device_id for device in session.list_devices()),
             )
         finally:
-            if not controller.is_active:
+            if retry_stop or controller.is_active:
+                session.mark_live_capture_running(live_capture)
+            else:
                 session.release_live_capture(live_capture)

@@ -6,7 +6,7 @@ from _thread import LockType
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final
 
 from bsu_tool.mcp.interfaces import (
     CaptureInterface,
@@ -120,9 +120,6 @@ class LiveCapture:
     output_path: Path
 
 
-_LiveCapturePhase = Literal["starting", "running", "stopping", "stalled"]
-
-
 @dataclass
 class _DeviceAccumulator:
     bus_num: int
@@ -145,57 +142,21 @@ class Session:
 
     capture: Capture | None = None
     live_capture: LiveCapture | None = field(default=None, init=False)
-    _live_capture_phase: _LiveCapturePhase | None = field(default=None, init=False, repr=False, compare=False)
     _live_capture_lock: LockType = field(default_factory=Lock, init=False, repr=False, compare=False)
-    _capture_loading: bool = field(default=False, init=False, repr=False, compare=False)
 
     def reserve_live_capture(self, live_capture: LiveCapture) -> None:
         """Atomically reserve this session for one live capture."""
         with self._live_capture_lock:
-            if self._capture_loading:
-                raise RuntimeError("a capture file is currently loading; wait for load_capture to finish")
             if self.live_capture is not None:
-                if self._live_capture_phase == "starting":
-                    raise RuntimeError("a capture is already starting; wait for start_capture to finish")
-                if self._live_capture_phase in ("stopping", "stalled"):
-                    raise RuntimeError("a capture is still stopping; wait for stop_capture to finish")
                 raise RuntimeError("a capture is already running; call stop_capture first")
             self.live_capture = live_capture
-            self._live_capture_phase = "starting"
-
-    def mark_live_capture_running(self, live_capture: LiveCapture) -> bool:
-        """Mark a reserved capture running if it still owns the session."""
-        with self._live_capture_lock:
-            if self.live_capture is not live_capture or self._live_capture_phase != "starting":
-                return False
-            self._live_capture_phase = "running"
-            return True
-
-    def mark_live_capture_stopping(self, live_capture: LiveCapture) -> bool:
-        """Mark a starting capture as stopping during failed-start cleanup."""
-        with self._live_capture_lock:
-            if self.live_capture is not live_capture or self._live_capture_phase != "starting":
-                return False
-            self._live_capture_phase = "stopping"
-            return True
-
-    def mark_live_capture_stalled(self, live_capture: LiveCapture) -> None:
-        """Keep an active capture reserved after a bounded stop times out."""
-        with self._live_capture_lock:
-            if self.live_capture is live_capture:
-                self._live_capture_phase = "stalled"
 
     def begin_stop_live_capture(self) -> LiveCapture:
-        """Atomically claim a running or stalled capture for one stop operation."""
+        """Return the live capture currently owned by this session."""
         with self._live_capture_lock:
             live_capture = self.live_capture
             if live_capture is None:
                 raise RuntimeError("no capture is running; call start_capture first")
-            if self._live_capture_phase == "starting":
-                raise RuntimeError("capture is still starting; wait for start_capture to finish")
-            if self._live_capture_phase == "stopping":
-                raise RuntimeError("capture is already stopping; wait for stop_capture to finish")
-            self._live_capture_phase = "stopping"
             return live_capture
 
     def release_live_capture(self, live_capture: LiveCapture) -> None:
@@ -203,37 +164,65 @@ class Session:
         with self._live_capture_lock:
             if self.live_capture is live_capture:
                 self.live_capture = None
-                self._live_capture_phase = None
 
     def load(self, path: Path) -> Capture:
         """Load a pcap-ng capture file and replace the active capture."""
-        return self._load_capture(path, live_capture=None)
+        with self._live_capture_lock:
+            if self.live_capture is not None:
+                raise RuntimeError("cannot load a capture file while a live capture is active")
+        return self._load_capture(path)
 
     def load_stopped_capture(self, live_capture: LiveCapture) -> Capture:
-        """Load the output owned by the current stopping live capture."""
-        return self._load_capture(live_capture.output_path, live_capture=live_capture)
-
-    def _load_capture(self, path: Path, *, live_capture: LiveCapture | None) -> Capture:
-        self._begin_capture_load(live_capture)
-        try:
-            capture = _read_capture(path)
-            with self._live_capture_lock:
-                self.capture = capture
-            return capture
-        finally:
-            with self._live_capture_lock:
-                self._capture_loading = False
-
-    def _begin_capture_load(self, live_capture: LiveCapture | None) -> None:
+        """Load the output owned by the current live capture."""
         with self._live_capture_lock:
-            if self._capture_loading:
-                raise RuntimeError("another capture file is already loading")
-            if live_capture is None:
-                if self.live_capture is not None:
-                    raise RuntimeError("cannot load a capture file while a live capture is active")
-            elif self.live_capture is not live_capture or self._live_capture_phase != "stopping":
-                raise RuntimeError("only the current stopping capture can load its output")
-            self._capture_loading = True
+            if self.live_capture is not live_capture:
+                raise RuntimeError("capture no longer owns this session")
+        return self._load_capture(live_capture.output_path)
+
+    def _load_capture(self, path: Path) -> Capture:
+        source = _validate_capture_path(path)
+        file_size_bytes = source.stat().st_size
+
+        interfaces_seen: list[CaptureInterface] = []
+        current_section_interfaces: list[CaptureInterface] = []
+        packets: list[CapturePacket] = []
+        packet_timestamps: list[float] = []
+
+        with source.open("rb") as stream:
+            for block in PcapNgReader(stream):
+                if isinstance(block, SectionHeaderBlock):
+                    current_section_interfaces = []
+                    continue
+                if isinstance(block, InterfaceDescriptionBlock):
+                    interface = _capture_interface(block, len(current_section_interfaces))
+                    current_section_interfaces.append(interface)
+                    interfaces_seen.append(interface)
+                    continue
+                if isinstance(block, EnhancedPacketBlock):
+                    packet = _capture_enhanced_packet(block, current_section_interfaces)
+                    packets.append(packet)
+                    if packet.pcap_timestamp_seconds is not None:
+                        packet_timestamps.append(packet.pcap_timestamp_seconds)
+                    continue
+                if isinstance(block, SimplePacketBlock):
+                    packets.append(_capture_simple_packet(block, current_section_interfaces))
+
+        metadata = CaptureMetadata(
+            source=str(source),
+            file_size_bytes=file_size_bytes,
+            packet_count=len(packets),
+            capture_duration_seconds=_capture_duration(packet_timestamps),
+            interfaces_seen=tuple(interfaces_seen),
+        )
+        records = _decode_supported_packets(packets)
+        self.capture = Capture(
+            source=source,
+            metadata=metadata,
+            packets=tuple(packets),
+            records=records,
+            transactions=tuple(pair_urbs(records)),
+        )
+        return self.capture
 
     def add_marker(self, name: str, packet_index: int, note: str | None = None) -> Marker:
         """Append a named marker anchored to a decoded packet and return it.
@@ -411,50 +400,6 @@ def _find_marker(markers: list[Marker], name: str) -> Marker:
         if marker.name == name:
             return marker
     raise ValueError(f"no marker named {name!r}")
-
-
-def _read_capture(path: Path) -> Capture:
-    source = _validate_capture_path(path)
-    file_size_bytes = source.stat().st_size
-    interfaces_seen: list[CaptureInterface] = []
-    current_section_interfaces: list[CaptureInterface] = []
-    packets: list[CapturePacket] = []
-    packet_timestamps: list[float] = []
-
-    with source.open("rb") as stream:
-        for block in PcapNgReader(stream):
-            if isinstance(block, SectionHeaderBlock):
-                current_section_interfaces = []
-                continue
-            if isinstance(block, InterfaceDescriptionBlock):
-                interface = _capture_interface(block, len(current_section_interfaces))
-                current_section_interfaces.append(interface)
-                interfaces_seen.append(interface)
-                continue
-            if isinstance(block, EnhancedPacketBlock):
-                packet = _capture_enhanced_packet(block, current_section_interfaces)
-                packets.append(packet)
-                if packet.pcap_timestamp_seconds is not None:
-                    packet_timestamps.append(packet.pcap_timestamp_seconds)
-                continue
-            if isinstance(block, SimplePacketBlock):
-                packets.append(_capture_simple_packet(block, current_section_interfaces))
-
-    metadata = CaptureMetadata(
-        source=str(source),
-        file_size_bytes=file_size_bytes,
-        packet_count=len(packets),
-        capture_duration_seconds=_capture_duration(packet_timestamps),
-        interfaces_seen=tuple(interfaces_seen),
-    )
-    records = _decode_supported_packets(packets)
-    return Capture(
-        source=source,
-        metadata=metadata,
-        packets=tuple(packets),
-        records=records,
-        transactions=tuple(pair_urbs(records)),
-    )
 
 
 def _validate_capture_path(path: Path) -> Path:

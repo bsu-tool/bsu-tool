@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,7 +36,7 @@ def register(mcp: FastMCP, session: Session) -> None:
     """Register live-capture tools on the FastMCP instance."""
 
     @mcp.tool()
-    async def start_capture(  # pyright: ignore[reportUnusedFunction]
+    def start_capture(  # pyright: ignore[reportUnusedFunction]
         bus: int,
         output_path: str,
         device: int | None = None,
@@ -73,31 +72,14 @@ def register(mcp: FastMCP, session: Session) -> None:
         live_capture = LiveCapture(controller=controller, output_path=destination)
         session.reserve_live_capture(live_capture)
         capture_started = False
-        start_job = asyncio.create_task(
-            asyncio.to_thread(controller.start, bus=bus, device=device, output_path=destination)
-        )
         try:
-            await asyncio.shield(start_job)
+            controller.start(bus=bus, device=device, output_path=destination)
             if not controller.is_running:
                 raise CaptureStateError("capture controller returned before the capture was live")
-            if not session.mark_live_capture_running(live_capture):
-                raise CaptureStateError("capture no longer owns the session after startup")
             capture_started = True
-        except asyncio.CancelledError:
-            try:
-                await asyncio.shield(start_job)
-            except Exception:
-                pass
-            session.mark_live_capture_stopping(live_capture)
-            try:
-                await asyncio.shield(asyncio.to_thread(controller.stop))
-            except Exception:
-                pass
-            raise
         except TimeoutError as exc:
-            session.mark_live_capture_stopping(live_capture)
             try:
-                await asyncio.to_thread(controller.stop)
+                controller.stop()
             except Exception as cleanup_error:  # noqa: BLE001 - report startup and cleanup failures together
                 raise RuntimeError(
                     "capture startup timed out and cleanup failed; "
@@ -112,14 +94,12 @@ def register(mcp: FastMCP, session: Session) -> None:
             raise RuntimeError(f"capture could not start: {exc}") from exc
         finally:
             if not capture_started:
-                if controller.is_active:
-                    session.mark_live_capture_stalled(live_capture)
-                else:
+                if not controller.is_active:
                     session.release_live_capture(live_capture)
         return StartCaptureResult(bus=bus, device=device, output_path=str(destination))
 
     @mcp.tool()
-    async def stop_capture() -> StopCaptureResult:  # pyright: ignore[reportUnusedFunction]
+    def stop_capture() -> StopCaptureResult:  # pyright: ignore[reportUnusedFunction]
         """Stop the running capture, load it as the active capture, and summarize it.
 
         Returns the final capture statistics plus what the loaded file contains
@@ -134,7 +114,7 @@ def register(mcp: FastMCP, session: Session) -> None:
 
         try:
             try:
-                stats = await asyncio.to_thread(controller.stop)
+                stats = controller.stop()
             except TimeoutError as exc:
                 raise RuntimeError(
                     f"capture did not stop in time; retry stop_capture before starting another capture: {exc}"
@@ -143,7 +123,7 @@ def register(mcp: FastMCP, session: Session) -> None:
                 raise RuntimeError(f"capture could not stop: {exc}") from exc
             except UsbmonError as exc:
                 raise RuntimeError(f"usbmon capture failed while stopping: {exc}") from exc
-            capture = await asyncio.to_thread(session.load_stopped_capture, live_capture)
+            capture = session.load_stopped_capture(live_capture)
             return StopCaptureResult(
                 output_path=str(output_path),
                 output_bytes=stats.output_bytes,
@@ -154,7 +134,5 @@ def register(mcp: FastMCP, session: Session) -> None:
                 device_ids=tuple(device.device_id for device in session.list_devices()),
             )
         finally:
-            if controller.is_active:
-                session.mark_live_capture_stalled(live_capture)
-            else:
+            if not controller.is_active:
                 session.release_live_capture(live_capture)

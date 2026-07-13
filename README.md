@@ -31,9 +31,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow, branch
 |----------|-------------|
 | [SRS](docs/srs/README.md) | Software Requirements Specification |
 | [Architecture](docs/architecture/README.md) | Component design and data flow |
+| [Milestone 2 demo](docs/demo/milestone-2-runbook.md) | Fresh-install and end-to-end demo runbook |
 | [User Guide](docs/user-guide/README.md) | Installation and usage (Milestone 4) |
 
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) and [Apache 2.0](LICENSE-APACHE).
-

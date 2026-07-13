@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from _thread import LockType
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final
+from threading import Lock
+from typing import TYPE_CHECKING, Final, Literal
 
 from bsu_tool.descriptors import (
     CONFIGURATION_DESCRIPTOR,
@@ -50,6 +52,9 @@ from bsu_tool.urb_decoder import (
     pair_urbs,
 )
 
+if TYPE_CHECKING:
+    from bsu_tool.sniffer import CaptureController
+
 _PCAPNG_SUFFIX: Final[str] = ".pcapng"
 _IF_TSRESOL_OPTION: Final[int] = 9
 _DEFAULT_TIMESTAMP_RESOLUTION_SECONDS: Final[float] = 1 / 1_000_000
@@ -70,6 +75,45 @@ class Marker:
     timestamp: float
     packet_index: int
     note: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MarkerSpan:
+    """Decoded packets recorded strictly between a pair of named markers.
+
+    ``packets`` are the records whose index lies between the two markers'
+    anchor packets, exclusive of the marker-anchored packets themselves. The
+    resolved markers are carried alongside so a caller can see exactly which
+    boundaries produced the span.
+
+    When a ``device_id`` filter is applied, ``packets`` holds only the records
+    in that span belonging to the device and ``count`` is the post-filter total
+    (the number of packets in the span for that device), so pagination against
+    ``count`` stays coherent.
+    """
+
+    start_marker: Marker
+    end_marker: Marker
+    packets: tuple[PacketRecord, ...]
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureSummary:
+    """Aggregate counts describing the active capture at a glance.
+
+    The counts are derived from the decoded record stream and the device
+    summaries, so they cover the same packets ``get_packets`` reports.
+    """
+
+    device_count: int  # distinct USB devices observed in the decoded records
+    packet_count: int  # total decoded URB records in the capture
+    marker_count: int  # analyst-supplied markers on the capture
+    endpoint_count: int  # endpoints across all devices (sum of each device's distinct endpoints)
+    # Neutral statistics, NOT errors. usbmon captures routinely begin and end
+    # mid-transaction, so a healthy capture normally carries some of each.
+    unmatched_submission_count: int  # submissions still in flight (no matching completion captured)
+    orphan_completion_count: int  # completions whose submission was not captured (capture began mid-transaction)
 
 
 def _empty_markers() -> list[Marker]:
@@ -100,6 +144,17 @@ class Capture:
     markers: list[Marker] = field(default_factory=_empty_markers)
 
 
+@dataclass(frozen=True, slots=True)
+class LiveCapture:
+    """A live capture owned by a session until it is stopped."""
+
+    controller: CaptureController
+    output_path: Path
+
+
+_LiveCapturePhase = Literal["starting", "running", "stopping"]
+
+
 @dataclass
 class _DeviceAccumulator:
     bus_num: int
@@ -117,9 +172,65 @@ class Session:
     """Holds the active loaded capture."""
 
     capture: Capture | None = None
+    live_capture: LiveCapture | None = field(default=None, init=False)
+    _live_capture_phase: _LiveCapturePhase | None = field(default=None, init=False, repr=False, compare=False)
+    _live_capture_lock: LockType = field(default_factory=Lock, init=False, repr=False, compare=False)
+
+    def reserve_live_capture(self, live_capture: LiveCapture) -> None:
+        """Atomically reserve this session for one live capture."""
+        with self._live_capture_lock:
+            if self.live_capture is not None:
+                if self._live_capture_phase == "starting":
+                    raise RuntimeError("a capture is already starting; wait for start_capture to finish")
+                if self._live_capture_phase == "stopping":
+                    raise RuntimeError("a capture is still stopping; wait for stop_capture to finish")
+                raise RuntimeError("a capture is already running; call stop_capture first")
+            self.live_capture = live_capture
+            self._live_capture_phase = "starting"
+
+    def mark_live_capture_running(self, live_capture: LiveCapture) -> bool:
+        """Mark an owned capture available for a stop operation."""
+        with self._live_capture_lock:
+            if self.live_capture is not live_capture:
+                return False
+            self._live_capture_phase = "running"
+            return True
+
+    def begin_stop_live_capture(self) -> LiveCapture:
+        """Atomically claim the running capture for one stop operation."""
+        with self._live_capture_lock:
+            live_capture = self.live_capture
+            if live_capture is None:
+                raise RuntimeError("no capture is running; call start_capture first")
+            if self._live_capture_phase == "starting":
+                raise RuntimeError("capture is still starting; wait for start_capture to finish")
+            if self._live_capture_phase == "stopping":
+                raise RuntimeError("capture is already stopping; wait for stop_capture to finish")
+            self._live_capture_phase = "stopping"
+            return live_capture
+
+    def release_live_capture(self, live_capture: LiveCapture) -> None:
+        """Release ``live_capture`` if it still owns this session."""
+        with self._live_capture_lock:
+            if self.live_capture is live_capture:
+                self.live_capture = None
+                self._live_capture_phase = None
 
     def load(self, path: Path) -> Capture:
         """Load a pcap-ng capture file and replace the active capture."""
+        with self._live_capture_lock:
+            if self.live_capture is not None:
+                raise RuntimeError("cannot load a capture file while a live capture is active")
+        return self._load_capture(path)
+
+    def load_stopped_capture(self, live_capture: LiveCapture) -> Capture:
+        """Load the output owned by the current live capture."""
+        with self._live_capture_lock:
+            if self.live_capture is not live_capture:
+                raise RuntimeError("capture no longer owns this session")
+        return self._load_capture(live_capture.output_path)
+
+    def _load_capture(self, path: Path) -> Capture:
         source = _validate_capture_path(path)
         file_size_bytes = source.stat().st_size
 
@@ -194,6 +305,63 @@ class Session:
         if self.capture is None:
             raise RuntimeError("No capture loaded. Call load() first.")
         return tuple(self.capture.markers)
+
+    def packets_between_markers(
+        self,
+        start_name: str,
+        end_name: str,
+        *,
+        device_id: str | None = None,
+    ) -> MarkerSpan:
+        """Return the decoded packets recorded strictly between two named markers.
+
+        The markers bracket a single physical action (see the marker tools): pass
+        the marker added when the action began as ``start_name`` and the one added
+        when it ended as ``end_name``. The returned packets are those whose index
+        lies strictly between the two markers' anchor packets — the marker-anchored
+        packets are the boundaries and are excluded — which isolates the traffic
+        produced by that one action.
+
+        Args:
+            start_name: Name of the marker anchoring the start of the span.
+            end_name: Name of the marker anchoring the end of the span.
+            device_id: Restrict the span to one device by its ``dev_bbb_ddd`` id,
+                mirroring ``get_packets``. ``None`` keeps every device in range. An
+                unknown id matches nothing and yields an empty span (no error). The
+                returned span's ``count`` is the post-filter total.
+
+        Returns:
+            A :class:`MarkerSpan` holding the resolved markers and the packets
+            between them in capture order. The span is empty when the markers are
+            adjacent, anchored to the same packet, when the same marker name is
+            passed for both ends, or when ``device_id`` excludes every packet in
+            range.
+
+        Raises:
+            RuntimeError: No capture has been loaded.
+            ValueError: Either name has no marker, or ``start_name`` is anchored
+                after ``end_name`` (a reversed span).
+        """
+        if self.capture is None:
+            raise RuntimeError("No capture loaded. Call load() first.")
+        markers = self.capture.markers
+        records = self.capture.records
+        start = _find_marker(markers, start_name)
+        end = _find_marker(markers, end_name)
+        if start.packet_index > end.packet_index:
+            raise ValueError(
+                f"start marker {start_name!r} (index {start.packet_index}) is anchored "
+                f"after end marker {end_name!r} (index {end.packet_index})"
+            )
+        # The span is the contiguous decoded-record range strictly between the
+        # two anchors; keep each record's original index and drop any that a
+        # device_id filter excludes so count reflects the post-filter total.
+        packets = tuple(
+            _packet_record(index, records[index])
+            for index in range(start.packet_index + 1, end.packet_index)
+            if device_id is None or _device_id(records[index].bus_num, records[index].dev_num) == device_id
+        )
+        return MarkerSpan(start_marker=start, end_marker=end, packets=packets, count=len(packets))
 
     def list_devices(self) -> tuple[DeviceSummary, ...]:
         """Return USB devices observed in the active capture."""
@@ -301,6 +469,80 @@ class Session:
         if self.capture is None:
             raise RuntimeError("No capture loaded. Call load_capture() first.")
         return _build_enumeration(self.capture.records, self.capture.transactions, device_id)
+
+    def summary(self) -> CaptureSummary:
+        """Return aggregate counts for the active capture.
+
+        Counts distinct devices, total decoded packets, markers, and endpoints
+        (summed across every device's distinct endpoints). Also reports the
+        neutral in-flight and orphan-completion statistics: these are normal for
+        captures that begin or end mid-transaction and are not faults.
+
+        Raises:
+            RuntimeError: No capture has been loaded.
+        """
+        if self.capture is None:
+            raise RuntimeError("No capture loaded. Call load() first.")
+        devices = _summarize_devices(self.capture.records, self.capture.transactions)
+        transactions = self.capture.transactions
+        return CaptureSummary(
+            device_count=len(devices),
+            packet_count=len(self.capture.records),
+            marker_count=len(self.capture.markers),
+            endpoint_count=sum(len(device.endpoints_seen) for device in devices),
+            unmatched_submission_count=_count_unmatched_submissions(transactions),
+            orphan_completion_count=_count_orphan_completions(transactions),
+        )
+
+    def validate(self) -> list[str]:
+        """Return human-readable integrity faults in the active capture.
+
+        An empty list genuinely means the capture is valid. Only true faults are
+        reported, in this order:
+
+        1. The capture decoded no supported URB records (an empty analysis).
+        2. A marker anchored outside the decoded record range (a dangling
+           reference that ``get_packet`` would resolve to nothing).
+
+        In-flight submissions (no matching completion) and orphan completions
+        (submission not captured) are NOT faults: usbmon captures routinely begin
+        and end mid-transaction, so a healthy capture normally carries some of
+        each. Those are surfaced as neutral statistics on :class:`CaptureSummary`
+        (``unmatched_submission_count`` / ``orphan_completion_count``) instead.
+
+        Raises:
+            RuntimeError: No capture has been loaded.
+        """
+        if self.capture is None:
+            raise RuntimeError("No capture loaded. Call load() first.")
+        records = self.capture.records
+        problems: list[str] = []
+        if not records:
+            problems.append("capture contains no decoded USB packets")
+        for marker in self.capture.markers:
+            if not 0 <= marker.packet_index < len(records):
+                problems.append(
+                    f"marker {marker.name!r} references packet index {marker.packet_index} "
+                    f"outside the decoded range 0..{len(records) - 1}"
+                )
+        return problems
+
+
+def _count_unmatched_submissions(transactions: tuple[UrbTransaction, ...]) -> int:
+    """Count in-flight submissions: a submission with no matching completion."""
+    return sum(1 for tx in transactions if tx.submission is not None and tx.completion is None)
+
+
+def _count_orphan_completions(transactions: tuple[UrbTransaction, ...]) -> int:
+    """Count orphan completions: a completion whose submission was not captured."""
+    return sum(1 for tx in transactions if tx.submission is None and tx.completion is not None)
+
+
+def _find_marker(markers: list[Marker], name: str) -> Marker:
+    for marker in markers:
+        if marker.name == name:
+            return marker
+    raise ValueError(f"no marker named {name!r}")
 
 
 def _validate_capture_path(path: Path) -> Path:

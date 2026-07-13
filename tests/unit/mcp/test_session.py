@@ -7,7 +7,7 @@ import pytest
 
 from bsu_tool.mcp.interfaces import EndpointSummary
 from bsu_tool.pcapng_reader import PcapNgError
-from bsu_tool.session import Marker, Session
+from bsu_tool.session import CaptureSummary, Marker, Session
 
 _USBMON_HEADER_FORMAT = "<QBBBBHBBqiiII8s"
 _SUBMISSION = 0x53
@@ -582,3 +582,266 @@ def test_list_markers_returns_insertion_order(tmp_path: Path) -> None:
     first = session.add_marker(name="a-start", packet_index=0)
     second = session.add_marker(name="a-end", packet_index=1)
     assert session.list_markers() == (first, second)
+
+
+def _span_session(tmp_path: Path) -> Session:
+    """A Session over the 5-packet multi-device capture (indices 0..4)."""
+    path = tmp_path / "span.pcapng"
+    path.write_bytes(_capture_bytes(_multi_device_packets()))
+    session = Session()
+    session.load(path)
+    return session
+
+
+def test_packets_between_markers_requires_loaded_capture() -> None:
+    """packets_between_markers raises RuntimeError if no capture has been loaded."""
+    with pytest.raises(RuntimeError):
+        Session().packets_between_markers("start", "end")
+
+
+def test_packets_between_markers_returns_packets_strictly_between(tmp_path: Path) -> None:
+    """The span is the records between the markers, excluding the marker packets."""
+    session = _span_session(tmp_path)
+    session.add_marker(name="start", packet_index=0)
+    session.add_marker(name="end", packet_index=4)
+
+    span = session.packets_between_markers("start", "end")
+
+    assert span.start_marker.name == "start"
+    assert span.end_marker.name == "end"
+    assert span.count == 3
+    assert [packet.index for packet in span.packets] == [1, 2, 3]
+
+
+def test_packets_between_markers_missing_start(tmp_path: Path) -> None:
+    """An unknown start marker name raises a clear ValueError."""
+    session = _span_session(tmp_path)
+    session.add_marker(name="end", packet_index=4)
+
+    with pytest.raises(ValueError, match="no marker named 'start'"):
+        session.packets_between_markers("start", "end")
+
+
+def test_packets_between_markers_missing_end(tmp_path: Path) -> None:
+    """An unknown end marker name raises a clear ValueError."""
+    session = _span_session(tmp_path)
+    session.add_marker(name="start", packet_index=0)
+
+    with pytest.raises(ValueError, match="no marker named 'end'"):
+        session.packets_between_markers("start", "end")
+
+
+def test_packets_between_markers_rejects_reversed_span(tmp_path: Path) -> None:
+    """A start marker anchored after the end marker raises ValueError."""
+    session = _span_session(tmp_path)
+    session.add_marker(name="start", packet_index=4)
+    session.add_marker(name="end", packet_index=1)
+
+    with pytest.raises(ValueError, match="anchored after"):
+        session.packets_between_markers("start", "end")
+
+
+def test_packets_between_markers_empty_when_adjacent(tmp_path: Path) -> None:
+    """Adjacent markers bound no packets, so the span is empty (not an error)."""
+    session = _span_session(tmp_path)
+    session.add_marker(name="start", packet_index=2)
+    session.add_marker(name="end", packet_index=3)
+
+    span = session.packets_between_markers("start", "end")
+
+    assert span.count == 0
+    assert span.packets == ()
+
+
+def test_packets_between_markers_empty_for_same_name(tmp_path: Path) -> None:
+    """Passing one marker name for both ends yields an empty span, not an error."""
+    session = _span_session(tmp_path)
+    session.add_marker(name="solo", packet_index=2)
+
+    span = session.packets_between_markers("solo", "solo")
+
+    assert span.count == 0
+    assert span.packets == ()
+    assert span.start_marker is span.end_marker
+
+
+def test_packets_between_markers_empty_for_distinct_markers_same_index(tmp_path: Path) -> None:
+    """Two differently named markers on the same packet bound an empty span."""
+    session = _span_session(tmp_path)
+    session.add_marker(name="start", packet_index=2)
+    session.add_marker(name="end", packet_index=2)
+
+    span = session.packets_between_markers("start", "end")
+
+    assert span.count == 0
+    assert span.packets == ()
+
+
+def test_packets_between_markers_spans_multiple_devices(tmp_path: Path) -> None:
+    """The span filters by index only, so it includes every device in range."""
+    session = _span_session(tmp_path)
+    # indices 0..4 across two devices: dev_001_004 at 0..1, dev_001_007 at 2..4.
+    session.add_marker(name="start", packet_index=0)
+    session.add_marker(name="end", packet_index=4)
+
+    span = session.packets_between_markers("start", "end")
+
+    assert [packet.index for packet in span.packets] == [1, 2, 3]
+    assert {packet.device_id for packet in span.packets} == {"dev_001_004", "dev_001_007"}
+
+
+def test_packets_between_markers_filters_by_device(tmp_path: Path) -> None:
+    """device_id keeps only that device's packets in the span; count is post-filter."""
+    session = _span_session(tmp_path)
+    # span 1..3 holds dev_001_004 at index 1 and dev_001_007 at indices 2..3.
+    session.add_marker(name="start", packet_index=0)
+    session.add_marker(name="end", packet_index=4)
+
+    span = session.packets_between_markers("start", "end", device_id="dev_001_007")
+
+    assert span.count == 2
+    assert [packet.index for packet in span.packets] == [2, 3]
+    assert {packet.device_id for packet in span.packets} == {"dev_001_007"}
+
+
+def test_packets_between_markers_device_with_zero_packets_in_span(tmp_path: Path) -> None:
+    """A known device absent from the span yields an empty span, not an error."""
+    session = _span_session(tmp_path)
+    # span 2..3 is all dev_001_007; dev_001_004 exists in the capture but not here.
+    session.add_marker(name="start", packet_index=1)
+    session.add_marker(name="end", packet_index=4)
+
+    span = session.packets_between_markers("start", "end", device_id="dev_001_004")
+
+    assert span.count == 0
+    assert span.packets == ()
+
+
+def test_packets_between_markers_unknown_device_id_is_empty(tmp_path: Path) -> None:
+    """An unknown device_id matches nothing and yields an empty span (as get_packets)."""
+    session = _span_session(tmp_path)
+    session.add_marker(name="start", packet_index=0)
+    session.add_marker(name="end", packet_index=4)
+
+    span = session.packets_between_markers("start", "end", device_id="dev_009_009")
+
+    assert span.count == 0
+    assert span.packets == ()
+
+
+def test_summary_requires_loaded_capture() -> None:
+    """summary raises RuntimeError if no capture has been loaded."""
+    with pytest.raises(RuntimeError):
+        Session().summary()
+
+
+def test_summary_returns_correct_counts(tmp_path: Path) -> None:
+    """summary counts devices, packets, markers, and endpoints across devices."""
+    setup_device = _get_descriptor_setup(descriptor_type=1, descriptor_index=0, length=18)
+    descriptor = _device_descriptor(vendor_id=0x27C6, product_id=0x533C, manufacturer_index=0, product_index=0)
+    # Two fully paired devices: dev 4 uses endpoints 0x01/0x81, dev 7 uses 0x00 (control).
+    path = tmp_path / "summary.pcapng"
+    path.write_bytes(
+        _capture_bytes(
+            (
+                _usbmon_packet(urb_id=1, endpoint=0x01, dev_num=4, data=b"a"),
+                _usbmon_packet(urb_id=1, event=_COMPLETION, endpoint=0x81, dev_num=4, data=b"bc"),
+                _usbmon_packet(urb_id=2, transfer_type=_CONTROL, endpoint=0x80, dev_num=7, setup=setup_device),
+                _usbmon_packet(
+                    urb_id=2,
+                    event=_COMPLETION,
+                    transfer_type=_CONTROL,
+                    endpoint=0x80,
+                    dev_num=7,
+                    flag_setup=0x3E,
+                    data=descriptor,
+                ),
+            )
+        )
+    )
+    session = Session()
+    session.load(path)
+    session.add_marker(name="start", packet_index=0)
+    session.add_marker(name="end", packet_index=3)
+
+    summary = session.summary()
+
+    assert summary == CaptureSummary(
+        device_count=2,
+        packet_count=4,
+        marker_count=2,
+        endpoint_count=3,
+        unmatched_submission_count=0,
+        orphan_completion_count=0,
+    )
+    assert session.validate() == []
+
+
+def test_validate_requires_loaded_capture() -> None:
+    """validate raises RuntimeError if no capture has been loaded."""
+    with pytest.raises(RuntimeError):
+        Session().validate()
+
+
+def test_validate_flags_empty_capture(tmp_path: Path) -> None:
+    """A capture that decodes no supported records is reported as empty."""
+    path = tmp_path / "isochronous-only.pcapng"
+    path.write_bytes(_capture_bytes((_usbmon_packet(transfer_type=_ISOCHRONOUS),)))
+    session = Session()
+    session.load(path)
+
+    assert session.validate() == ["capture contains no decoded USB packets"]
+
+
+def test_summary_counts_unmatched_submission(tmp_path: Path) -> None:
+    """An in-flight submission (no completion) is a neutral summary statistic, not a validate fault."""
+    path = tmp_path / "orphan-sub.pcapng"
+    path.write_bytes(_capture_bytes((_usbmon_packet(urb_id=1, endpoint=0x01, dev_num=4, data=b"a"),)))
+    session = Session()
+    session.load(path)
+
+    # A lone submission is still a valid capture: captures normally begin/end mid-transaction.
+    assert session.validate() == []
+    summary = session.summary()
+    assert summary.unmatched_submission_count == 1
+    assert summary.orphan_completion_count == 0
+
+
+def test_summary_counts_orphan_completion(tmp_path: Path) -> None:
+    """A completion whose submission was never captured is a neutral statistic, not a validate fault."""
+    path = tmp_path / "orphan-comp.pcapng"
+    completion = _usbmon_packet(urb_id=9, event=_COMPLETION, endpoint=0x81, dev_num=4, data=b"z")
+    path.write_bytes(_capture_bytes((completion,)))
+    session = Session()
+    session.load(path)
+
+    assert session.validate() == []
+    summary = session.summary()
+    assert summary.orphan_completion_count == 1
+    assert summary.unmatched_submission_count == 0
+
+
+def test_validate_flags_marker_out_of_range(tmp_path: Path) -> None:
+    """A marker anchored outside the decoded record range is reported."""
+    session = Session()
+    capture = session.load(_write_capture(tmp_path))
+    # Bypass add_marker's guard to model a dangling marker reference (capture has 2 records).
+    capture.markers.append(Marker(name="stale", timestamp=0.0, packet_index=99))
+
+    assert "marker 'stale' references packet index 99 outside the decoded range 0..1" in session.validate()
+
+
+def test_validate_reports_multiple_faults_in_order(tmp_path: Path) -> None:
+    """With both genuine faults present, validate reports empty-capture first, then the dangling marker."""
+    path = tmp_path / "empty-with-marker.pcapng"
+    path.write_bytes(_capture_bytes((_usbmon_packet(transfer_type=_ISOCHRONOUS),)))
+    session = Session()
+    capture = session.load(path)
+    assert len(capture.records) == 0
+    # Bypass add_marker's guard: on a zero-record capture any index dangles.
+    capture.markers.append(Marker(name="stale", timestamp=0.0, packet_index=0))
+
+    assert session.validate() == [
+        "capture contains no decoded USB packets",
+        "marker 'stale' references packet index 0 outside the decoded range 0..-1",
+    ]

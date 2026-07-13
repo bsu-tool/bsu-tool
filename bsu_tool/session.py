@@ -79,6 +79,24 @@ class MarkerSpan:
     count: int
 
 
+@dataclass(frozen=True, slots=True)
+class CaptureSummary:
+    """Aggregate counts describing the active capture at a glance.
+
+    The counts are derived from the decoded record stream and the device
+    summaries, so they cover the same packets ``get_packets`` reports.
+    """
+
+    device_count: int  # distinct USB devices observed in the decoded records
+    packet_count: int  # total decoded URB records in the capture
+    marker_count: int  # analyst-supplied markers on the capture
+    endpoint_count: int  # endpoints across all devices (sum of each device's distinct endpoints)
+    # Neutral statistics, NOT errors. usbmon captures routinely begin and end
+    # mid-transaction, so a healthy capture normally carries some of each.
+    unmatched_submission_count: int  # submissions still in flight (no matching completion captured)
+    orphan_completion_count: int  # completions whose submission was not captured (capture began mid-transaction)
+
+
 def _empty_markers() -> list[Marker]:
     return []
 
@@ -344,6 +362,73 @@ class Session:
         if not 0 <= index < len(records):
             return None
         return _packet_record(index, records[index])
+
+    def summary(self) -> CaptureSummary:
+        """Return aggregate counts for the active capture.
+
+        Counts distinct devices, total decoded packets, markers, and endpoints
+        (summed across every device's distinct endpoints). Also reports the
+        neutral in-flight and orphan-completion statistics: these are normal for
+        captures that begin or end mid-transaction and are not faults.
+
+        Raises:
+            RuntimeError: No capture has been loaded.
+        """
+        if self.capture is None:
+            raise RuntimeError("No capture loaded. Call load() first.")
+        devices = _summarize_devices(self.capture.records, self.capture.transactions)
+        transactions = self.capture.transactions
+        return CaptureSummary(
+            device_count=len(devices),
+            packet_count=len(self.capture.records),
+            marker_count=len(self.capture.markers),
+            endpoint_count=sum(len(device.endpoints_seen) for device in devices),
+            unmatched_submission_count=_count_unmatched_submissions(transactions),
+            orphan_completion_count=_count_orphan_completions(transactions),
+        )
+
+    def validate(self) -> list[str]:
+        """Return human-readable integrity faults in the active capture.
+
+        An empty list genuinely means the capture is valid. Only true faults are
+        reported, in this order:
+
+        1. The capture decoded no supported URB records (an empty analysis).
+        2. A marker anchored outside the decoded record range (a dangling
+           reference that ``get_packet`` would resolve to nothing).
+
+        In-flight submissions (no matching completion) and orphan completions
+        (submission not captured) are NOT faults: usbmon captures routinely begin
+        and end mid-transaction, so a healthy capture normally carries some of
+        each. Those are surfaced as neutral statistics on :class:`CaptureSummary`
+        (``unmatched_submission_count`` / ``orphan_completion_count``) instead.
+
+        Raises:
+            RuntimeError: No capture has been loaded.
+        """
+        if self.capture is None:
+            raise RuntimeError("No capture loaded. Call load() first.")
+        records = self.capture.records
+        problems: list[str] = []
+        if not records:
+            problems.append("capture contains no decoded USB packets")
+        for marker in self.capture.markers:
+            if not 0 <= marker.packet_index < len(records):
+                problems.append(
+                    f"marker {marker.name!r} references packet index {marker.packet_index} "
+                    f"outside the decoded range 0..{len(records) - 1}"
+                )
+        return problems
+
+
+def _count_unmatched_submissions(transactions: tuple[UrbTransaction, ...]) -> int:
+    """Count in-flight submissions: a submission with no matching completion."""
+    return sum(1 for tx in transactions if tx.submission is not None and tx.completion is None)
+
+
+def _count_orphan_completions(transactions: tuple[UrbTransaction, ...]) -> int:
+    """Count orphan completions: a completion whose submission was not captured."""
+    return sum(1 for tx in transactions if tx.submission is None and tx.completion is not None)
 
 
 def _find_marker(markers: list[Marker], name: str) -> Marker:

@@ -137,57 +137,75 @@ def capture(
     stats = CaptureStats(output_path=output_path)
     start_time = time.monotonic()
     last_progress_time = start_time
+    output_created = False
+    capture_live = False
 
-    # "xb" fails atomically if the path exists, so the caller needn't do
-    # its own check-then-open (which would race).
-    with output_path.open("xb") as out_fp:
-        writer = PcapNgWriter(out_fp)
-        writer.write_section_header()
-        interface_id = writer.write_interface_description(
-            link_type=LINKTYPE_USB_LINUX_MMAPPED,
-        )
+    if output_path.exists():
+        raise FileExistsError(output_path)
 
+    try:
         with UsbmonSource(bus_number=bus, stop_event=stop_event) as source:
-            # File open and device polling: the capture is live. Signal any
-            # waiter that it's now safe to tell the user to operate the device.
-            if ready_event is not None:
-                ready_event.set()
+            if stop_event.is_set():
+                stats.elapsed_seconds = time.monotonic() - start_time
+                return stats
 
-            for header, data in source:
-                stats.seen += 1
+            # "xb" remains the atomic guard against a path created while the
+            # usbmon source was opening.
+            with output_path.open("xb") as out_fp:
+                output_created = True
+                writer = PcapNgWriter(out_fp)
+                writer.write_section_header()
+                interface_id = writer.write_interface_description(
+                    link_type=LINKTYPE_USB_LINUX_MMAPPED,
+                )
+                capture_live = True
+                # File open and device polling: the capture is live. Signal any
+                # waiter that it's now safe to tell the user to operate the device.
+                if ready_event is not None:
+                    ready_event.set()
 
-                if device is not None and header[_DEVNUM_OFFSET] != device:
-                    # Another device on the bus. Still tick progress so a wrong
-                    # --device shows climbing "seen" against stuck "matched".
+                for header, data in source:
+                    stats.seen += 1
+
+                    if device is not None and header[_DEVNUM_OFFSET] != device:
+                        # Another device on the bus. Still tick progress so a wrong
+                        # --device shows climbing "seen" against stuck "matched".
+                        now = time.monotonic()
+                        if on_progress is not None and now - last_progress_time >= _PROGRESS_INTERVAL_SECONDS:
+                            stats.elapsed_seconds = now - start_time
+                            stats.output_bytes = out_fp.tell()
+                            on_progress(stats)
+                            last_progress_time = now
+                        continue
+
+                    # Derive the EPB timestamp from the usbmon header rather than
+                    # time.time(), so a reader sees consistent values whether it
+                    # reads the EPB header or the URB header.
+                    ts_sec = int.from_bytes(header[16:24], "little", signed=True)
+                    ts_usec = int.from_bytes(header[24:28], "little", signed=True)
+                    timestamp_us = ts_sec * 1_000_000 + ts_usec
+
+                    packet_data = header + data
+                    writer.write_enhanced_packet(
+                        interface_id=interface_id,
+                        timestamp_us=timestamp_us,
+                        packet_data=packet_data,
+                    )
+                    stats.matched += 1
+
                     now = time.monotonic()
                     if on_progress is not None and now - last_progress_time >= _PROGRESS_INTERVAL_SECONDS:
                         stats.elapsed_seconds = now - start_time
                         stats.output_bytes = out_fp.tell()
                         on_progress(stats)
                         last_progress_time = now
-                    continue
-
-                # Derive the EPB timestamp from the usbmon header rather than
-                # time.time(), so a reader sees consistent values whether it
-                # reads the EPB header or the URB header.
-                ts_sec = int.from_bytes(header[16:24], "little", signed=True)
-                ts_usec = int.from_bytes(header[24:28], "little", signed=True)
-                timestamp_us = ts_sec * 1_000_000 + ts_usec
-
-                packet_data = header + data
-                writer.write_enhanced_packet(
-                    interface_id=interface_id,
-                    timestamp_us=timestamp_us,
-                    packet_data=packet_data,
-                )
-                stats.matched += 1
-
-                now = time.monotonic()
-                if on_progress is not None and now - last_progress_time >= _PROGRESS_INTERVAL_SECONDS:
-                    stats.elapsed_seconds = now - start_time
-                    stats.output_bytes = out_fp.tell()
-                    on_progress(stats)
-                    last_progress_time = now
+    except BaseException as exc:  # noqa: BLE001 - preserve the original capture failure
+        if output_created and not capture_live:
+            try:
+                output_path.unlink()
+            except OSError as cleanup_error:
+                exc.add_note(f"could not remove incomplete output {output_path}: {cleanup_error}")
+        raise
 
     # Final update after close, so output_bytes is the true file size
     # rather than a possibly-still-buffered tell().
@@ -216,6 +234,10 @@ def capture(
 #: capture to go live. Startup should take milliseconds; this only guards
 #: against a pathological hang.
 _DEFAULT_READY_TIMEOUT_SECONDS: float = 5.0
+
+#: Default ceiling on how long :meth:`CaptureController.stop` waits for the
+#: capture thread to finish after it has been signalled.
+_DEFAULT_STOP_TIMEOUT_SECONDS: float = 5.0
 
 #: Poll granularity of the start-time wait loop: prompt enough to notice a fast
 #: startup failure, coarse enough not to busy-spin.
@@ -268,6 +290,11 @@ class CaptureController:
     def is_running(self) -> bool:
         """Whether a capture is live (started, gone ready, not yet finished)."""
         return self._ready.is_set() and not self._finished.is_set()
+
+    @property
+    def is_active(self) -> bool:
+        """Whether the capture thread has started and not yet finished."""
+        return self._thread is not None and self._thread.is_alive()
 
     def start(
         self,
@@ -344,20 +371,22 @@ class CaptureController:
             raise self._exc
         if deadline_reached:
             raise TimeoutError(f"capture did not go live within {ready_timeout:.1f}s")
-        # _finished set, no exception, never went ready: capture returned
-        # immediately (e.g. stop_event somehow pre-set). Nothing to wait on.
+        raise CaptureStateError("capture finished before becoming live")
 
-    def stop(self) -> CaptureStats:
+    def stop(self, *, timeout: float = _DEFAULT_STOP_TIMEOUT_SECONDS) -> CaptureStats:
         """Stop the capture, wait for the thread, and return final stats.
 
-        Signals the capture to stop and joins the thread. If the capture raised
-        after going live, that exception is re-raised here.
+        Signals the capture to stop and waits up to ``timeout`` seconds for the
+        thread. If the capture raised after going live, that exception is
+        re-raised here.
 
         Raises
         ------
         CaptureStateError
             If called before :meth:`start`, or if the capture produced neither
             stats nor an exception (should not happen).
+        TimeoutError
+            If the capture thread does not finish within ``timeout`` seconds.
         Exception
             Any error raised by ``capture`` after the capture went live.
         """
@@ -365,7 +394,9 @@ class CaptureController:
             raise CaptureStateError("stop() called before start()")
 
         self._stop.set()
-        self._thread.join()
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            raise TimeoutError(f"capture did not stop within {timeout:.1f}s")
 
         if self._exc is not None:
             raise self._exc

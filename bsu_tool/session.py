@@ -6,12 +6,28 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
 
+from bsu_tool.descriptors import (
+    CONFIGURATION_DESCRIPTOR,
+    DEVICE_DESCRIPTOR,
+    GET_DESCRIPTOR_REQUEST,
+    SET_CONFIGURATION_REQUEST,
+    STRING_DESCRIPTOR,
+    ConfigurationDescriptor,
+    DeviceDescriptor,
+    parse_configuration,
+    parse_device_descriptor,
+    parse_setup_packet,
+    parse_string_descriptor,
+)
 from bsu_tool.mcp.interfaces import (
     CaptureInterface,
     CaptureMetadata,
     CapturePacket,
+    DeviceEnumeration,
     DeviceSummary,
     EndpointSummary,
+    EnumeratedEndpoint,
+    EnumeratedInterface,
     PacketRecord,
     PacketSelection,
 )
@@ -39,13 +55,11 @@ _IF_TSRESOL_OPTION: Final[int] = 9
 _DEFAULT_TIMESTAMP_RESOLUTION_SECONDS: Final[float] = 1 / 1_000_000
 _BINARY_RESOLUTION_FLAG: Final[int] = 0x80
 _RESOLUTION_VALUE_MASK: Final[int] = 0x7F
-_GET_DESCRIPTOR_REQUEST: Final[int] = 0x06
-_DEVICE_DESCRIPTOR_TYPE: Final[int] = 0x01
-_STRING_DESCRIPTOR_TYPE: Final[int] = 0x03
 _ENDPOINT_IN_FLAG: Final[int] = 0x80
 _ENDPOINT_NUMBER_MASK: Final[int] = 0x0F
 _TRANSFER_TYPE_ORDER: Final[tuple[TransferType, ...]] = ("control", "bulk", "interrupt")
 _DATA_PREVIEW_BYTES: Final[int] = 32
+_CONTROL_ENDPOINT: Final[int] = 0
 
 
 @dataclass(frozen=True)
@@ -93,12 +107,8 @@ class _DeviceAccumulator:
     packet_count: int = 0
     endpoint_packet_counts: dict[int, int] = field(default_factory=_empty_endpoint_packet_counts)
     transfer_types: set[TransferType] = field(default_factory=_empty_transfer_types)
-    vendor_id: str | None = None
-    product_id: str | None = None
-    manufacturer: str | None = None
-    product: str | None = None
-    manufacturer_index: int | None = None
-    product_index: int | None = None
+    device_descriptor: DeviceDescriptor | None = None
+    configuration: ConfigurationDescriptor | None = None
     string_descriptors: dict[int, str] = field(default_factory=_empty_string_descriptors)
 
 
@@ -267,6 +277,31 @@ class Session:
             return None
         return _packet_record(index, records[index])
 
+    def get_enumeration(self, device_id: str) -> DeviceEnumeration:
+        """Return the descriptors and enumeration-phase span for one device.
+
+        Decodes the device and configuration descriptors the device reported
+        during its initial enumeration, and identifies the enumeration/negotiation
+        phase: the standard control transfers on endpoint 0 that precede the
+        device's first runtime traffic. This lets an analyst learn what a device
+        is before interpreting its vendor protocol.
+
+        Args:
+            device_id: The ``dev_bbb_ddd`` id of the device, as reported by
+                :meth:`list_devices`.
+
+        Returns:
+            A :class:`DeviceEnumeration`. When the capture contains no packets for
+            ``device_id``, every descriptor field is ``None``/empty, the index
+            fields are ``None``, and ``is_complete`` is ``False``.
+
+        Raises:
+            RuntimeError: No capture has been loaded.
+        """
+        if self.capture is None:
+            raise RuntimeError("No capture loaded. Call load_capture() first.")
+        return _build_enumeration(self.capture.records, self.capture.transactions, device_id)
+
 
 def _validate_capture_path(path: Path) -> Path:
     source = path.expanduser().resolve()
@@ -429,10 +464,10 @@ def _record_matches(
     return True
 
 
-def _summarize_devices(
+def _accumulate_devices(
     records: tuple[UrbRecord, ...],
     transactions: tuple[UrbTransaction, ...],
-) -> tuple[DeviceSummary, ...]:
+) -> dict[tuple[int, int], _DeviceAccumulator]:
     devices: dict[tuple[int, int], _DeviceAccumulator] = {}
     for record in records:
         accumulator = _device_accumulator(devices, record.bus_num, record.dev_num)
@@ -443,7 +478,14 @@ def _summarize_devices(
 
     for transaction in transactions:
         _apply_descriptor_info(devices, transaction)
+    return devices
 
+
+def _summarize_devices(
+    records: tuple[UrbRecord, ...],
+    transactions: tuple[UrbTransaction, ...],
+) -> tuple[DeviceSummary, ...]:
+    devices = _accumulate_devices(records, transactions)
     return tuple(
         _device_summary(accumulator)
         for _, accumulator in sorted(devices.items(), key=lambda item: (item[0][0], item[0][1]))
@@ -479,68 +521,47 @@ def _apply_descriptor_info(
     completion = transaction.completion
     if submission is None or completion is None or submission.setup is None:
         return
+    setup = parse_setup_packet(submission.setup)
+    if setup is None or not setup.is_standard or setup.b_request != GET_DESCRIPTOR_REQUEST:
+        return
     accumulator = devices.get((submission.bus_num, submission.dev_num))
     if accumulator is None:
         return
 
-    descriptor_type = _requested_descriptor_type(submission.setup)
-    descriptor_index = submission.setup[2]
-    if descriptor_type == _DEVICE_DESCRIPTOR_TYPE:
-        _apply_device_descriptor(accumulator, completion.data)
-        return
-    if descriptor_type == _STRING_DESCRIPTOR_TYPE and descriptor_index > 0:
-        descriptor = _decode_string_descriptor(completion.data)
+    if setup.descriptor_type == DEVICE_DESCRIPTOR:
+        descriptor = parse_device_descriptor(completion.data)
         if descriptor is not None:
-            accumulator.string_descriptors[descriptor_index] = descriptor
+            accumulator.device_descriptor = descriptor
+    elif setup.descriptor_type == CONFIGURATION_DESCRIPTOR:
+        configuration = parse_configuration(completion.data)
+        if configuration is not None and _prefer_configuration(accumulator.configuration, configuration):
+            accumulator.configuration = configuration
+    elif setup.descriptor_type == STRING_DESCRIPTOR and setup.descriptor_index > 0:
+        text = parse_string_descriptor(completion.data)
+        if text is not None:
+            accumulator.string_descriptors[setup.descriptor_index] = text
 
 
-def _requested_descriptor_type(setup: bytes) -> int | None:
-    if len(setup) != 8 or setup[1] != _GET_DESCRIPTOR_REQUEST:
-        return None
-    return setup[3]
+def _prefer_configuration(existing: ConfigurationDescriptor | None, candidate: ConfigurationDescriptor) -> bool:
+    """Return whether ``candidate`` is a more complete configuration than ``existing``.
 
-
-def _apply_device_descriptor(accumulator: _DeviceAccumulator, data: bytes) -> None:
-    if len(data) < 18 or data[1] != _DEVICE_DESCRIPTOR_TYPE:
-        return
-    accumulator.vendor_id = _format_usb_id(data[8], data[9])
-    accumulator.product_id = _format_usb_id(data[10], data[11])
-    accumulator.manufacturer_index = _descriptor_string_index(data[14])
-    accumulator.product_index = _descriptor_string_index(data[15])
-
-
-def _format_usb_id(low: int, high: int) -> str:
-    return f"0x{((high << 8) | low):04x}"
-
-
-def _descriptor_string_index(value: int) -> int | None:
-    if value == 0:
-        return None
-    return value
-
-
-def _decode_string_descriptor(data: bytes) -> str | None:
-    if len(data) < 2 or data[1] != _STRING_DESCRIPTOR_TYPE:
-        return None
-    descriptor_length = min(data[0], len(data))
-    if descriptor_length <= 2:
-        return None
-    payload = data[2:descriptor_length]
-    if len(payload) % 2 != 0:
-        payload = payload[:-1]
-    try:
-        decoded = payload.decode("utf-16-le")
-    except UnicodeDecodeError:
-        return None
-    decoded = decoded.rstrip("\x00")
-    if decoded == "":
-        return None
-    return decoded
+    Enumeration reads the configuration twice — a 9-byte header-only read to
+    learn the total length, then the full blob. Keep whichever carries more
+    interface descriptors so the header-only read never overwrites the full one.
+    """
+    if existing is None:
+        return True
+    return len(candidate.interfaces) > len(existing.interfaces)
 
 
 def _device_summary(accumulator: _DeviceAccumulator) -> DeviceSummary:
-    manufacturer = _descriptor_string(accumulator, accumulator.manufacturer_index)
-    product = _descriptor_string(accumulator, accumulator.product_index)
+    device = accumulator.device_descriptor
+    config = accumulator.configuration
+    manufacturer = _descriptor_string(accumulator, device.manufacturer_index) if device else None
+    product = _descriptor_string(accumulator, device.product_index) if device else None
+    vendor_id = _format_usb_id(device.vendor_id) if device else None
+    product_id = _format_usb_id(device.product_id) if device else None
+    interface_class = config.interfaces[0].interface_class if config and config.interfaces else None
     return DeviceSummary(
         device_id=_device_id(accumulator.bus_num, accumulator.dev_num),
         bus_num=accumulator.bus_num,
@@ -551,11 +572,13 @@ def _device_summary(accumulator: _DeviceAccumulator) -> DeviceSummary:
             for addr, count in sorted(accumulator.endpoint_packet_counts.items())
         ),
         transfer_types_seen=_sorted_transfer_types(accumulator.transfer_types),
-        vendor_id=accumulator.vendor_id,
-        product_id=accumulator.product_id,
+        vendor_id=vendor_id,
+        product_id=product_id,
         manufacturer=manufacturer,
         product=product,
-        descriptor_summary=_descriptor_summary(accumulator, manufacturer, product),
+        descriptor_summary=_descriptor_summary(vendor_id, product_id, manufacturer, product),
+        device_class=device.device_class if device else None,
+        interface_class=interface_class,
     )
 
 
@@ -563,6 +586,10 @@ def _descriptor_string(accumulator: _DeviceAccumulator, index: int | None) -> st
     if index is None:
         return None
     return accumulator.string_descriptors.get(index)
+
+
+def _format_usb_id(value: int) -> str:
+    return f"0x{value:04x}"
 
 
 def _sorted_transfer_types(transfer_types: set[TransferType]) -> tuple[TransferType, ...]:
@@ -574,18 +601,150 @@ def _device_id(bus_num: int, dev_num: int) -> str:
 
 
 def _descriptor_summary(
-    accumulator: _DeviceAccumulator,
+    vendor_id: str | None,
+    product_id: str | None,
     manufacturer: str | None,
     product: str | None,
 ) -> str | None:
-    if accumulator.vendor_id is None and accumulator.product_id is None:
+    if vendor_id is None and product_id is None:
         return None
     label = "USB device"
     if manufacturer is not None and product is not None:
         label = f"{manufacturer} {product}"
     elif product is not None:
         label = product
-    return f"{label} ({accumulator.vendor_id}:{accumulator.product_id})"
+    return f"{label} ({vendor_id}:{product_id})"
+
+
+# ---------------------------------------------------------------------------
+# Enumeration-phase detection and descriptor retrieval
+# ---------------------------------------------------------------------------
+
+
+def _build_enumeration(
+    records: tuple[UrbRecord, ...],
+    transactions: tuple[UrbTransaction, ...],
+    device_id: str,
+) -> DeviceEnumeration:
+    accumulators = _accumulate_devices(records, transactions)
+    accumulator = next(
+        (acc for acc in accumulators.values() if _device_id(acc.bus_num, acc.dev_num) == device_id),
+        None,
+    )
+    device = accumulator.device_descriptor if accumulator else None
+    config = accumulator.configuration if accumulator else None
+    enum_indices, runtime_start, is_complete = _enumeration_indices(records, device_id)
+    return DeviceEnumeration(
+        device_id=device_id,
+        vendor_id=_format_usb_id(device.vendor_id) if device else None,
+        product_id=_format_usb_id(device.product_id) if device else None,
+        usb_version=device.usb_version if device else None,
+        device_class=device.device_class if device else None,
+        device_subclass=device.device_subclass if device else None,
+        device_protocol=device.device_protocol if device else None,
+        manufacturer=_descriptor_string(accumulator, device.manufacturer_index) if accumulator and device else None,
+        product=_descriptor_string(accumulator, device.product_index) if accumulator and device else None,
+        serial_number=(_descriptor_string(accumulator, device.serial_number_index) if accumulator and device else None),
+        configuration_value=config.configuration_value if config else None,
+        interfaces=_enumerated_interfaces(config, accumulator) if config and accumulator else (),
+        enumeration_packet_indices=tuple(enum_indices),
+        enumeration_start_index=min(enum_indices) if enum_indices else None,
+        enumeration_end_index=max(enum_indices) if enum_indices else None,
+        runtime_start_index=runtime_start,
+        is_complete=is_complete,
+    )
+
+
+def _enumerated_interfaces(
+    config: ConfigurationDescriptor,
+    accumulator: _DeviceAccumulator,
+) -> tuple[EnumeratedInterface, ...]:
+    return tuple(
+        EnumeratedInterface(
+            number=interface.number,
+            alternate_setting=interface.alternate_setting,
+            interface_class=interface.interface_class,
+            interface_subclass=interface.interface_subclass,
+            interface_protocol=interface.interface_protocol,
+            description=_descriptor_string(accumulator, interface.interface_index),
+            endpoints=tuple(
+                EnumeratedEndpoint(
+                    address=f"0x{endpoint.address:02x}",
+                    number=endpoint.number,
+                    direction=endpoint.direction,
+                    transfer_type=endpoint.transfer_type,
+                    max_packet_size=endpoint.max_packet_size,
+                    interval=endpoint.interval,
+                )
+                for endpoint in interface.endpoints
+            ),
+        )
+        for interface in config.interfaces
+    )
+
+
+def _enumeration_indices(
+    records: tuple[UrbRecord, ...],
+    device_id: str,
+) -> tuple[list[int], int | None, bool]:
+    """Classify a device's records into its enumeration phase.
+
+    Returns the record indices belonging to the enumeration phase, the index at
+    which the device's runtime traffic begins (``None`` if it never does), and
+    whether a ``SET_CONFIGURATION`` was seen during enumeration.
+    """
+    enum_flags = _classify_enumeration_records(records)
+    runtime_start = next(
+        (
+            index
+            for index, record in enumerate(records)
+            if _device_id(record.bus_num, record.dev_num) == device_id and not enum_flags[index]
+        ),
+        None,
+    )
+
+    enum_indices: list[int] = []
+    is_complete = False
+    for index, record in enumerate(records):
+        if runtime_start is not None and index >= runtime_start:
+            break
+        if _device_id(record.bus_num, record.dev_num) != device_id or not enum_flags[index]:
+            continue
+        enum_indices.append(index)
+        if _is_set_configuration(record):
+            is_complete = True
+    return enum_indices, runtime_start, is_complete
+
+
+def _classify_enumeration_records(records: tuple[UrbRecord, ...]) -> list[bool]:
+    """Flag each record as belonging to enumeration (standard ep0 control) or runtime.
+
+    A record is enumeration when it is a standard control transfer on endpoint 0.
+    Completions carry no setup packet, so each is matched to its own in-flight
+    submission — ``urb_id`` alone is unreliable because the kernel reuses ids
+    across the capture. Unmatched (orphan) control completions default to
+    enumeration rather than being mistaken for runtime traffic.
+    """
+    flags = [False] * len(records)
+    open_standard: dict[int, bool] = {}
+    for index, record in enumerate(records):
+        if record.transfer_type != "control" or record.endpoint != _CONTROL_ENDPOINT:
+            continue  # any transfer off endpoint 0 is runtime traffic
+        if record.event_type == "submission" and record.setup is not None:
+            setup = parse_setup_packet(record.setup)
+            standard = setup is not None and setup.is_standard
+            open_standard[record.urb_id] = standard
+        else:
+            standard = open_standard.pop(record.urb_id, True)
+        flags[index] = standard
+    return flags
+
+
+def _is_set_configuration(record: UrbRecord) -> bool:
+    if record.event_type != "submission" or record.setup is None:
+        return False
+    setup = parse_setup_packet(record.setup)
+    return setup is not None and setup.is_standard and setup.b_request == SET_CONFIGURATION_REQUEST
 
 
 # ---------------------------------------------------------------------------

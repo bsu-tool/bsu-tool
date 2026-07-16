@@ -83,17 +83,21 @@ Normalization is the boundary between decoded USB evidence and protocol inferenc
 should preserve enough packet-level detail for human validation while removing noise that
 would prevent repeated behavior from matching.
 
-The preprocessing layer has four goals:
-1. **Filter analysis scope:** keep successful Bulk and Interrupt records; exclude Control
-   setup traffic and failed URBs from pattern detection while still reporting exclusions in
-   `analysis_notes`.
-2. **Create directional analysis events:** split paired `UrbTransaction` objects into the
+The preprocessing layer has five goals:
+1. **Filter promotion scope:** keep Bulk and Interrupt records as candidate runtime
+   traffic; exclude Control setup traffic from default pattern promotion while still
+   reporting exclusions in `analysis_notes`.
+2. **Preserve URB status:** failed URBs remain visible during pairing and timing analysis
+   so retries, failed OUTs, and failed INs do not turn into false `UnansweredCommand` or
+   `UnsolicitedResponse` results. Failed URBs are excluded only when promoting successful
+   repeated patterns.
+3. **Create directional analysis events:** split paired `UrbTransaction` objects into the
    individual IN/OUT records that carry payload data, so multi-step sequences can be
    compared one token at a time.
-3. **Group comparable events:** group by device, endpoint number, direction, transfer type,
+4. **Group comparable events:** group by device, endpoint number, direction, transfer type,
    and payload length. Endpoint number and direction stay separate because decoded
    `UrbRecord` already stores them separately.
-4. **Classify payload bytes:** within each group, identify fixed bytes that define command
+5. **Classify payload bytes:** within each group, identify fixed bytes that define command
    identity and variable bytes that likely represent arguments, counters, checksums, or
    response data.
 
@@ -147,9 +151,13 @@ Example: if three packets of length 4 have bytes `[0x01, 0x00, 0x05, 0xA1]`,
 `(0x01, 0x00, None, None)` — bytes 0 and 1 are fixed, bytes 2 and 3 vary.
 
 **Step 4 — Minimum sample threshold.**
-Variable/fixed classification requires a minimum of **3 packets** with the same
-endpoint+direction+length. With fewer samples, all bytes are treated as fixed (no
-variable detection). This threshold is a named constant and can be tuned.
+Variable/fixed classification supports a provisional two-sample mode. With **2 packets**
+in the same endpoint+direction+length group, byte positions that differ are treated as
+variable and byte positions that match are treated as fixed. With **3 or more packets**,
+the same rule becomes more reliable because there are enough samples to distinguish
+stable identity bytes from counters, checksums, or arguments with less risk of overfitting.
+This prevents commands seen exactly twice from disappearing simply because one byte varies.
+The threshold is a named constant and can be tuned.
 
 ### 2.4 When Normalization Runs
 
@@ -157,6 +165,19 @@ Normalization is a two-pass process:
 1. **First pass:** collect all packets per (endpoint, direction, length) group, compute
    variable byte positions
 2. **Second pass:** assign each analysis event its token using the variable map from pass 1
+
+### 2.5 Determinism Guarantee
+
+A token's `payload_signature` is computed only from packets sharing its
+`(device_id, endpoint_number, direction, transfer_type, len(data))` group, processed in
+ascending capture order. The variable-byte map is therefore a pure function of that group.
+Two runs over the same capture always produce identical signatures.
+
+Two captures of the same device produce identical signatures for a command when that
+command's group has the same fixed and variable byte positions in both captures. Truncating
+a capture only changes a signature when the truncation removes packets from that command's
+own group. Packets on other endpoints, other devices, or other payload lengths do not
+affect the signature.
 
 ---
 
@@ -171,18 +192,26 @@ ordered tokens found by the algorithm; "pattern" describes that sequence plus me
 such as occurrence count, marker correlation, and response-time statistics.
 
 Sequence detection uses n-gram frequency analysis: a sliding window extracts all
-sub-sequences of each length and counts occurrences across the token stream.
+sub-sequences of each length and counts occurrences across scoped token streams.
+
+The default scope is an **endpoint lane**: one device, one endpoint number, and one
+transfer type, with IN and OUT events for that endpoint number kept in the same
+timestamp-ordered stream. This keeps background traffic on unrelated endpoints from
+contaminating command traffic while still allowing common OUT/IN exchanges such as
+`0x01` OUT followed by `0x81` IN to appear in one sequence.
 
 **Algorithm:**
 
-1. Flatten all analysis events for a device into an ordered list of tokens (by timestamp).
-2. Use a sliding window of width `w` (minimum 1, maximum configurable, default 8) to
+1. Partition analysis events into endpoint lanes by `(device_id, endpoint_number,
+   transfer_type)`.
+2. Sort each lane by timestamp.
+3. Use a sliding window of width `w` (minimum 1, maximum configurable, default 8) to
    extract all sub-sequences of each length.
-3. Hash each sub-sequence and count occurrences.
-4. A sequence that occurs **≥ 2 times** is a repeated candidate pattern.
-5. Prefer longer patterns over their sub-sequences: if pattern `[A, B, C]` covers
+4. Hash each sub-sequence and count occurrences within that lane.
+5. A sequence that occurs **≥ 2 times** is a repeated candidate pattern.
+6. Prefer longer patterns over their sub-sequences: if pattern `[A, B, C]` covers
    every occurrence of `[A, B]`, discard `[A, B]` as a redundant sub-pattern.
-6. Sort candidates by occurrence count descending.
+7. Sort candidates by occurrence count descending.
 
 Subsumed shorter patterns are dropped only when their occurrence count exactly matches
 the longer parent pattern. If `[A, B]` occurs more often than `[A, B, C]`, keep both
@@ -197,16 +226,20 @@ discarded silently either.
 Single-occurrence sequences are reported as `AnalysisObservation` objects when they meet
 one of these criteria:
 - The sequence occurs within the marker correlation window of an analyst marker.
-- The sequence appears near the beginning of runtime traffic after enumeration.
 - The sequence is a long multi-step exchange that does not repeat but includes both OUT
   and IN traffic on the same device.
 
 This keeps the main `command_patterns` list focused on repeated evidence while preserving
 important one-time behavior for analyst review.
 
-**Complexity note:** With N analysis events and window size W, this is O(N × W). For
-typical captures (hundreds to low thousands of packets), this is fast enough for
-synchronous execution. No async or streaming required.
+The engine does not infer an "end of enumeration" boundary by default because Control
+transfers are excluded from the default runtime analysis path. If the team later wants a
+boundary-based observation rule, the loader or analyzer must first expose an explicit
+enumeration-end timestamp.
+
+**Complexity note:** With N analysis events and window size W across all endpoint lanes,
+this is O(N × W). For typical captures (hundreds to low thousands of packets), this is
+fast enough for synchronous execution. No async or streaming required.
 
 ### 3.3 Marker Correlation
 
@@ -235,15 +268,25 @@ A **command/response pair** links an OUT transaction (host→device) to the IN t
 best-effort label for common Bulk/Interrupt runtime traffic; the full pattern detector
 still preserves multi-step and cross-endpoint sequences through `CommandPattern.steps`.
 
+The engine must start from the existing `UrbTransaction` objects created by
+`pair_urbs()`. It must not rebuild submit/complete pairs with a FIFO queue because USB
+allows multiple outstanding URBs and completions are not guaranteed to arrive in submit
+order. `UrbTransaction` already preserves the actual submit/complete relationship by
+URB id, including orphan submissions and orphan completions.
+
 **Algorithm:**
 
-For each device and endpoint number, process transactions in timestamp order:
-1. When an OUT transaction is seen, push it onto a pending command queue.
-2. When an IN transaction is seen, pop the oldest pending OUT from the queue and pair them.
-3. If no pending OUT exists when an IN arrives, the IN is an **unsolicited response**
-   (recorded as such, not discarded).
-4. If a pending OUT has no IN follow-up within a configurable timeout window (default
-   **5.0 seconds** of capture time, not wall time), it is an **unanswered command**.
+For each endpoint lane, process available `UrbTransaction` objects in timestamp order:
+1. Convert each transaction into an analysis event using the record that carries payload
+   data and status information.
+2. Keep failed transactions visible to this pass so retries and failed responses affect
+   timing and notes, even if they are not promoted into successful command patterns.
+3. When an OUT event is followed by an IN event on the same endpoint lane within the
+   configurable timeout window, record it as a likely command/response pair.
+4. If an IN event has no preceding successful OUT candidate in the timeout window, record
+   it as an **unsolicited response** unless it is explained by a failed transaction.
+5. If an OUT event has no following successful IN candidate in the timeout window, record
+   it as an **unanswered command** unless it is explained by a failed transaction.
 
 **Endpoint scope:** pairing is scoped by device and endpoint number. An OUT on endpoint
 `0x01` may pair with an IN on endpoint `0x81` because both refer to endpoint number 1
@@ -251,8 +294,8 @@ with opposite directions. Pairing by full endpoint address would miss this commo
 command/response shape.
 
 If a device sends commands and responses on different endpoint numbers, those events are
-not forced into a simple command/response pair. They remain visible as adjacent
-`PatternStep` entries in a detected `CommandPattern`.
+not forced into a simple command/response pair. They remain visible as separate endpoint
+lane patterns or as `AnalysisObservation` entries for analyst review.
 
 ### 4.2 Control Transfer Exclusion
 
@@ -278,10 +321,31 @@ class ProtocolHypothesis:
     unsolicited_responses: tuple[UnsolicitedResponse, ...]
     unanswered_commands: tuple[UnansweredCommand, ...]
     marker_correlations: tuple[MarkerCorrelation, ...]
+    result_limits: ResultLimits
     analysis_notes: tuple[str, ...]         # free-text warnings from the engine
 ```
 
-### 5.2 `CommandPattern`
+### 5.2 `ResultLimits`
+
+```python
+@dataclass(frozen=True)
+class ResultLimits:
+    max_command_patterns: int
+    max_observations: int
+    max_variable_values_reported: int
+    command_patterns_truncated: bool
+    observations_truncated: bool
+    truncation_note: str | None
+```
+
+The analyzer must rank results before truncation so MCP output stays token-frugal.
+Command patterns are sorted by marker correlation, occurrence count, sequence length, and
+then first occurrence timestamp. Observations are sorted by marker proximity, sequence
+length, and first occurrence timestamp. If truncation occurs, the returned JSON must set
+the relevant `*_truncated` flag and include a short `truncation_note` in both
+`result_limits` and `analysis_notes`.
+
+### 5.3 `CommandPattern`
 
 ```python
 @dataclass(frozen=True)
@@ -291,11 +355,10 @@ class CommandPattern:
     steps: tuple[PatternStep, ...]          # ordered, length 1..MAX_SEQUENCE_WINDOW
     response_timing: ResponseTimingStats | None
     parent_pattern_id: str | None           # set only when retained as an optional sub-pattern
-    nearest_marker: str | None              # marker name if correlated
-    marker_correlation_percent: float | None
+    marker_correlation_id: str | None       # references MarkerCorrelation.correlation_id
 ```
 
-### 5.3 `PatternStep`
+### 5.4 `PatternStep`
 
 ```python
 @dataclass(frozen=True)
@@ -309,7 +372,7 @@ class PatternStep:
     variable_byte_ranges: tuple[VariableByteRange, ...]
 ```
 
-### 5.4 `ResponseTimingStats`
+### 5.5 `ResponseTimingStats`
 
 ```python
 @dataclass(frozen=True)
@@ -323,13 +386,13 @@ class ResponseTimingStats:
 These timing values are only meaningful for patterns whose steps include an OUT event
 followed by an IN event that the pairing algorithm identifies as a likely response.
 
-### 5.5 `AnalysisObservation`
+### 5.6 `AnalysisObservation`
 
 ```python
 @dataclass(frozen=True)
 class AnalysisObservation:
     observation_id: str                     # e.g. "observation_01"
-    reason: str                             # e.g. "near_marker" or "startup_exchange"
+    reason: str                             # e.g. "near_marker" or "single_exchange"
     steps: tuple[PatternStep, ...]
     nearest_marker: str | None
 ```
@@ -337,7 +400,7 @@ class AnalysisObservation:
 Observations preserve meaningful single-occurrence behavior without weakening the
 definition of repeated command patterns.
 
-### 5.6 `VariableByteRange`
+### 5.7 `VariableByteRange`
 
 ```python
 @dataclass(frozen=True)
@@ -348,7 +411,7 @@ class VariableByteRange:
     observed_values: tuple[int, ...]        # all distinct values seen (capped at 32)
 ```
 
-### 5.7 `UnsolicitedResponse`
+### 5.8 `UnsolicitedResponse`
 
 ```python
 @dataclass(frozen=True)
@@ -360,7 +423,7 @@ class UnsolicitedResponse:
     payload_signature: tuple[int | None, ...]
 ```
 
-### 5.8 `UnansweredCommand`
+### 5.9 `UnansweredCommand`
 
 ```python
 @dataclass(frozen=True)
@@ -372,18 +435,23 @@ class UnansweredCommand:
     payload_signature: tuple[int | None, ...]
 ```
 
-### 5.9 `MarkerCorrelation`
+### 5.10 `MarkerCorrelation`
 
 ```python
 @dataclass(frozen=True)
 class MarkerCorrelation:
+    correlation_id: str                     # e.g. "marker_corr_01"
     marker_name: str
     pattern_ids: tuple[str, ...]            # which CommandPatterns appear near this marker
     correlation_percent: float
     mean_time_delta_ms: float               # average offset between marker and first pattern packet
 ```
 
-### 5.10 MCP Tool Output
+`MarkerCorrelation` is the authoritative source for marker-correlation details. A
+`CommandPattern` references it by `marker_correlation_id` so marker names and percentages
+cannot disagree across two output locations.
+
+### 5.11 MCP Tool Output
 
 The engine result is returned from a new MCP tool `analyze_protocol`. The tool accepts an
 optional `device_id` filter. If `device_id` is omitted, it returns one
@@ -402,19 +470,21 @@ JSON and uses it to draft a human-readable protocol description.
 | Case | Handling |
 |------|----------|
 | No markers in capture | Proceed without correlation; `marker_correlations` is empty; emit analysis note |
-| Sequence seen only once | Not reported as a `CommandPattern`; may be reported as `AnalysisObservation` if marker-adjacent, startup-related, or a long OUT/IN exchange |
-| Fewer than 3 packets for normalization | All bytes treated as fixed; no variable byte detection |
+| Sequence seen only once | Not reported as a `CommandPattern`; may be reported as `AnalysisObservation` if marker-adjacent or a long OUT/IN exchange |
+| Two packets for normalization | Differing byte positions are provisionally treated as variable so twice-seen commands can still match |
+| One packet for normalization | All bytes treated as fixed; no variable byte detection |
 | Sub-pattern has same count as parent | Drop shorter sub-pattern as redundant |
 | Sub-pattern occurs more than parent | Keep both; shorter pattern may represent optional protocol steps |
 | OUT with no IN response | Recorded as `UnansweredCommand`; not treated as error |
 | IN with no preceding OUT | Recorded as `UnsolicitedResponse`; device may be pushing status |
 | OUT and IN use same endpoint number with opposite directions | Pair as likely command/response, e.g. `0x01` OUT and `0x81` IN |
-| OUT and IN use different endpoint numbers | Preserve as multi-step pattern; do not force into simple pair |
+| OUT and IN use different endpoint numbers | Preserve as separate endpoint-lane patterns or `AnalysisObservation`; do not force into simple pair |
+| Background endpoint traffic interleaves with command traffic | Analyze per endpoint lane by default so unrelated polling does not contaminate n-gram windows |
 | Overlapping marker windows | Occurrence assigned to the single nearest marker by timestamp |
 | Multiple devices in capture | Engine runs independently per device; results are separate `ProtocolHypothesis` objects |
 | All-zero payload | Treated as a valid payload; not filtered out |
 | Empty capture (no bulk/interrupt packets) | Return empty `ProtocolHypothesis` with analysis note explaining why |
-| Status != 0 (failed URB) | Failed URBs are excluded from pattern detection; counted and reported in `analysis_notes` |
+| Status != 0 (failed URB) | Failed URBs remain visible to pairing/timing and retry notes, but are not promoted into successful repeated patterns |
 | Capture with only control transfers | All packets excluded from engine scope; empty result with note |
 
 ---
@@ -425,13 +495,15 @@ All tunable values are named constants in the engine module (not magic numbers):
 
 | Constant | Default | Meaning |
 |----------|---------|---------|
-| `MIN_NORMALIZATION_SAMPLE_COUNT` | 3 | Minimum packets needed to detect variable bytes |
+| `MIN_NORMALIZATION_SAMPLE_COUNT` | 2 | Minimum packets needed for provisional variable-byte detection |
 | `MAX_SEQUENCE_WINDOW` | 8 | Maximum token sequence length to search for; configurable per analysis run |
 | `MIN_OCCURRENCE_COUNT` | 2 | Minimum occurrences for a pattern to be reported |
 | `MARKER_CORRELATION_WINDOW_SECONDS` | 2.0 | Max time delta to associate a packet with a marker; configurable per analysis run |
 | `MARKER_CORRELATION_THRESHOLD_PERCENT` | 70.0 | Default percentage needed to call out a marker association; raw percentage is always reported |
 | `COMMAND_RESPONSE_TIMEOUT_SECONDS` | 5.0 | Max capture-time gap to pair OUT→IN |
 | `MAX_VARIABLE_VALUES_REPORTED` | 32 | Cap on distinct values stored per variable byte |
+| `MAX_COMMAND_PATTERNS_RETURNED` | 20 | Cap on ranked command patterns returned in one MCP response |
+| `MAX_OBSERVATIONS_RETURNED` | 10 | Cap on ranked single-occurrence observations returned in one MCP response |
 
 ---
 
@@ -450,6 +522,17 @@ The MCP tool wrapper goes in `bsu_tool/mcp/tools/analysis.py` and is registered 
 Tests go in:
 - `tests/unit/test_analyzer.py` — unit tests for each algorithm step
 - `tests/int/test_mcp_analyze_goodix.py` — integration test against the Goodix capture
+
+The Goodix integration test should assert the stable output shape rather than an exact
+human narrative. Expected assertions:
+- `analyze_protocol` returns machine-readable JSON with one `ProtocolHypothesis` for the
+  requested Goodix device.
+- `result_limits` is present and reports the configured caps.
+- `command_patterns`, `observations`, `marker_correlations`, `analysis_notes`,
+  `unsolicited_responses`, and `unanswered_commands` are present even when empty.
+- every returned `CommandPattern` has at least one `PatternStep`, no more than
+  `MAX_SEQUENCE_WINDOW` steps, and JSON-safe payload signatures.
+- if result caps are exceeded, truncation flags and a truncation note are present.
 
 ---
 
@@ -471,9 +554,9 @@ Tests go in:
 
 ## Open Questions for Team Review
 
-1. **Single-occurrence observations** — are the three proposed criteria for preserving
-   one-time handshakes enough, or should the team define additional rules for startup
-   traffic before implementation?
+1. **Single-occurrence observations** — are the two proposed criteria for preserving
+   one-time handshakes enough, or should the team define additional computable rules
+   before implementation?
 
 2. **Control-transfer runtime commands** — should default analysis continue to exclude
    all Control transfers, or should the engine include an optional mode for devices that

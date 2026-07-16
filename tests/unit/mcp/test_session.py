@@ -345,6 +345,12 @@ def test_list_devices_summarizes_multiple_devices(tmp_path: Path) -> None:
     assert device_summaries[1].manufacturer == "Goodix"
     assert device_summaries[1].product == "Fingerprint Reader"
     assert device_summaries[1].descriptor_summary == "Goodix Fingerprint Reader (0x27c6:0x533c)"
+    assert device_summaries[1].device_class == 0xFF
+    assert device_summaries[1].interface_class is None
+
+    serialized_devices = cast(list[JsonDict], capture.to_dict()["devices"])
+    assert serialized_devices[1]["device_class"] == 0xFF
+    assert serialized_devices[1]["interface_class"] is None
 
 
 def _multi_device_packets() -> tuple[bytes, ...]:
@@ -872,6 +878,8 @@ def test_session_round_trips_json_safe_dict(tmp_path: Path) -> None:
     assert len(devices) == 2
     assert len(packets) == 5
     assert len(markers) == 2
+    assert "device_class" in devices[0]
+    assert "interface_class" in devices[0]
     assert capture_data["summary"] == session.summary().to_dict()
 
     packet = packets[0]

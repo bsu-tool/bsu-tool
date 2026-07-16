@@ -759,6 +759,8 @@ def _device_summary_to_dict(device: DeviceSummary) -> JsonDict:
         "manufacturer": device.manufacturer,
         "product": device.product,
         "descriptor_summary": device.descriptor_summary,
+        "device_class": device.device_class,
+        "interface_class": device.interface_class,
     }
 
 

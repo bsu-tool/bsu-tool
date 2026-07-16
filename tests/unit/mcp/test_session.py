@@ -1,13 +1,15 @@
 """Tests for the MCP session container."""
 
+import json
 import struct
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from bsu_tool.mcp.interfaces import EndpointSummary
 from bsu_tool.pcapng_reader import PcapNgError
-from bsu_tool.session import CaptureSummary, Marker, Session
+from bsu_tool.session import CaptureSummary, JsonDict, Marker, Session
 
 _USBMON_HEADER_FORMAT = "<QBBBBHBBqiiII8s"
 _SUBMISSION = 0x53
@@ -845,3 +847,34 @@ def test_validate_reports_multiple_faults_in_order(tmp_path: Path) -> None:
         "capture contains no decoded USB packets",
         "marker 'stale' references packet index 0 outside the decoded range 0..-1",
     ]
+
+
+def test_session_round_trips_json_safe_dict(tmp_path: Path) -> None:
+    """Session serialization preserves devices, packets, markers, and summary counts."""
+    session = _span_session(tmp_path)
+    session.add_marker(name="start", packet_index=0, note="before action")
+    session.add_marker(name="end", packet_index=4, note="after action")
+
+    data = session.to_dict()
+    loaded = cast(JsonDict, json.loads(json.dumps(data)))
+    rebuilt = Session.from_dict(loaded)
+
+    assert rebuilt.to_dict() == data
+    assert rebuilt.summary() == session.summary()
+    assert rebuilt.list_devices() == session.list_devices()
+    assert rebuilt.list_markers() == session.list_markers()
+    assert rebuilt.get_packets().matches == session.get_packets().matches
+
+    capture_data = cast(JsonDict, data["capture"])
+    devices = cast(list[JsonDict], capture_data["devices"])
+    packets = cast(list[JsonDict], capture_data["packets"])
+    markers = cast(list[JsonDict], capture_data["markers"])
+    assert len(devices) == 2
+    assert len(packets) == 5
+    assert len(markers) == 2
+    assert capture_data["summary"] == session.summary().to_dict()
+
+    packet = packets[0]
+    assert packet["data_hex"] == "61"
+    assert packet["data_preview"] == "61"
+    assert packet["setup_hex"] is None

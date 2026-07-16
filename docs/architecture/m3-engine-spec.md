@@ -226,16 +226,10 @@ discarded silently either.
 Single-occurrence sequences are reported as `AnalysisObservation` objects when they meet
 one of these criteria:
 - The sequence occurs within the marker correlation window of an analyst marker.
-- The sequence is a long multi-step exchange that does not repeat but includes both OUT
-  and IN traffic on the same device.
+- The sequence is a multi-step exchange that does not repeat but contains at least `MIN_OBSERVATION_STEPS` steps with both OUT and IN traffic on the same device.
 
 This keeps the main `command_patterns` list focused on repeated evidence while preserving
 important one-time behavior for analyst review.
-
-The engine does not infer an "end of enumeration" boundary by default because Control
-transfers are excluded from the default runtime analysis path. If the team later wants a
-boundary-based observation rule, the loader or analyzer must first expose an explicit
-enumeration-end timestamp.
 
 **Complexity note:** With N analysis events and window size W across all endpoint lanes,
 this is O(N × W). For typical captures (hundreds to low thousands of packets), this is
@@ -277,16 +271,17 @@ URB id, including orphan submissions and orphan completions.
 **Algorithm:**
 
 For each endpoint lane, process available `UrbTransaction` objects in timestamp order:
-1. Convert each transaction into an analysis event using the record that carries payload
-   data and status information.
+1. Convert each transaction into an analysis event using the submission record for direction
+   and the completion record for status and payload data.
 2. Keep failed transactions visible to this pass so retries and failed responses affect
    timing and notes, even if they are not promoted into successful command patterns.
-3. When an OUT event is followed by an IN event on the same endpoint lane within the
-   configurable timeout window, record it as a likely command/response pair.
-4. If an IN event has no preceding successful OUT candidate in the timeout window, record
-   it as an **unsolicited response** unless it is explained by a failed transaction.
-5. If an OUT event has no following successful IN candidate in the timeout window, record
-   it as an **unanswered command** unless it is explained by a failed transaction.
+3. When a transaction's submission is an OUT event and its completion is an IN event on
+   the same endpoint lane, record it as a likely command/response pair.
+4. If a transaction has an orphan completion with no matching submission, record it as an
+   **unsolicited response** unless it is explained by a failed transaction.
+5. If a transaction has an orphan submission with no matching completion within the
+   configurable timeout window, record it as an **unanswered command** unless it is
+   explained by a failed transaction.
 
 **Endpoint scope:** pairing is scoped by device and endpoint number. An OUT on endpoint
 `0x01` may pair with an IN on endpoint `0x81` because both refer to endpoint number 1
@@ -392,7 +387,7 @@ followed by an IN event that the pairing algorithm identifies as a likely respon
 @dataclass(frozen=True)
 class AnalysisObservation:
     observation_id: str                     # e.g. "observation_01"
-    reason: str                             # e.g. "near_marker" or "single_exchange"
+    reason: Literal["near_marker", "multi_step_exchange"]
     steps: tuple[PatternStep, ...]
     nearest_marker: str | None
 ```
@@ -504,6 +499,7 @@ All tunable values are named constants in the engine module (not magic numbers):
 | `MAX_VARIABLE_VALUES_REPORTED` | 32 | Cap on distinct values stored per variable byte |
 | `MAX_COMMAND_PATTERNS_RETURNED` | 20 | Cap on ranked command patterns returned in one MCP response |
 | `MAX_OBSERVATIONS_RETURNED` | 10 | Cap on ranked single-occurrence observations returned in one MCP response |
+| `MIN_OBSERVATION_STEPS` | 2 | Minimum number of steps containing both IN and OUT traffic a single-occurrence exchange must have to qualify as an `AnalysisObservation` via the multi-step criteria |
 
 ---
 
@@ -551,6 +547,11 @@ human narrative. Expected assertions:
 
 4. **Multi-device handling** — `analyze_protocol` returns all devices by default and
    accepts an optional `device_id` filter, matching the shape of `get_packets`.
+
+5. **Single-occurrence observation criteria** — proceed with the two proposed criteria
+   (marker-adjacent and multi-step exchange with `MIN_OBSERVATION_STEPS`) as sufficient
+   for initial implementation. Additional computable rules should be defined only after
+   validation against reference captures confirms meaningful observations are being dropped.
 
 ## Open Questions for Team Review
 

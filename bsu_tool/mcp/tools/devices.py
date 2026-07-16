@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 
 from mcp.server.fastmcp import FastMCP
 
-from bsu_tool.mcp.interfaces import DeviceSummary
+from bsu_tool.mcp.interfaces import DeviceEnumeration, DeviceSummary
 from bsu_tool.mcp.tools.pagination import DEFAULT_LIMIT, validate_pagination
 from bsu_tool.session import Session
 
@@ -46,3 +46,17 @@ def register(mcp: FastMCP, session: Session) -> None:
             returned_count=len(page),
             has_more=offset + len(page) < len(devices),
         )
+
+    @mcp.tool()
+    def get_enumeration(device_id: str) -> DeviceEnumeration:  # pyright: ignore[reportUnusedFunction]
+        """Return a device's USB descriptors and enumeration-phase span.
+
+        Decodes the device and configuration descriptors (vendor/product id,
+        class, interfaces, endpoints) exchanged during the device's initial
+        enumeration, and reports the packet-index range of the enumeration
+        phase — the standard endpoint-0 control transfers that precede the
+        device's runtime traffic. Use this to learn what a device is before
+        interpreting its vendor protocol. ``device_id`` is a ``dev_bbb_ddd``
+        id from list_devices.
+        """
+        return session.get_enumeration(device_id)

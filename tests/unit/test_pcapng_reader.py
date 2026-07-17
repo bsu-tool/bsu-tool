@@ -467,6 +467,7 @@ def test_rejects_pcap_format() -> None:
         ):
             list(PcapNgReader(f))
 
+
 # --- Tests: real capture file (goodix_enroll_sanitized.pcapng) ------------
 
 # LINKTYPE_USB_LINUX_MMAPPED as seen in usbmon captures from modern kernels.

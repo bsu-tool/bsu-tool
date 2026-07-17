@@ -50,19 +50,36 @@ class UsbEnumerationError(RuntimeError):
 class LiveUsbDevice:
     """A USB device currently attached to the host.
 
-    The ``bus`` and ``device`` fields mirror what ``lsusb`` prints ("Bus 003
-    Device 007"); ``vendor_id`` and ``product_id`` are ``0x``-prefixed 4-digit
-    hex strings matching the capture-side :class:`~bsu_tool.mcp.interfaces.DeviceSummary`
-    convention. ``usbmon_path`` is the ``/dev/usbmonN`` character device that
-    captures this device's bus.
+    The ``bus_num`` and ``dev_num`` fields mirror what ``lsusb`` prints ("Bus 003
+    Device 007") and match the capture-side
+    :class:`~bsu_tool.mcp.interfaces.DeviceSummary` field names. ``device_id`` is
+    the same stable ``dev_bbb_ddd`` identifier the capture side builds (e.g.
+    ``dev_001_004`` for bus 1 device 4), so a live-enumerated device can be
+    correlated to one seen in a capture. ``vendor_id`` and ``product_id`` are
+    ``0x``-prefixed 4-digit hex strings matching the capture-side convention.
+    ``usbmon_path`` is the ``/dev/usbmonN`` character device that captures this
+    device's bus.
     """
 
-    bus: int
-    device: int
+    device_id: str
+    bus_num: int
+    dev_num: int
     vendor_id: str
     product_id: str
     description: str | None
     usbmon_path: str
+
+
+def device_id_for(bus_num: int, dev_num: int) -> str:
+    """Return the stable ``dev_bbb_ddd`` id for a bus/device address.
+
+    Mirrors the capture-side identifier built in :mod:`bsu_tool.session` (e.g.
+    ``dev_001_004`` for bus 1 device 4) so a live-enumerated device can be
+    matched to one observed in a capture. Each field is zero-padded to three
+    digits; addresses wider than three digits are not truncated and simply widen
+    the field, matching the capture side exactly.
+    """
+    return f"dev_{bus_num:03d}_{dev_num:03d}"
 
 
 def usbmon_path_for_bus(bus: int) -> str:
@@ -82,7 +99,7 @@ def enumerate_usb_devices(sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> tuple[LiveUs
     ``idProduct`` and optional ``manufacturer``/``product`` files. Interface
     directories (names containing ``":"``, e.g. ``1-1:1.0``) and any directory
     missing the required numeric files are skipped. The result is sorted by
-    ``(bus, device)`` for stable output.
+    ``(bus_num, dev_num)`` for stable output.
 
     Args:
         sysfs_root: Root directory of the sysfs USB device tree. Defaults to the
@@ -90,8 +107,8 @@ def enumerate_usb_devices(sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> tuple[LiveUs
             run on any platform without real hardware.
 
     Returns:
-        A tuple of :class:`LiveUsbDevice`, one per attached device, sorted by bus
-        then device address. Each row carries its derived ``usbmon_path``.
+        A tuple of :class:`LiveUsbDevice`, one per attached device, sorted by
+        ``bus_num`` then ``dev_num``. Each row carries its derived ``usbmon_path``.
 
     Raises:
         UsbEnumerationError: ``sysfs_root`` does not exist — typically a non-Linux
@@ -110,25 +127,26 @@ def enumerate_usb_devices(sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> tuple[LiveUs
         if device is not None:
             devices.append(device)
 
-    devices.sort(key=lambda device: (device.bus, device.device))
+    devices.sort(key=lambda device: (device.bus_num, device.dev_num))
     return tuple(devices)
 
 
 def _read_device(entry: Path) -> LiveUsbDevice | None:
     """Build a LiveUsbDevice from a sysfs device dir, or None if unparseable."""
-    bus = _read_int(entry / "busnum")
-    device = _read_int(entry / "devnum")
+    bus_num = _read_int(entry / "busnum")
+    dev_num = _read_int(entry / "devnum")
     vendor_id = _read_usb_id(entry / "idVendor")
     product_id = _read_usb_id(entry / "idProduct")
-    if bus is None or device is None or vendor_id is None or product_id is None:
+    if bus_num is None or dev_num is None or vendor_id is None or product_id is None:
         return None
     return LiveUsbDevice(
-        bus=bus,
-        device=device,
+        device_id=device_id_for(bus_num, dev_num),
+        bus_num=bus_num,
+        dev_num=dev_num,
         vendor_id=vendor_id,
         product_id=product_id,
         description=_describe(_read_text(entry / "manufacturer"), _read_text(entry / "product")),
-        usbmon_path=usbmon_path_for_bus(bus),
+        usbmon_path=usbmon_path_for_bus(bus_num),
     )
 
 

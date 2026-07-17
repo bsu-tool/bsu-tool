@@ -748,6 +748,7 @@ def _endpoint_summary_to_dict(endpoint: EndpointSummary) -> JsonDict:
     return {
         "address": endpoint.address,
         "packet_count": endpoint.packet_count,
+        "byte_count": endpoint.byte_count,
     }
 
 

@@ -995,6 +995,11 @@ def test_session_round_trips_json_safe_dict(tmp_path: Path) -> None:
     assert "interface_class" in devices[0]
     assert capture_data["summary"] == session.summary().to_dict()
 
+    # Endpoint byte_count must survive serialization; 0x81 carries a non-zero
+    # tally so this cannot pass vacuously on the field's 0 default.
+    endpoints = cast(list[JsonDict], devices[0]["endpoints_seen"])
+    assert [(endpoint["address"], endpoint["byte_count"]) for endpoint in endpoints] == [("0x01", 0), ("0x81", 2)]
+
     packet = packets[0]
     assert packet["data_hex"] == "61"
     assert packet["data_preview"] == "61"

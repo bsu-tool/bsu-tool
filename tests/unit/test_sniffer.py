@@ -12,7 +12,7 @@ reading it back with :class:`~bsu_tool.pcapng_reader.PcapNgReader`.
 from __future__ import annotations
 
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from types import TracebackType
 
 import pytest
@@ -181,9 +181,20 @@ def test_output_bytes_matches_file_size(monkeypatch: pytest.MonkeyPatch, tmp_pat
 def test_existing_output_path_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _install_source(monkeypatch, _FakeSource([]))
     out = tmp_path / "cap.pcapng"
-    out.write_bytes(b"")  # already exists -> "xb" open fails
+    out.write_bytes(b"existing")  # already exists -> "xb" open fails
     with pytest.raises(FileExistsError):
         capture(bus=3, device=None, output_path=out, stop_event=Event())
+    assert out.read_bytes() == b"existing"
+
+
+def test_startup_failure_does_not_create_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _install_source(monkeypatch, _FakeSource([], enter_error=UsbmonPermissionError("denied")))
+    out = tmp_path / "cap.pcapng"
+
+    with pytest.raises(UsbmonPermissionError):
+        capture(bus=3, device=None, output_path=out, stop_event=Event())
+
+    assert not out.exists()
 
 
 def test_ready_event_is_set_once_live(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -253,10 +264,12 @@ def test_controller_post_live_error_surfaces_from_stop(monkeypatch: pytest.Monke
     # Goes live (ready set), then raises while iterating -> stop() re-raises.
     source = _FakeSource([(_header(), b"\x01")], iter_error=RuntimeError("bus vanished"))
     _install_source(monkeypatch, source)
+    out = tmp_path / "c.pcapng"
     controller = CaptureController()
-    controller.start(bus=3, device=None, output_path=tmp_path / "c.pcapng")
+    controller.start(bus=3, device=None, output_path=out)
     with pytest.raises(RuntimeError, match="bus vanished"):
         controller.stop()
+    assert out.exists()
 
 
 def test_controller_start_times_out_when_never_live(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -264,10 +277,63 @@ def test_controller_start_times_out_when_never_live(monkeypatch: pytest.MonkeyPa
     source = _FakeSource([], block_enter=gate)
     _install_source(monkeypatch, source)
     controller = CaptureController()
+    out = tmp_path / "c.pcapng"
     with pytest.raises(TimeoutError):
-        controller.start(bus=3, device=None, output_path=tmp_path / "c.pcapng", ready_timeout=0.15)
-    gate.set()  # let the daemon thread unwind
-    controller.stop()
+        controller.start(bus=3, device=None, output_path=out, ready_timeout=0.15)
+    assert not out.exists()
+    with pytest.raises(TimeoutError):
+        controller.stop(timeout=0.01)
+    gate.set()
+    controller.stop(timeout=1.0)
+    assert not out.exists()
+
+
+def test_controller_thread_start_failure_is_not_active(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def fail_start(_thread: Thread) -> None:
+        raise RuntimeError("cannot start thread")
+
+    monkeypatch.setattr(sniffer.Thread, "start", fail_start)
+    controller = CaptureController()
+
+    with pytest.raises(RuntimeError, match="cannot start thread"):
+        controller.start(bus=3, device=None, output_path=tmp_path / "c.pcapng")
+
+    assert not controller.is_active
+
+
+def test_controller_stop_times_out_without_losing_active_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    release = Event()
+
+    def blocked_capture(
+        bus: int,
+        device: int | None,
+        output_path: Path,
+        *,
+        stop_event: Event,
+        ready_event: Event | None = None,
+        on_progress: sniffer.ProgressCallback | None = None,
+    ) -> CaptureStats:
+        del bus, device, stop_event, on_progress
+        output_path.write_bytes(b"capture")
+        assert ready_event is not None
+        ready_event.set()
+        release.wait()
+        return CaptureStats(output_path=output_path)
+
+    monkeypatch.setattr(sniffer, "capture", blocked_capture)
+    controller = CaptureController()
+    controller.start(bus=3, device=None, output_path=tmp_path / "c.pcapng")
+
+    with pytest.raises(TimeoutError, match="did not stop"):
+        controller.stop(timeout=0.01)
+    assert controller.is_active
+
+    release.set()
+    controller.stop(timeout=1.0)
+    assert not controller.is_active
 
 
 def test_is_running_reflects_lifecycle(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

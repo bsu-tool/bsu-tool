@@ -19,6 +19,7 @@ dev = [
     "pyright>=1.1",
     "ruff>=0.15",
     "pre-commit>=3.0",
+    "claude-agent-sdk>=0.2",
 ]
 
 [tool.pytest.ini_options]

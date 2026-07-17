@@ -1,6 +1,9 @@
 """Tests for USB capture session data structures."""
 
-from bsu_tool.session import CaptureSession, USBDevice, USBEndpoint
+import json
+from typing import cast
+
+from bsu_tool.session import CaptureSession, JsonDict, USBDevice, USBEndpoint
 
 
 def test_capture_session_stores_capture_metadata() -> None:
@@ -53,3 +56,31 @@ def test_capture_session_adds_multiple_markers() -> None:
     assert session.markers[0].packet_index == 12
     assert session.markers[1].name == "button_press_end"
     assert session.markers[1].packet_index == 18
+
+
+def test_capture_session_round_trips_json_safe_dict() -> None:
+    """CaptureSession serializes devices, markers, and summary counts."""
+    endpoints = [
+        USBEndpoint(number=1, packet_count=10),
+        USBEndpoint(number=129, packet_count=12),
+    ]
+    session = CaptureSession(
+        filepath="/captures/sample.pcapng",
+        devices=[USBDevice(bus_num=1, dev_num=7, endpoints=endpoints)],
+        packet_count=42,
+    )
+    session.add_marker(name="button_press_start", packet_index=12, note="pressed relay")
+    session.add_marker(name="button_press_end", packet_index=18)
+
+    data = session.to_dict()
+    loaded = cast(JsonDict, json.loads(json.dumps(data)))
+    rebuilt = CaptureSession.from_dict(loaded)
+
+    assert rebuilt == session
+    assert data["packets"] == []
+    assert data["summary"] == {
+        "device_count": 1,
+        "packet_count": 42,
+        "marker_count": 2,
+        "endpoint_count": 2,
+    }

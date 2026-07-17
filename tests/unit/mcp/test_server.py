@@ -155,3 +155,15 @@ def test_get_packets_without_capture_reports_error() -> None:
 
     with pytest.raises(ToolError, match="No capture loaded"):
         asyncio.run(call_tool())
+
+
+def test_build_server_registers_live_capture_tools() -> None:
+    """build_server registers the Issue #80 start_capture and stop_capture tools."""
+
+    async def tool_names() -> set[str]:
+        tools = await build_server().list_tools()
+        return {tool.name for tool in tools}
+
+    names = asyncio.run(tool_names())
+    assert "start_capture" in names
+    assert "stop_capture" in names

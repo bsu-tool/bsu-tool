@@ -2,16 +2,34 @@
 
 from __future__ import annotations
 
+from _thread import LockType
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final
+from threading import Lock
+from typing import TYPE_CHECKING, Final, Literal, TypeAlias, cast
 
+from bsu_tool.descriptors import (
+    CONFIGURATION_DESCRIPTOR,
+    DEVICE_DESCRIPTOR,
+    GET_DESCRIPTOR_REQUEST,
+    SET_CONFIGURATION_REQUEST,
+    STRING_DESCRIPTOR,
+    ConfigurationDescriptor,
+    DeviceDescriptor,
+    parse_configuration,
+    parse_device_descriptor,
+    parse_setup_packet,
+    parse_string_descriptor,
+)
 from bsu_tool.mcp.interfaces import (
     CaptureInterface,
     CaptureMetadata,
     CapturePacket,
+    DeviceEnumeration,
     DeviceSummary,
     EndpointSummary,
+    EnumeratedEndpoint,
+    EnumeratedInterface,
     PacketRecord,
     PacketSelection,
 )
@@ -34,18 +52,22 @@ from bsu_tool.urb_decoder import (
     pair_urbs,
 )
 
+if TYPE_CHECKING:
+    from bsu_tool.sniffer import CaptureController
+
+JsonValue: TypeAlias = str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
+JsonDict: TypeAlias = dict[str, JsonValue]
+
 _PCAPNG_SUFFIX: Final[str] = ".pcapng"
 _IF_TSRESOL_OPTION: Final[int] = 9
 _DEFAULT_TIMESTAMP_RESOLUTION_SECONDS: Final[float] = 1 / 1_000_000
 _BINARY_RESOLUTION_FLAG: Final[int] = 0x80
 _RESOLUTION_VALUE_MASK: Final[int] = 0x7F
-_GET_DESCRIPTOR_REQUEST: Final[int] = 0x06
-_DEVICE_DESCRIPTOR_TYPE: Final[int] = 0x01
-_STRING_DESCRIPTOR_TYPE: Final[int] = 0x03
 _ENDPOINT_IN_FLAG: Final[int] = 0x80
 _ENDPOINT_NUMBER_MASK: Final[int] = 0x0F
 _TRANSFER_TYPE_ORDER: Final[tuple[TransferType, ...]] = ("control", "bulk", "interrupt")
 _DATA_PREVIEW_BYTES: Final[int] = 32
+_CONTROL_ENDPOINT: Final[int] = 0
 
 
 @dataclass(frozen=True)
@@ -56,6 +78,25 @@ class Marker:
     timestamp: float
     packet_index: int
     note: str | None = None
+
+    def to_dict(self) -> JsonDict:
+        """Return a JSON-safe representation of this marker."""
+        return {
+            "name": self.name,
+            "timestamp": self.timestamp,
+            "packet_index": self.packet_index,
+            "note": self.note,
+        }
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> Marker:
+        """Build a marker from a JSON-safe dictionary."""
+        return cls(
+            name=_json_str(data, "name"),
+            timestamp=_json_float(data, "timestamp"),
+            packet_index=_json_int(data, "packet_index"),
+            note=_json_optional_str(data, "note"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +118,47 @@ class MarkerSpan:
     end_marker: Marker
     packets: tuple[PacketRecord, ...]
     count: int
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureSummary:
+    """Aggregate counts describing the active capture at a glance.
+
+    The counts are derived from the decoded record stream and the device
+    summaries, so they cover the same packets ``get_packets`` reports.
+    """
+
+    device_count: int  # distinct USB devices observed in the decoded records
+    packet_count: int  # total decoded URB records in the capture
+    marker_count: int  # analyst-supplied markers on the capture
+    endpoint_count: int  # endpoints across all devices (sum of each device's distinct endpoints)
+    # Neutral statistics, NOT errors. usbmon captures routinely begin and end
+    # mid-transaction, so a healthy capture normally carries some of each.
+    unmatched_submission_count: int  # submissions still in flight (no matching completion captured)
+    orphan_completion_count: int  # completions whose submission was not captured (capture began mid-transaction)
+
+    def to_dict(self) -> JsonDict:
+        """Return a JSON-safe representation of this summary."""
+        return {
+            "device_count": self.device_count,
+            "packet_count": self.packet_count,
+            "marker_count": self.marker_count,
+            "endpoint_count": self.endpoint_count,
+            "unmatched_submission_count": self.unmatched_submission_count,
+            "orphan_completion_count": self.orphan_completion_count,
+        }
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> CaptureSummary:
+        """Build a summary from a JSON-safe dictionary."""
+        return cls(
+            device_count=_json_int(data, "device_count"),
+            packet_count=_json_int(data, "packet_count"),
+            marker_count=_json_int(data, "marker_count"),
+            endpoint_count=_json_int(data, "endpoint_count"),
+            unmatched_submission_count=_json_int(data, "unmatched_submission_count"),
+            orphan_completion_count=_json_int(data, "orphan_completion_count"),
+        )
 
 
 def _empty_markers() -> list[Marker]:
@@ -106,6 +188,44 @@ class Capture:
     transactions: tuple[UrbTransaction, ...]
     markers: list[Marker] = field(default_factory=_empty_markers)
 
+    def to_dict(self) -> JsonDict:
+        """Return a JSON-safe representation of this loaded capture."""
+        devices = _summarize_devices(self.records, self.transactions)
+        summary = _capture_summary(self.records, self.transactions, self.markers)
+        return {
+            "source": str(self.source),
+            "metadata": _capture_metadata_to_dict(self.metadata),
+            "devices": [_device_summary_to_dict(device) for device in devices],
+            "packets": [_urb_record_to_dict(index, record) for index, record in enumerate(self.records)],
+            "markers": [marker.to_dict() for marker in self.markers],
+            "summary": summary.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> Capture:
+        """Build a loaded capture from a JSON-safe dictionary."""
+        source = Path(_json_str(data, "source"))
+        records = tuple(_urb_record_from_dict(item) for item in _json_dict_list(data, "packets"))
+        return cls(
+            source=source,
+            metadata=_capture_metadata_from_dict(_json_dict(data, "metadata")),
+            packets=(),
+            records=records,
+            transactions=tuple(pair_urbs(records)),
+            markers=[Marker.from_dict(item) for item in _json_dict_list(data, "markers")],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LiveCapture:
+    """A live capture owned by a session until it is stopped."""
+
+    controller: CaptureController
+    output_path: Path
+
+
+_LiveCapturePhase = Literal["starting", "running", "stopping"]
+
 
 @dataclass
 class _DeviceAccumulator:
@@ -114,12 +234,8 @@ class _DeviceAccumulator:
     packet_count: int = 0
     endpoint_packet_counts: dict[int, int] = field(default_factory=_empty_endpoint_packet_counts)
     transfer_types: set[TransferType] = field(default_factory=_empty_transfer_types)
-    vendor_id: str | None = None
-    product_id: str | None = None
-    manufacturer: str | None = None
-    product: str | None = None
-    manufacturer_index: int | None = None
-    product_index: int | None = None
+    device_descriptor: DeviceDescriptor | None = None
+    configuration: ConfigurationDescriptor | None = None
     string_descriptors: dict[int, str] = field(default_factory=_empty_string_descriptors)
 
 
@@ -128,9 +244,65 @@ class Session:
     """Holds the active loaded capture."""
 
     capture: Capture | None = None
+    live_capture: LiveCapture | None = field(default=None, init=False)
+    _live_capture_phase: _LiveCapturePhase | None = field(default=None, init=False, repr=False, compare=False)
+    _live_capture_lock: LockType = field(default_factory=Lock, init=False, repr=False, compare=False)
+
+    def reserve_live_capture(self, live_capture: LiveCapture) -> None:
+        """Atomically reserve this session for one live capture."""
+        with self._live_capture_lock:
+            if self.live_capture is not None:
+                if self._live_capture_phase == "starting":
+                    raise RuntimeError("a capture is already starting; wait for start_capture to finish")
+                if self._live_capture_phase == "stopping":
+                    raise RuntimeError("a capture is still stopping; wait for stop_capture to finish")
+                raise RuntimeError("a capture is already running; call stop_capture first")
+            self.live_capture = live_capture
+            self._live_capture_phase = "starting"
+
+    def mark_live_capture_running(self, live_capture: LiveCapture) -> bool:
+        """Mark an owned capture available for a stop operation."""
+        with self._live_capture_lock:
+            if self.live_capture is not live_capture:
+                return False
+            self._live_capture_phase = "running"
+            return True
+
+    def begin_stop_live_capture(self) -> LiveCapture:
+        """Atomically claim the running capture for one stop operation."""
+        with self._live_capture_lock:
+            live_capture = self.live_capture
+            if live_capture is None:
+                raise RuntimeError("no capture is running; call start_capture first")
+            if self._live_capture_phase == "starting":
+                raise RuntimeError("capture is still starting; wait for start_capture to finish")
+            if self._live_capture_phase == "stopping":
+                raise RuntimeError("capture is already stopping; wait for stop_capture to finish")
+            self._live_capture_phase = "stopping"
+            return live_capture
+
+    def release_live_capture(self, live_capture: LiveCapture) -> None:
+        """Release ``live_capture`` if it still owns this session."""
+        with self._live_capture_lock:
+            if self.live_capture is live_capture:
+                self.live_capture = None
+                self._live_capture_phase = None
 
     def load(self, path: Path) -> Capture:
         """Load a pcap-ng capture file and replace the active capture."""
+        with self._live_capture_lock:
+            if self.live_capture is not None:
+                raise RuntimeError("cannot load a capture file while a live capture is active")
+        return self._load_capture(path)
+
+    def load_stopped_capture(self, live_capture: LiveCapture) -> Capture:
+        """Load the output owned by the current live capture."""
+        with self._live_capture_lock:
+            if self.live_capture is not live_capture:
+                raise RuntimeError("capture no longer owns this session")
+        return self._load_capture(live_capture.output_path)
+
+    def _load_capture(self, path: Path) -> Capture:
         source = _validate_capture_path(path)
         file_size_bytes = source.stat().st_size
 
@@ -345,12 +517,317 @@ class Session:
             return None
         return _packet_record(index, records[index])
 
+    def get_enumeration(self, device_id: str) -> DeviceEnumeration:
+        """Return the descriptors and enumeration-phase span for one device.
+
+        Decodes the device and configuration descriptors the device reported
+        during its initial enumeration, and identifies the enumeration/negotiation
+        phase: the standard control transfers on endpoint 0 that precede the
+        device's first runtime traffic. This lets an analyst learn what a device
+        is before interpreting its vendor protocol.
+
+        Args:
+            device_id: The ``dev_bbb_ddd`` id of the device, as reported by
+                :meth:`list_devices`.
+
+        Returns:
+            A :class:`DeviceEnumeration`. When the capture contains no packets for
+            ``device_id``, every descriptor field is ``None``/empty, the index
+            fields are ``None``, and ``is_complete`` is ``False``.
+
+        Raises:
+            RuntimeError: No capture has been loaded.
+        """
+        if self.capture is None:
+            raise RuntimeError("No capture loaded. Call load_capture() first.")
+        return _build_enumeration(self.capture.records, self.capture.transactions, device_id)
+
+    def summary(self) -> CaptureSummary:
+        """Return aggregate counts for the active capture.
+
+        Counts distinct devices, total decoded packets, markers, and endpoints
+        (summed across every device's distinct endpoints). Also reports the
+        neutral in-flight and orphan-completion statistics: these are normal for
+        captures that begin or end mid-transaction and are not faults.
+
+        Raises:
+            RuntimeError: No capture has been loaded.
+        """
+        if self.capture is None:
+            raise RuntimeError("No capture loaded. Call load() first.")
+        return _capture_summary(self.capture.records, self.capture.transactions, self.capture.markers)
+
+    def validate(self) -> list[str]:
+        """Return human-readable integrity faults in the active capture.
+
+        An empty list genuinely means the capture is valid. Only true faults are
+        reported, in this order:
+
+        1. The capture decoded no supported URB records (an empty analysis).
+        2. A marker anchored outside the decoded record range (a dangling
+           reference that ``get_packet`` would resolve to nothing).
+
+        In-flight submissions (no matching completion) and orphan completions
+        (submission not captured) are NOT faults: usbmon captures routinely begin
+        and end mid-transaction, so a healthy capture normally carries some of
+        each. Those are surfaced as neutral statistics on :class:`CaptureSummary`
+        (``unmatched_submission_count`` / ``orphan_completion_count``) instead.
+
+        Raises:
+            RuntimeError: No capture has been loaded.
+        """
+        if self.capture is None:
+            raise RuntimeError("No capture loaded. Call load() first.")
+        records = self.capture.records
+        problems: list[str] = []
+        if not records:
+            problems.append("capture contains no decoded USB packets")
+        for marker in self.capture.markers:
+            if not 0 <= marker.packet_index < len(records):
+                problems.append(
+                    f"marker {marker.name!r} references packet index {marker.packet_index} "
+                    f"outside the decoded range 0..{len(records) - 1}"
+                )
+        return problems
+
+    def to_dict(self) -> JsonDict:
+        """Return a JSON-safe representation of the current session."""
+        return {
+            "capture": None if self.capture is None else self.capture.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> Session:
+        """Build a session from a JSON-safe dictionary."""
+        capture_data = data.get("capture")
+        session = cls()
+        if capture_data is not None:
+            if not isinstance(capture_data, dict):
+                raise TypeError("capture must be a dictionary or None")
+            session.capture = Capture.from_dict(cast(JsonDict, capture_data))
+        return session
+
+
+def _capture_summary(
+    records: tuple[UrbRecord, ...],
+    transactions: tuple[UrbTransaction, ...],
+    markers: list[Marker],
+) -> CaptureSummary:
+    devices = _summarize_devices(records, transactions)
+    return CaptureSummary(
+        device_count=len(devices),
+        packet_count=len(records),
+        marker_count=len(markers),
+        endpoint_count=sum(len(device.endpoints_seen) for device in devices),
+        unmatched_submission_count=_count_unmatched_submissions(transactions),
+        orphan_completion_count=_count_orphan_completions(transactions),
+    )
+
+
+def _count_unmatched_submissions(transactions: tuple[UrbTransaction, ...]) -> int:
+    """Count in-flight submissions: a submission with no matching completion."""
+    return sum(1 for tx in transactions if tx.submission is not None and tx.completion is None)
+
+
+def _count_orphan_completions(transactions: tuple[UrbTransaction, ...]) -> int:
+    """Count orphan completions: a completion whose submission was not captured."""
+    return sum(1 for tx in transactions if tx.submission is None and tx.completion is not None)
+
 
 def _find_marker(markers: list[Marker], name: str) -> Marker:
     for marker in markers:
         if marker.name == name:
             return marker
     raise ValueError(f"no marker named {name!r}")
+
+
+def _json_str(data: JsonDict, key: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, str):
+        raise TypeError(f"{key} must be a string")
+    return value
+
+
+def _json_optional_str(data: JsonDict, key: str) -> str | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{key} must be a string or None")
+    return value
+
+
+def _json_int(data: JsonDict, key: str) -> int:
+    value = data.get(key)
+    if type(value) is not int:
+        raise TypeError(f"{key} must be an integer")
+    return value
+
+
+def _json_float(data: JsonDict, key: str) -> float:
+    value = data.get(key)
+    if type(value) is int or type(value) is float:
+        return float(value)
+    raise TypeError(f"{key} must be a number")
+
+
+def _json_optional_float(data: JsonDict, key: str) -> float | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if type(value) is int or type(value) is float:
+        return float(value)
+    raise TypeError(f"{key} must be a number or None")
+
+
+def _json_dict(data: JsonDict, key: str) -> JsonDict:
+    value = data.get(key)
+    if not isinstance(value, dict):
+        raise TypeError(f"{key} must be a dictionary")
+    return cast(JsonDict, value)
+
+
+def _json_dict_list(data: JsonDict, key: str) -> list[JsonDict]:
+    value = data.get(key)
+    if not isinstance(value, list):
+        raise TypeError(f"{key} must be a list")
+    result: list[JsonDict] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise TypeError(f"{key} must contain dictionaries")
+        result.append(cast(JsonDict, item))
+    return result
+
+
+def _capture_interface_to_dict(interface: CaptureInterface) -> JsonDict:
+    return {
+        "interface_id": interface.interface_id,
+        "link_type": interface.link_type,
+        "snap_len": interface.snap_len,
+        "timestamp_resolution_seconds": interface.timestamp_resolution_seconds,
+    }
+
+
+def _capture_interface_from_dict(data: JsonDict) -> CaptureInterface:
+    return CaptureInterface(
+        interface_id=_json_int(data, "interface_id"),
+        link_type=_json_int(data, "link_type"),
+        snap_len=_json_int(data, "snap_len"),
+        timestamp_resolution_seconds=_json_float(data, "timestamp_resolution_seconds"),
+    )
+
+
+def _capture_metadata_to_dict(metadata: CaptureMetadata) -> JsonDict:
+    return {
+        "source": metadata.source,
+        "file_size_bytes": metadata.file_size_bytes,
+        "packet_count": metadata.packet_count,
+        "capture_duration_seconds": metadata.capture_duration_seconds,
+        "interfaces_seen": [_capture_interface_to_dict(interface) for interface in metadata.interfaces_seen],
+    }
+
+
+def _capture_metadata_from_dict(data: JsonDict) -> CaptureMetadata:
+    return CaptureMetadata(
+        source=_json_str(data, "source"),
+        file_size_bytes=_json_int(data, "file_size_bytes"),
+        packet_count=_json_int(data, "packet_count"),
+        capture_duration_seconds=_json_optional_float(data, "capture_duration_seconds"),
+        interfaces_seen=tuple(
+            _capture_interface_from_dict(interface) for interface in _json_dict_list(data, "interfaces_seen")
+        ),
+    )
+
+
+def _endpoint_summary_to_dict(endpoint: EndpointSummary) -> JsonDict:
+    return {
+        "address": endpoint.address,
+        "packet_count": endpoint.packet_count,
+    }
+
+
+def _device_summary_to_dict(device: DeviceSummary) -> JsonDict:
+    return {
+        "device_id": device.device_id,
+        "bus_num": device.bus_num,
+        "dev_num": device.dev_num,
+        "packet_count": device.packet_count,
+        "endpoints_seen": [_endpoint_summary_to_dict(endpoint) for endpoint in device.endpoints_seen],
+        "transfer_types_seen": list(device.transfer_types_seen),
+        "vendor_id": device.vendor_id,
+        "product_id": device.product_id,
+        "manufacturer": device.manufacturer,
+        "product": device.product,
+        "descriptor_summary": device.descriptor_summary,
+        "device_class": device.device_class,
+        "interface_class": device.interface_class,
+    }
+
+
+def _urb_record_to_dict(index: int, record: UrbRecord) -> JsonDict:
+    packet = _packet_record(index, record)
+    return {
+        "index": index,
+        "urb_id": record.urb_id,
+        "event_type": record.event_type,
+        "transfer_type": record.transfer_type,
+        "direction": record.direction,
+        "device_id": packet.device_id,
+        "bus_num": record.bus_num,
+        "dev_num": record.dev_num,
+        "endpoint_address": packet.endpoint_address,
+        "endpoint_number": record.endpoint,
+        "status": record.status,
+        "length": record.length,
+        "captured_length": record.captured_length,
+        "data_length": len(record.data),
+        "data_preview": _data_preview(record.data),
+        "data_hex": record.data.hex(),
+        "setup_hex": record.setup.hex() if record.setup is not None else None,
+        "timestamp": record.timestamp,
+    }
+
+
+def _urb_record_from_dict(data: JsonDict) -> UrbRecord:
+    return UrbRecord(
+        urb_id=_json_int(data, "urb_id"),
+        event_type=_event_type_from_json(_json_str(data, "event_type")),
+        transfer_type=_transfer_type_from_json(_json_str(data, "transfer_type")),
+        direction=_direction_from_json(_json_str(data, "direction")),
+        bus_num=_json_int(data, "bus_num"),
+        dev_num=_json_int(data, "dev_num"),
+        endpoint=_json_int(data, "endpoint_number"),
+        status=_json_int(data, "status"),
+        length=_json_int(data, "length"),
+        captured_length=_json_int(data, "captured_length"),
+        data=bytes.fromhex(_json_str(data, "data_hex")),
+        setup=_optional_bytes_from_hex(_json_optional_str(data, "setup_hex")),
+        timestamp=_json_float(data, "timestamp"),
+    )
+
+
+def _event_type_from_json(value: str) -> EventType:
+    if value in ("submission", "completion", "error"):
+        return value
+    raise ValueError(f"invalid event_type {value!r}")
+
+
+def _transfer_type_from_json(value: str) -> TransferType:
+    if value in ("control", "bulk", "interrupt"):
+        return value
+    raise ValueError(f"invalid transfer_type {value!r}")
+
+
+def _direction_from_json(value: str) -> Direction:
+    if value in ("in", "out"):
+        return value
+    raise ValueError(f"invalid direction {value!r}")
+
+
+def _optional_bytes_from_hex(value: str | None) -> bytes | None:
+    if value is None:
+        return None
+    return bytes.fromhex(value)
 
 
 def _validate_capture_path(path: Path) -> Path:
@@ -514,10 +991,10 @@ def _record_matches(
     return True
 
 
-def _summarize_devices(
+def _accumulate_devices(
     records: tuple[UrbRecord, ...],
     transactions: tuple[UrbTransaction, ...],
-) -> tuple[DeviceSummary, ...]:
+) -> dict[tuple[int, int], _DeviceAccumulator]:
     devices: dict[tuple[int, int], _DeviceAccumulator] = {}
     for record in records:
         accumulator = _device_accumulator(devices, record.bus_num, record.dev_num)
@@ -528,7 +1005,14 @@ def _summarize_devices(
 
     for transaction in transactions:
         _apply_descriptor_info(devices, transaction)
+    return devices
 
+
+def _summarize_devices(
+    records: tuple[UrbRecord, ...],
+    transactions: tuple[UrbTransaction, ...],
+) -> tuple[DeviceSummary, ...]:
+    devices = _accumulate_devices(records, transactions)
     return tuple(
         _device_summary(accumulator)
         for _, accumulator in sorted(devices.items(), key=lambda item: (item[0][0], item[0][1]))
@@ -564,68 +1048,47 @@ def _apply_descriptor_info(
     completion = transaction.completion
     if submission is None or completion is None or submission.setup is None:
         return
+    setup = parse_setup_packet(submission.setup)
+    if setup is None or not setup.is_standard or setup.b_request != GET_DESCRIPTOR_REQUEST:
+        return
     accumulator = devices.get((submission.bus_num, submission.dev_num))
     if accumulator is None:
         return
 
-    descriptor_type = _requested_descriptor_type(submission.setup)
-    descriptor_index = submission.setup[2]
-    if descriptor_type == _DEVICE_DESCRIPTOR_TYPE:
-        _apply_device_descriptor(accumulator, completion.data)
-        return
-    if descriptor_type == _STRING_DESCRIPTOR_TYPE and descriptor_index > 0:
-        descriptor = _decode_string_descriptor(completion.data)
+    if setup.descriptor_type == DEVICE_DESCRIPTOR:
+        descriptor = parse_device_descriptor(completion.data)
         if descriptor is not None:
-            accumulator.string_descriptors[descriptor_index] = descriptor
+            accumulator.device_descriptor = descriptor
+    elif setup.descriptor_type == CONFIGURATION_DESCRIPTOR:
+        configuration = parse_configuration(completion.data)
+        if configuration is not None and _prefer_configuration(accumulator.configuration, configuration):
+            accumulator.configuration = configuration
+    elif setup.descriptor_type == STRING_DESCRIPTOR and setup.descriptor_index > 0:
+        text = parse_string_descriptor(completion.data)
+        if text is not None:
+            accumulator.string_descriptors[setup.descriptor_index] = text
 
 
-def _requested_descriptor_type(setup: bytes) -> int | None:
-    if len(setup) != 8 or setup[1] != _GET_DESCRIPTOR_REQUEST:
-        return None
-    return setup[3]
+def _prefer_configuration(existing: ConfigurationDescriptor | None, candidate: ConfigurationDescriptor) -> bool:
+    """Return whether ``candidate`` is a more complete configuration than ``existing``.
 
-
-def _apply_device_descriptor(accumulator: _DeviceAccumulator, data: bytes) -> None:
-    if len(data) < 18 or data[1] != _DEVICE_DESCRIPTOR_TYPE:
-        return
-    accumulator.vendor_id = _format_usb_id(data[8], data[9])
-    accumulator.product_id = _format_usb_id(data[10], data[11])
-    accumulator.manufacturer_index = _descriptor_string_index(data[14])
-    accumulator.product_index = _descriptor_string_index(data[15])
-
-
-def _format_usb_id(low: int, high: int) -> str:
-    return f"0x{((high << 8) | low):04x}"
-
-
-def _descriptor_string_index(value: int) -> int | None:
-    if value == 0:
-        return None
-    return value
-
-
-def _decode_string_descriptor(data: bytes) -> str | None:
-    if len(data) < 2 or data[1] != _STRING_DESCRIPTOR_TYPE:
-        return None
-    descriptor_length = min(data[0], len(data))
-    if descriptor_length <= 2:
-        return None
-    payload = data[2:descriptor_length]
-    if len(payload) % 2 != 0:
-        payload = payload[:-1]
-    try:
-        decoded = payload.decode("utf-16-le")
-    except UnicodeDecodeError:
-        return None
-    decoded = decoded.rstrip("\x00")
-    if decoded == "":
-        return None
-    return decoded
+    Enumeration reads the configuration twice — a 9-byte header-only read to
+    learn the total length, then the full blob. Keep whichever carries more
+    interface descriptors so the header-only read never overwrites the full one.
+    """
+    if existing is None:
+        return True
+    return len(candidate.interfaces) > len(existing.interfaces)
 
 
 def _device_summary(accumulator: _DeviceAccumulator) -> DeviceSummary:
-    manufacturer = _descriptor_string(accumulator, accumulator.manufacturer_index)
-    product = _descriptor_string(accumulator, accumulator.product_index)
+    device = accumulator.device_descriptor
+    config = accumulator.configuration
+    manufacturer = _descriptor_string(accumulator, device.manufacturer_index) if device else None
+    product = _descriptor_string(accumulator, device.product_index) if device else None
+    vendor_id = _format_usb_id(device.vendor_id) if device else None
+    product_id = _format_usb_id(device.product_id) if device else None
+    interface_class = config.interfaces[0].interface_class if config and config.interfaces else None
     return DeviceSummary(
         device_id=_device_id(accumulator.bus_num, accumulator.dev_num),
         bus_num=accumulator.bus_num,
@@ -636,11 +1099,13 @@ def _device_summary(accumulator: _DeviceAccumulator) -> DeviceSummary:
             for addr, count in sorted(accumulator.endpoint_packet_counts.items())
         ),
         transfer_types_seen=_sorted_transfer_types(accumulator.transfer_types),
-        vendor_id=accumulator.vendor_id,
-        product_id=accumulator.product_id,
+        vendor_id=vendor_id,
+        product_id=product_id,
         manufacturer=manufacturer,
         product=product,
-        descriptor_summary=_descriptor_summary(accumulator, manufacturer, product),
+        descriptor_summary=_descriptor_summary(vendor_id, product_id, manufacturer, product),
+        device_class=device.device_class if device else None,
+        interface_class=interface_class,
     )
 
 
@@ -648,6 +1113,10 @@ def _descriptor_string(accumulator: _DeviceAccumulator, index: int | None) -> st
     if index is None:
         return None
     return accumulator.string_descriptors.get(index)
+
+
+def _format_usb_id(value: int) -> str:
+    return f"0x{value:04x}"
 
 
 def _sorted_transfer_types(transfer_types: set[TransferType]) -> tuple[TransferType, ...]:
@@ -659,18 +1128,150 @@ def _device_id(bus_num: int, dev_num: int) -> str:
 
 
 def _descriptor_summary(
-    accumulator: _DeviceAccumulator,
+    vendor_id: str | None,
+    product_id: str | None,
     manufacturer: str | None,
     product: str | None,
 ) -> str | None:
-    if accumulator.vendor_id is None and accumulator.product_id is None:
+    if vendor_id is None and product_id is None:
         return None
     label = "USB device"
     if manufacturer is not None and product is not None:
         label = f"{manufacturer} {product}"
     elif product is not None:
         label = product
-    return f"{label} ({accumulator.vendor_id}:{accumulator.product_id})"
+    return f"{label} ({vendor_id}:{product_id})"
+
+
+# ---------------------------------------------------------------------------
+# Enumeration-phase detection and descriptor retrieval
+# ---------------------------------------------------------------------------
+
+
+def _build_enumeration(
+    records: tuple[UrbRecord, ...],
+    transactions: tuple[UrbTransaction, ...],
+    device_id: str,
+) -> DeviceEnumeration:
+    accumulators = _accumulate_devices(records, transactions)
+    accumulator = next(
+        (acc for acc in accumulators.values() if _device_id(acc.bus_num, acc.dev_num) == device_id),
+        None,
+    )
+    device = accumulator.device_descriptor if accumulator else None
+    config = accumulator.configuration if accumulator else None
+    enum_indices, runtime_start, is_complete = _enumeration_indices(records, device_id)
+    return DeviceEnumeration(
+        device_id=device_id,
+        vendor_id=_format_usb_id(device.vendor_id) if device else None,
+        product_id=_format_usb_id(device.product_id) if device else None,
+        usb_version=device.usb_version if device else None,
+        device_class=device.device_class if device else None,
+        device_subclass=device.device_subclass if device else None,
+        device_protocol=device.device_protocol if device else None,
+        manufacturer=_descriptor_string(accumulator, device.manufacturer_index) if accumulator and device else None,
+        product=_descriptor_string(accumulator, device.product_index) if accumulator and device else None,
+        serial_number=(_descriptor_string(accumulator, device.serial_number_index) if accumulator and device else None),
+        configuration_value=config.configuration_value if config else None,
+        interfaces=_enumerated_interfaces(config, accumulator) if config and accumulator else (),
+        enumeration_packet_indices=tuple(enum_indices),
+        enumeration_start_index=min(enum_indices) if enum_indices else None,
+        enumeration_end_index=max(enum_indices) if enum_indices else None,
+        runtime_start_index=runtime_start,
+        is_complete=is_complete,
+    )
+
+
+def _enumerated_interfaces(
+    config: ConfigurationDescriptor,
+    accumulator: _DeviceAccumulator,
+) -> tuple[EnumeratedInterface, ...]:
+    return tuple(
+        EnumeratedInterface(
+            number=interface.number,
+            alternate_setting=interface.alternate_setting,
+            interface_class=interface.interface_class,
+            interface_subclass=interface.interface_subclass,
+            interface_protocol=interface.interface_protocol,
+            description=_descriptor_string(accumulator, interface.interface_index),
+            endpoints=tuple(
+                EnumeratedEndpoint(
+                    address=f"0x{endpoint.address:02x}",
+                    number=endpoint.number,
+                    direction=endpoint.direction,
+                    transfer_type=endpoint.transfer_type,
+                    max_packet_size=endpoint.max_packet_size,
+                    interval=endpoint.interval,
+                )
+                for endpoint in interface.endpoints
+            ),
+        )
+        for interface in config.interfaces
+    )
+
+
+def _enumeration_indices(
+    records: tuple[UrbRecord, ...],
+    device_id: str,
+) -> tuple[list[int], int | None, bool]:
+    """Classify a device's records into its enumeration phase.
+
+    Returns the record indices belonging to the enumeration phase, the index at
+    which the device's runtime traffic begins (``None`` if it never does), and
+    whether a ``SET_CONFIGURATION`` was seen during enumeration.
+    """
+    enum_flags = _classify_enumeration_records(records)
+    runtime_start = next(
+        (
+            index
+            for index, record in enumerate(records)
+            if _device_id(record.bus_num, record.dev_num) == device_id and not enum_flags[index]
+        ),
+        None,
+    )
+
+    enum_indices: list[int] = []
+    is_complete = False
+    for index, record in enumerate(records):
+        if runtime_start is not None and index >= runtime_start:
+            break
+        if _device_id(record.bus_num, record.dev_num) != device_id or not enum_flags[index]:
+            continue
+        enum_indices.append(index)
+        if _is_set_configuration(record):
+            is_complete = True
+    return enum_indices, runtime_start, is_complete
+
+
+def _classify_enumeration_records(records: tuple[UrbRecord, ...]) -> list[bool]:
+    """Flag each record as belonging to enumeration (standard ep0 control) or runtime.
+
+    A record is enumeration when it is a standard control transfer on endpoint 0.
+    Completions carry no setup packet, so each is matched to its own in-flight
+    submission — ``urb_id`` alone is unreliable because the kernel reuses ids
+    across the capture. Unmatched (orphan) control completions default to
+    enumeration rather than being mistaken for runtime traffic.
+    """
+    flags = [False] * len(records)
+    open_standard: dict[int, bool] = {}
+    for index, record in enumerate(records):
+        if record.transfer_type != "control" or record.endpoint != _CONTROL_ENDPOINT:
+            continue  # any transfer off endpoint 0 is runtime traffic
+        if record.event_type == "submission" and record.setup is not None:
+            setup = parse_setup_packet(record.setup)
+            standard = setup is not None and setup.is_standard
+            open_standard[record.urb_id] = standard
+        else:
+            standard = open_standard.pop(record.urb_id, True)
+        flags[index] = standard
+    return flags
+
+
+def _is_set_configuration(record: UrbRecord) -> bool:
+    if record.event_type != "submission" or record.setup is None:
+        return False
+    setup = parse_setup_packet(record.setup)
+    return setup is not None and setup.is_standard and setup.b_request == SET_CONFIGURATION_REQUEST
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +1286,21 @@ class USBEndpoint:
     number: int
     packet_count: int
 
+    def to_dict(self) -> JsonDict:
+        """Return a JSON-safe representation of this endpoint."""
+        return {
+            "number": self.number,
+            "packet_count": self.packet_count,
+        }
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> USBEndpoint:
+        """Build an endpoint from a JSON-safe dictionary."""
+        return cls(
+            number=_json_int(data, "number"),
+            packet_count=_json_int(data, "packet_count"),
+        )
+
 
 @dataclass
 class USBDevice:
@@ -694,12 +1310,44 @@ class USBDevice:
     dev_num: int
     endpoints: list[USBEndpoint]
 
+    def to_dict(self) -> JsonDict:
+        """Return a JSON-safe representation of this device."""
+        return {
+            "bus_num": self.bus_num,
+            "dev_num": self.dev_num,
+            "endpoints": [endpoint.to_dict() for endpoint in self.endpoints],
+        }
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> USBDevice:
+        """Build a device from a JSON-safe dictionary."""
+        return cls(
+            bus_num=_json_int(data, "bus_num"),
+            dev_num=_json_int(data, "dev_num"),
+            endpoints=[USBEndpoint.from_dict(endpoint) for endpoint in _json_dict_list(data, "endpoints")],
+        )
+
 
 @dataclass
 class _CliMarker:
     name: str
     packet_index: int
     note: str = ""
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "name": self.name,
+            "packet_index": self.packet_index,
+            "note": self.note,
+        }
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> _CliMarker:
+        return cls(
+            name=_json_str(data, "name"),
+            packet_index=_json_int(data, "packet_index"),
+            note=_json_str(data, "note"),
+        )
 
 
 def _new_cli_marker_list() -> list[_CliMarker]:
@@ -724,3 +1372,29 @@ class CaptureSession:
             note: Optional analyst note describing the marked event.
         """
         self.markers.append(_CliMarker(name=name, packet_index=packet_index, note=note))
+
+    def to_dict(self) -> JsonDict:
+        """Return a JSON-safe representation of this capture session."""
+        return {
+            "filepath": self.filepath,
+            "devices": [device.to_dict() for device in self.devices],
+            "packets": [],
+            "packet_count": self.packet_count,
+            "markers": [marker.to_dict() for marker in self.markers],
+            "summary": {
+                "device_count": len(self.devices),
+                "packet_count": self.packet_count,
+                "marker_count": len(self.markers),
+                "endpoint_count": sum(len(device.endpoints) for device in self.devices),
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> CaptureSession:
+        """Build a capture session from a JSON-safe dictionary."""
+        return cls(
+            filepath=_json_str(data, "filepath"),
+            devices=[USBDevice.from_dict(device) for device in _json_dict_list(data, "devices")],
+            packet_count=_json_int(data, "packet_count"),
+            markers=[_CliMarker.from_dict(marker) for marker in _json_dict_list(data, "markers")],
+        )

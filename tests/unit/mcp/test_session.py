@@ -1,13 +1,15 @@
 """Tests for the MCP session container."""
 
+import json
 import struct
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from bsu_tool.mcp.interfaces import EndpointSummary
 from bsu_tool.pcapng_reader import PcapNgError
-from bsu_tool.session import Marker, Session
+from bsu_tool.session import CaptureSummary, JsonDict, Marker, Session
 
 _USBMON_HEADER_FORMAT = "<QBBBBHBBqiiII8s"
 _SUBMISSION = 0x53
@@ -343,6 +345,12 @@ def test_list_devices_summarizes_multiple_devices(tmp_path: Path) -> None:
     assert device_summaries[1].manufacturer == "Goodix"
     assert device_summaries[1].product == "Fingerprint Reader"
     assert device_summaries[1].descriptor_summary == "Goodix Fingerprint Reader (0x27c6:0x533c)"
+    assert device_summaries[1].device_class == 0xFF
+    assert device_summaries[1].interface_class is None
+
+    serialized_devices = cast(list[JsonDict], capture.to_dict()["devices"])
+    assert serialized_devices[1]["device_class"] == 0xFF
+    assert serialized_devices[1]["interface_class"] is None
 
 
 def _multi_device_packets() -> tuple[bytes, ...]:
@@ -727,3 +735,154 @@ def test_packets_between_markers_unknown_device_id_is_empty(tmp_path: Path) -> N
 
     assert span.count == 0
     assert span.packets == ()
+
+
+def test_summary_requires_loaded_capture() -> None:
+    """summary raises RuntimeError if no capture has been loaded."""
+    with pytest.raises(RuntimeError):
+        Session().summary()
+
+
+def test_summary_returns_correct_counts(tmp_path: Path) -> None:
+    """summary counts devices, packets, markers, and endpoints across devices."""
+    setup_device = _get_descriptor_setup(descriptor_type=1, descriptor_index=0, length=18)
+    descriptor = _device_descriptor(vendor_id=0x27C6, product_id=0x533C, manufacturer_index=0, product_index=0)
+    # Two fully paired devices: dev 4 uses endpoints 0x01/0x81, dev 7 uses 0x00 (control).
+    path = tmp_path / "summary.pcapng"
+    path.write_bytes(
+        _capture_bytes(
+            (
+                _usbmon_packet(urb_id=1, endpoint=0x01, dev_num=4, data=b"a"),
+                _usbmon_packet(urb_id=1, event=_COMPLETION, endpoint=0x81, dev_num=4, data=b"bc"),
+                _usbmon_packet(urb_id=2, transfer_type=_CONTROL, endpoint=0x80, dev_num=7, setup=setup_device),
+                _usbmon_packet(
+                    urb_id=2,
+                    event=_COMPLETION,
+                    transfer_type=_CONTROL,
+                    endpoint=0x80,
+                    dev_num=7,
+                    flag_setup=0x3E,
+                    data=descriptor,
+                ),
+            )
+        )
+    )
+    session = Session()
+    session.load(path)
+    session.add_marker(name="start", packet_index=0)
+    session.add_marker(name="end", packet_index=3)
+
+    summary = session.summary()
+
+    assert summary == CaptureSummary(
+        device_count=2,
+        packet_count=4,
+        marker_count=2,
+        endpoint_count=3,
+        unmatched_submission_count=0,
+        orphan_completion_count=0,
+    )
+    assert session.validate() == []
+
+
+def test_validate_requires_loaded_capture() -> None:
+    """validate raises RuntimeError if no capture has been loaded."""
+    with pytest.raises(RuntimeError):
+        Session().validate()
+
+
+def test_validate_flags_empty_capture(tmp_path: Path) -> None:
+    """A capture that decodes no supported records is reported as empty."""
+    path = tmp_path / "isochronous-only.pcapng"
+    path.write_bytes(_capture_bytes((_usbmon_packet(transfer_type=_ISOCHRONOUS),)))
+    session = Session()
+    session.load(path)
+
+    assert session.validate() == ["capture contains no decoded USB packets"]
+
+
+def test_summary_counts_unmatched_submission(tmp_path: Path) -> None:
+    """An in-flight submission (no completion) is a neutral summary statistic, not a validate fault."""
+    path = tmp_path / "orphan-sub.pcapng"
+    path.write_bytes(_capture_bytes((_usbmon_packet(urb_id=1, endpoint=0x01, dev_num=4, data=b"a"),)))
+    session = Session()
+    session.load(path)
+
+    # A lone submission is still a valid capture: captures normally begin/end mid-transaction.
+    assert session.validate() == []
+    summary = session.summary()
+    assert summary.unmatched_submission_count == 1
+    assert summary.orphan_completion_count == 0
+
+
+def test_summary_counts_orphan_completion(tmp_path: Path) -> None:
+    """A completion whose submission was never captured is a neutral statistic, not a validate fault."""
+    path = tmp_path / "orphan-comp.pcapng"
+    completion = _usbmon_packet(urb_id=9, event=_COMPLETION, endpoint=0x81, dev_num=4, data=b"z")
+    path.write_bytes(_capture_bytes((completion,)))
+    session = Session()
+    session.load(path)
+
+    assert session.validate() == []
+    summary = session.summary()
+    assert summary.orphan_completion_count == 1
+    assert summary.unmatched_submission_count == 0
+
+
+def test_validate_flags_marker_out_of_range(tmp_path: Path) -> None:
+    """A marker anchored outside the decoded record range is reported."""
+    session = Session()
+    capture = session.load(_write_capture(tmp_path))
+    # Bypass add_marker's guard to model a dangling marker reference (capture has 2 records).
+    capture.markers.append(Marker(name="stale", timestamp=0.0, packet_index=99))
+
+    assert "marker 'stale' references packet index 99 outside the decoded range 0..1" in session.validate()
+
+
+def test_validate_reports_multiple_faults_in_order(tmp_path: Path) -> None:
+    """With both genuine faults present, validate reports empty-capture first, then the dangling marker."""
+    path = tmp_path / "empty-with-marker.pcapng"
+    path.write_bytes(_capture_bytes((_usbmon_packet(transfer_type=_ISOCHRONOUS),)))
+    session = Session()
+    capture = session.load(path)
+    assert len(capture.records) == 0
+    # Bypass add_marker's guard: on a zero-record capture any index dangles.
+    capture.markers.append(Marker(name="stale", timestamp=0.0, packet_index=0))
+
+    assert session.validate() == [
+        "capture contains no decoded USB packets",
+        "marker 'stale' references packet index 0 outside the decoded range 0..-1",
+    ]
+
+
+def test_session_round_trips_json_safe_dict(tmp_path: Path) -> None:
+    """Session serialization preserves devices, packets, markers, and summary counts."""
+    session = _span_session(tmp_path)
+    session.add_marker(name="start", packet_index=0, note="before action")
+    session.add_marker(name="end", packet_index=4, note="after action")
+
+    data = session.to_dict()
+    loaded = cast(JsonDict, json.loads(json.dumps(data)))
+    rebuilt = Session.from_dict(loaded)
+
+    assert rebuilt.to_dict() == data
+    assert rebuilt.summary() == session.summary()
+    assert rebuilt.list_devices() == session.list_devices()
+    assert rebuilt.list_markers() == session.list_markers()
+    assert rebuilt.get_packets().matches == session.get_packets().matches
+
+    capture_data = cast(JsonDict, data["capture"])
+    devices = cast(list[JsonDict], capture_data["devices"])
+    packets = cast(list[JsonDict], capture_data["packets"])
+    markers = cast(list[JsonDict], capture_data["markers"])
+    assert len(devices) == 2
+    assert len(packets) == 5
+    assert len(markers) == 2
+    assert "device_class" in devices[0]
+    assert "interface_class" in devices[0]
+    assert capture_data["summary"] == session.summary().to_dict()
+
+    packet = packets[0]
+    assert packet["data_hex"] == "61"
+    assert packet["data_preview"] == "61"
+    assert packet["setup_hex"] is None

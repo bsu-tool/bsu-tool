@@ -464,13 +464,6 @@ def test_rejects_pcap_format() -> None:
             list(PcapNgReader(f))
 
 
-def test_rejects_pcap_format():
-    """Legacy libpcap (.pcap) files are not supported."""
-    with open("test_data/captures/usb_memory_stick.pcap", "rb") as f:
-        with pytest.raises(InvalidBlockError):
-            list(PcapNgReader(f))
-
-
 # --- Tests: real capture file (goodix_enroll_sanitized.pcapng) ------------
 
 # LINKTYPE_USB_LINUX_MMAPPED as seen in usbmon captures from modern kernels.

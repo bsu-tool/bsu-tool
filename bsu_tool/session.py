@@ -169,6 +169,10 @@ def _empty_endpoint_packet_counts() -> dict[int, int]:
     return {}
 
 
+def _empty_endpoint_byte_counts() -> dict[int, int]:
+    return {}
+
+
 def _empty_transfer_types() -> set[TransferType]:
     return set()
 
@@ -233,6 +237,7 @@ class _DeviceAccumulator:
     dev_num: int
     packet_count: int = 0
     endpoint_packet_counts: dict[int, int] = field(default_factory=_empty_endpoint_packet_counts)
+    endpoint_byte_counts: dict[int, int] = field(default_factory=_empty_endpoint_byte_counts)
     transfer_types: set[TransferType] = field(default_factory=_empty_transfer_types)
     device_descriptor: DeviceDescriptor | None = None
     configuration: ConfigurationDescriptor | None = None
@@ -743,6 +748,7 @@ def _endpoint_summary_to_dict(endpoint: EndpointSummary) -> JsonDict:
     return {
         "address": endpoint.address,
         "packet_count": endpoint.packet_count,
+        "byte_count": endpoint.byte_count,
     }
 
 
@@ -1001,6 +1007,13 @@ def _accumulate_devices(
         accumulator.packet_count += 1
         addr = _endpoint_address(record)
         accumulator.endpoint_packet_counts[addr] = accumulator.endpoint_packet_counts.get(addr, 0) + 1
+        # Bytes are tallied only on completion events using the URB-reported full
+        # length (not captured_length, which snaplen truncation would under-report),
+        # so a submission and its completion never double-count the same transfer.
+        # Caveats: control endpoint 0 (address 0x00) mixes IN and OUT traffic under
+        # one address, and in-flight URBs seen only as submissions contribute 0 bytes.
+        if record.event_type == "completion":
+            accumulator.endpoint_byte_counts[addr] = accumulator.endpoint_byte_counts.get(addr, 0) + record.length
         accumulator.transfer_types.add(record.transfer_type)
 
     for transaction in transactions:
@@ -1095,7 +1108,11 @@ def _device_summary(accumulator: _DeviceAccumulator) -> DeviceSummary:
         dev_num=accumulator.dev_num,
         packet_count=accumulator.packet_count,
         endpoints_seen=tuple(
-            EndpointSummary(address=f"0x{addr:02x}", packet_count=count)
+            EndpointSummary(
+                address=f"0x{addr:02x}",
+                packet_count=count,
+                byte_count=accumulator.endpoint_byte_counts.get(addr, 0),
+            )
             for addr, count in sorted(accumulator.endpoint_packet_counts.items())
         ),
         transfer_types_seen=_sorted_transfer_types(accumulator.transfer_types),

@@ -46,6 +46,7 @@ class EndpointSummary:
 
     address: str
     packet_count: int
+    byte_count: int  # total bytes transferred on this endpoint, summed from completion events only
 
 
 @dataclass(frozen=True, slots=True)

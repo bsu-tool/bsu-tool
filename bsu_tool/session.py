@@ -6,7 +6,7 @@ from _thread import LockType
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final, Literal, TypeAlias, cast
 
 from bsu_tool.descriptors import (
     CONFIGURATION_DESCRIPTOR,
@@ -55,6 +55,9 @@ from bsu_tool.urb_decoder import (
 if TYPE_CHECKING:
     from bsu_tool.sniffer import CaptureController
 
+JsonValue: TypeAlias = str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
+JsonDict: TypeAlias = dict[str, JsonValue]
+
 _PCAPNG_SUFFIX: Final[str] = ".pcapng"
 _IF_TSRESOL_OPTION: Final[int] = 9
 _DEFAULT_TIMESTAMP_RESOLUTION_SECONDS: Final[float] = 1 / 1_000_000
@@ -75,6 +78,25 @@ class Marker:
     timestamp: float
     packet_index: int
     note: str | None = None
+
+    def to_dict(self) -> JsonDict:
+        """Return a JSON-safe representation of this marker."""
+        return {
+            "name": self.name,
+            "timestamp": self.timestamp,
+            "packet_index": self.packet_index,
+            "note": self.note,
+        }
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> Marker:
+        """Build a marker from a JSON-safe dictionary."""
+        return cls(
+            name=_json_str(data, "name"),
+            timestamp=_json_float(data, "timestamp"),
+            packet_index=_json_int(data, "packet_index"),
+            note=_json_optional_str(data, "note"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +137,29 @@ class CaptureSummary:
     unmatched_submission_count: int  # submissions still in flight (no matching completion captured)
     orphan_completion_count: int  # completions whose submission was not captured (capture began mid-transaction)
 
+    def to_dict(self) -> JsonDict:
+        """Return a JSON-safe representation of this summary."""
+        return {
+            "device_count": self.device_count,
+            "packet_count": self.packet_count,
+            "marker_count": self.marker_count,
+            "endpoint_count": self.endpoint_count,
+            "unmatched_submission_count": self.unmatched_submission_count,
+            "orphan_completion_count": self.orphan_completion_count,
+        }
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> CaptureSummary:
+        """Build a summary from a JSON-safe dictionary."""
+        return cls(
+            device_count=_json_int(data, "device_count"),
+            packet_count=_json_int(data, "packet_count"),
+            marker_count=_json_int(data, "marker_count"),
+            endpoint_count=_json_int(data, "endpoint_count"),
+            unmatched_submission_count=_json_int(data, "unmatched_submission_count"),
+            orphan_completion_count=_json_int(data, "orphan_completion_count"),
+        )
+
 
 def _empty_markers() -> list[Marker]:
     return []
@@ -142,6 +187,33 @@ class Capture:
     records: tuple[UrbRecord, ...]
     transactions: tuple[UrbTransaction, ...]
     markers: list[Marker] = field(default_factory=_empty_markers)
+
+    def to_dict(self) -> JsonDict:
+        """Return a JSON-safe representation of this loaded capture."""
+        devices = _summarize_devices(self.records, self.transactions)
+        summary = _capture_summary(self.records, self.transactions, self.markers)
+        return {
+            "source": str(self.source),
+            "metadata": _capture_metadata_to_dict(self.metadata),
+            "devices": [_device_summary_to_dict(device) for device in devices],
+            "packets": [_urb_record_to_dict(index, record) for index, record in enumerate(self.records)],
+            "markers": [marker.to_dict() for marker in self.markers],
+            "summary": summary.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> Capture:
+        """Build a loaded capture from a JSON-safe dictionary."""
+        source = Path(_json_str(data, "source"))
+        records = tuple(_urb_record_from_dict(item) for item in _json_dict_list(data, "packets"))
+        return cls(
+            source=source,
+            metadata=_capture_metadata_from_dict(_json_dict(data, "metadata")),
+            packets=(),
+            records=records,
+            transactions=tuple(pair_urbs(records)),
+            markers=[Marker.from_dict(item) for item in _json_dict_list(data, "markers")],
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -483,16 +555,7 @@ class Session:
         """
         if self.capture is None:
             raise RuntimeError("No capture loaded. Call load() first.")
-        devices = _summarize_devices(self.capture.records, self.capture.transactions)
-        transactions = self.capture.transactions
-        return CaptureSummary(
-            device_count=len(devices),
-            packet_count=len(self.capture.records),
-            marker_count=len(self.capture.markers),
-            endpoint_count=sum(len(device.endpoints_seen) for device in devices),
-            unmatched_submission_count=_count_unmatched_submissions(transactions),
-            orphan_completion_count=_count_orphan_completions(transactions),
-        )
+        return _capture_summary(self.capture.records, self.capture.transactions, self.capture.markers)
 
     def validate(self) -> list[str]:
         """Return human-readable integrity faults in the active capture.
@@ -527,6 +590,39 @@ class Session:
                 )
         return problems
 
+    def to_dict(self) -> JsonDict:
+        """Return a JSON-safe representation of the current session."""
+        return {
+            "capture": None if self.capture is None else self.capture.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> Session:
+        """Build a session from a JSON-safe dictionary."""
+        capture_data = data.get("capture")
+        session = cls()
+        if capture_data is not None:
+            if not isinstance(capture_data, dict):
+                raise TypeError("capture must be a dictionary or None")
+            session.capture = Capture.from_dict(cast(JsonDict, capture_data))
+        return session
+
+
+def _capture_summary(
+    records: tuple[UrbRecord, ...],
+    transactions: tuple[UrbTransaction, ...],
+    markers: list[Marker],
+) -> CaptureSummary:
+    devices = _summarize_devices(records, transactions)
+    return CaptureSummary(
+        device_count=len(devices),
+        packet_count=len(records),
+        marker_count=len(markers),
+        endpoint_count=sum(len(device.endpoints_seen) for device in devices),
+        unmatched_submission_count=_count_unmatched_submissions(transactions),
+        orphan_completion_count=_count_orphan_completions(transactions),
+    )
+
 
 def _count_unmatched_submissions(transactions: tuple[UrbTransaction, ...]) -> int:
     """Count in-flight submissions: a submission with no matching completion."""
@@ -543,6 +639,195 @@ def _find_marker(markers: list[Marker], name: str) -> Marker:
         if marker.name == name:
             return marker
     raise ValueError(f"no marker named {name!r}")
+
+
+def _json_str(data: JsonDict, key: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, str):
+        raise TypeError(f"{key} must be a string")
+    return value
+
+
+def _json_optional_str(data: JsonDict, key: str) -> str | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{key} must be a string or None")
+    return value
+
+
+def _json_int(data: JsonDict, key: str) -> int:
+    value = data.get(key)
+    if type(value) is not int:
+        raise TypeError(f"{key} must be an integer")
+    return value
+
+
+def _json_float(data: JsonDict, key: str) -> float:
+    value = data.get(key)
+    if type(value) is int or type(value) is float:
+        return float(value)
+    raise TypeError(f"{key} must be a number")
+
+
+def _json_optional_float(data: JsonDict, key: str) -> float | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if type(value) is int or type(value) is float:
+        return float(value)
+    raise TypeError(f"{key} must be a number or None")
+
+
+def _json_dict(data: JsonDict, key: str) -> JsonDict:
+    value = data.get(key)
+    if not isinstance(value, dict):
+        raise TypeError(f"{key} must be a dictionary")
+    return cast(JsonDict, value)
+
+
+def _json_dict_list(data: JsonDict, key: str) -> list[JsonDict]:
+    value = data.get(key)
+    if not isinstance(value, list):
+        raise TypeError(f"{key} must be a list")
+    result: list[JsonDict] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise TypeError(f"{key} must contain dictionaries")
+        result.append(cast(JsonDict, item))
+    return result
+
+
+def _capture_interface_to_dict(interface: CaptureInterface) -> JsonDict:
+    return {
+        "interface_id": interface.interface_id,
+        "link_type": interface.link_type,
+        "snap_len": interface.snap_len,
+        "timestamp_resolution_seconds": interface.timestamp_resolution_seconds,
+    }
+
+
+def _capture_interface_from_dict(data: JsonDict) -> CaptureInterface:
+    return CaptureInterface(
+        interface_id=_json_int(data, "interface_id"),
+        link_type=_json_int(data, "link_type"),
+        snap_len=_json_int(data, "snap_len"),
+        timestamp_resolution_seconds=_json_float(data, "timestamp_resolution_seconds"),
+    )
+
+
+def _capture_metadata_to_dict(metadata: CaptureMetadata) -> JsonDict:
+    return {
+        "source": metadata.source,
+        "file_size_bytes": metadata.file_size_bytes,
+        "packet_count": metadata.packet_count,
+        "capture_duration_seconds": metadata.capture_duration_seconds,
+        "interfaces_seen": [_capture_interface_to_dict(interface) for interface in metadata.interfaces_seen],
+    }
+
+
+def _capture_metadata_from_dict(data: JsonDict) -> CaptureMetadata:
+    return CaptureMetadata(
+        source=_json_str(data, "source"),
+        file_size_bytes=_json_int(data, "file_size_bytes"),
+        packet_count=_json_int(data, "packet_count"),
+        capture_duration_seconds=_json_optional_float(data, "capture_duration_seconds"),
+        interfaces_seen=tuple(
+            _capture_interface_from_dict(interface) for interface in _json_dict_list(data, "interfaces_seen")
+        ),
+    )
+
+
+def _endpoint_summary_to_dict(endpoint: EndpointSummary) -> JsonDict:
+    return {
+        "address": endpoint.address,
+        "packet_count": endpoint.packet_count,
+    }
+
+
+def _device_summary_to_dict(device: DeviceSummary) -> JsonDict:
+    return {
+        "device_id": device.device_id,
+        "bus_num": device.bus_num,
+        "dev_num": device.dev_num,
+        "packet_count": device.packet_count,
+        "endpoints_seen": [_endpoint_summary_to_dict(endpoint) for endpoint in device.endpoints_seen],
+        "transfer_types_seen": list(device.transfer_types_seen),
+        "vendor_id": device.vendor_id,
+        "product_id": device.product_id,
+        "manufacturer": device.manufacturer,
+        "product": device.product,
+        "descriptor_summary": device.descriptor_summary,
+        "device_class": device.device_class,
+        "interface_class": device.interface_class,
+    }
+
+
+def _urb_record_to_dict(index: int, record: UrbRecord) -> JsonDict:
+    packet = _packet_record(index, record)
+    return {
+        "index": index,
+        "urb_id": record.urb_id,
+        "event_type": record.event_type,
+        "transfer_type": record.transfer_type,
+        "direction": record.direction,
+        "device_id": packet.device_id,
+        "bus_num": record.bus_num,
+        "dev_num": record.dev_num,
+        "endpoint_address": packet.endpoint_address,
+        "endpoint_number": record.endpoint,
+        "status": record.status,
+        "length": record.length,
+        "captured_length": record.captured_length,
+        "data_length": len(record.data),
+        "data_preview": _data_preview(record.data),
+        "data_hex": record.data.hex(),
+        "setup_hex": record.setup.hex() if record.setup is not None else None,
+        "timestamp": record.timestamp,
+    }
+
+
+def _urb_record_from_dict(data: JsonDict) -> UrbRecord:
+    return UrbRecord(
+        urb_id=_json_int(data, "urb_id"),
+        event_type=_event_type_from_json(_json_str(data, "event_type")),
+        transfer_type=_transfer_type_from_json(_json_str(data, "transfer_type")),
+        direction=_direction_from_json(_json_str(data, "direction")),
+        bus_num=_json_int(data, "bus_num"),
+        dev_num=_json_int(data, "dev_num"),
+        endpoint=_json_int(data, "endpoint_number"),
+        status=_json_int(data, "status"),
+        length=_json_int(data, "length"),
+        captured_length=_json_int(data, "captured_length"),
+        data=bytes.fromhex(_json_str(data, "data_hex")),
+        setup=_optional_bytes_from_hex(_json_optional_str(data, "setup_hex")),
+        timestamp=_json_float(data, "timestamp"),
+    )
+
+
+def _event_type_from_json(value: str) -> EventType:
+    if value in ("submission", "completion", "error"):
+        return value
+    raise ValueError(f"invalid event_type {value!r}")
+
+
+def _transfer_type_from_json(value: str) -> TransferType:
+    if value in ("control", "bulk", "interrupt"):
+        return value
+    raise ValueError(f"invalid transfer_type {value!r}")
+
+
+def _direction_from_json(value: str) -> Direction:
+    if value in ("in", "out"):
+        return value
+    raise ValueError(f"invalid direction {value!r}")
+
+
+def _optional_bytes_from_hex(value: str | None) -> bytes | None:
+    if value is None:
+        return None
+    return bytes.fromhex(value)
 
 
 def _validate_capture_path(path: Path) -> Path:
@@ -1001,6 +1286,21 @@ class USBEndpoint:
     number: int
     packet_count: int
 
+    def to_dict(self) -> JsonDict:
+        """Return a JSON-safe representation of this endpoint."""
+        return {
+            "number": self.number,
+            "packet_count": self.packet_count,
+        }
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> USBEndpoint:
+        """Build an endpoint from a JSON-safe dictionary."""
+        return cls(
+            number=_json_int(data, "number"),
+            packet_count=_json_int(data, "packet_count"),
+        )
+
 
 @dataclass
 class USBDevice:
@@ -1010,12 +1310,44 @@ class USBDevice:
     dev_num: int
     endpoints: list[USBEndpoint]
 
+    def to_dict(self) -> JsonDict:
+        """Return a JSON-safe representation of this device."""
+        return {
+            "bus_num": self.bus_num,
+            "dev_num": self.dev_num,
+            "endpoints": [endpoint.to_dict() for endpoint in self.endpoints],
+        }
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> USBDevice:
+        """Build a device from a JSON-safe dictionary."""
+        return cls(
+            bus_num=_json_int(data, "bus_num"),
+            dev_num=_json_int(data, "dev_num"),
+            endpoints=[USBEndpoint.from_dict(endpoint) for endpoint in _json_dict_list(data, "endpoints")],
+        )
+
 
 @dataclass
 class _CliMarker:
     name: str
     packet_index: int
     note: str = ""
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "name": self.name,
+            "packet_index": self.packet_index,
+            "note": self.note,
+        }
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> _CliMarker:
+        return cls(
+            name=_json_str(data, "name"),
+            packet_index=_json_int(data, "packet_index"),
+            note=_json_str(data, "note"),
+        )
 
 
 def _new_cli_marker_list() -> list[_CliMarker]:
@@ -1040,3 +1372,29 @@ class CaptureSession:
             note: Optional analyst note describing the marked event.
         """
         self.markers.append(_CliMarker(name=name, packet_index=packet_index, note=note))
+
+    def to_dict(self) -> JsonDict:
+        """Return a JSON-safe representation of this capture session."""
+        return {
+            "filepath": self.filepath,
+            "devices": [device.to_dict() for device in self.devices],
+            "packets": [],
+            "packet_count": self.packet_count,
+            "markers": [marker.to_dict() for marker in self.markers],
+            "summary": {
+                "device_count": len(self.devices),
+                "packet_count": self.packet_count,
+                "marker_count": len(self.markers),
+                "endpoint_count": sum(len(device.endpoints) for device in self.devices),
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> CaptureSession:
+        """Build a capture session from a JSON-safe dictionary."""
+        return cls(
+            filepath=_json_str(data, "filepath"),
+            devices=[USBDevice.from_dict(device) for device in _json_dict_list(data, "devices")],
+            packet_count=_json_int(data, "packet_count"),
+            markers=[_CliMarker.from_dict(marker) for marker in _json_dict_list(data, "markers")],
+        )

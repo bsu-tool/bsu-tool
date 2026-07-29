@@ -276,8 +276,7 @@ Update `add_marker()` so marker names are unique within a capture session.
 Suggested behavior:
 
 ```python
-def add_marker(self, name: str, packet_index: int, note: str = "") -> None:
-    ...
+def add_marker(self, name: str, packet_index: int, note: str = "") -> None: ...
 ```
 
 Raise `ValueError` if the marker name already exists.

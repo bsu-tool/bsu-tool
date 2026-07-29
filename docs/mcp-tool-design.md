@@ -307,11 +307,7 @@ Initial error codes:
 Example usage:
 
 ```python
-load_capture(
-    path="/captures/device_trace.pcapng",
-    force_reload=False,
-    assume_format="auto"
-)
+load_capture(path="/captures/device_trace.pcapng", force_reload=False, assume_format="auto")
 ```
 
 Example `structuredContent.data`:
@@ -569,7 +565,7 @@ get_packets(
     offset=0,
     limit=100,
     include_data_preview=True,
-    data_preview_bytes=32
+    data_preview_bytes=32,
 )
 ```
 
@@ -647,9 +643,7 @@ Example usage:
 
 ```python
 mark_session_marker(
-    name="suspected_runtime_loop",
-    packet_index=421,
-    note="Possible start of repeated runtime communication."
+    name="suspected_runtime_loop", packet_index=421, note="Possible start of repeated runtime communication."
 )
 ```
 
@@ -682,10 +676,7 @@ Likely output:
 Example usage:
 
 ```python
-list_session_markers(
-    offset=0,
-    limit=100
-)
+list_session_markers(offset=0, limit=100)
 ```
 
 ---
@@ -718,10 +709,7 @@ Likely output:
 Example usage:
 
 ```python
-list_endpoints(
-    device_id="dev_01",
-    include_ep0=True
-)
+list_endpoints(device_id="dev_01", include_ep0=True)
 ```
 
 ---
@@ -754,11 +742,7 @@ Likely output:
 Example usage:
 
 ```python
-get_control_transfer_details(
-    packet_index=12,
-    include_descriptor_decode=True,
-    include_paired_event=True
-)
+get_control_transfer_details(packet_index=12, include_descriptor_decode=True, include_paired_event=True)
 ```
 
 ---
@@ -787,11 +771,7 @@ Likely output:
 Example usage:
 
 ```python
-infer_traffic_phase(
-    device_id="dev_01",
-    method="heuristic_v1",
-    include_reasons=True
-)
+infer_traffic_phase(device_id="dev_01", method="heuristic_v1", include_reasons=True)
 ```
 
 ---
@@ -825,10 +805,7 @@ Example usage:
 
 ```python
 summarize_device_activity(
-    device_id="dev_01",
-    traffic_phase="any",
-    include_repeated_payload_previews=False,
-    top_n_previews=10
+    device_id="dev_01", traffic_phase="any", include_repeated_payload_previews=False, top_n_previews=10
 )
 ```
 
@@ -914,11 +891,7 @@ load_capture(path="/captures/device_trace.pcapng")
 
 list_devices(include_descriptor_summary=True)
 
-get_packets(
-    device_id="dev_01",
-    limit=40,
-    include_data_preview=True
-)
+get_packets(device_id="dev_01", limit=40, include_data_preview=True)
 
 get_packets(
     device_id="dev_01",
@@ -928,53 +901,32 @@ get_packets(
     urb_event="complete",
     offset=0,
     limit=100,
-    include_data_preview=True
+    include_data_preview=True,
 )
 ```
 
 ## Extended workflow if supporting tools are available
 
 ```python
-list_endpoints(
-    device_id="dev_01",
-    include_ep0=True
-)
+list_endpoints(device_id="dev_01", include_ep0=True)
 
-infer_traffic_phase(
-    device_id="dev_01",
-    method="heuristic_v1",
-    include_reasons=True
-)
+infer_traffic_phase(device_id="dev_01", method="heuristic_v1", include_reasons=True)
 
 get_packets(
-    device_id="dev_01",
-    transfer_type="control",
-    traffic_phase="enumeration",
-    limit=40,
-    include_setup_summary=True
+    device_id="dev_01", transfer_type="control", traffic_phase="enumeration", limit=40, include_setup_summary=True
 )
 
-get_control_transfer_details(
-    packet_index=12,
-    include_descriptor_decode=True
-)
+get_control_transfer_details(packet_index=12, include_descriptor_decode=True)
 
 mark_session_marker(
     name="suspected_runtime_loop",
     packet_index=421,
     device_id="dev_01",
     note="Possible start of repeated runtime communication.",
-    tags=["hypothesis", "runtime"]
+    tags=["hypothesis", "runtime"],
 )
 
-list_session_markers(
-    device_id="dev_01",
-    tag="runtime"
-)
+list_session_markers(device_id="dev_01", tag="runtime")
 
-summarize_device_activity(
-    device_id="dev_01",
-    traffic_phase="any",
-    include_repeated_payload_previews=False
-)
+summarize_device_activity(device_id="dev_01", traffic_phase="any", include_repeated_payload_previews=False)
 ```

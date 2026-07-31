@@ -257,10 +257,11 @@ to captured packet sequences ("these 3 packets always appear within 2 seconds of
 
 ### 4.1 Command/Response Pairing
 
-A **command/response pair** links an OUT transaction (host→device) to the IN transaction
-(device→host) that follows it on the same device and endpoint number. This is a
-best-effort label for common Bulk/Interrupt runtime traffic; the full pattern detector
-still preserves multi-step and cross-endpoint sequences through `CommandPattern.steps`.
+A **command/response pair** links an OUT analysis event (host→device) derived from one
+`UrbTransaction` to a later IN analysis event (device→host) derived from a separate
+`UrbTransaction` on the same device and endpoint number. This is a best-effort label for
+common Bulk/Interrupt runtime traffic; the full pattern detector still preserves
+multi-step and cross-endpoint sequences through `CommandPattern.steps`.
 
 The engine must start from the existing `UrbTransaction` objects created by
 `pair_urbs()`. It must not rebuild submit/complete pairs with a FIFO queue because USB
@@ -271,17 +272,28 @@ URB id, including orphan submissions and orphan completions.
 **Algorithm:**
 
 For each endpoint lane, process available `UrbTransaction` objects in timestamp order:
-1. Convert each transaction into an analysis event using the submission record for direction
-   and the completion record for status and payload data.
+1. Convert each transaction into zero or one payload-bearing analysis event:
+   - For OUT transfers, use the submission record as the command payload evidence.
+   - For IN transfers, use the completion record as the response payload evidence.
+   - Carry completion/error status into the event when a matching completion/error exists.
+   - If the needed payload-bearing side is missing, record an `IncompleteTransfer` and do
+     not promote the transaction directly into a protocol-level command or response.
 2. Keep failed transactions visible to this pass so retries and failed responses affect
    timing and notes, even if they are not promoted into successful command patterns.
-3. When a transaction's submission is an OUT event and its completion is an IN event on
-   the same endpoint lane, record it as a likely command/response pair.
-4. If a transaction has an orphan completion with no matching submission, record it as an
-   **unsolicited response** unless it is explained by a failed transaction.
-5. If a transaction has an orphan submission with no matching completion within the
+3. When a successful OUT analysis event is followed by a successful IN analysis event on
+   the same endpoint lane within the configurable timeout window, record those separate
+   events as a likely command/response pair.
+4. If an IN analysis event has no preceding compatible OUT analysis event within the
+   protocol pairing window, record it as an **unsolicited response** unless it is explained
+   by failed traffic or an incomplete transfer at a capture boundary.
+5. If an OUT analysis event has no following compatible IN analysis event within the
    configurable timeout window, record it as an **unanswered command** unless it is
-   explained by a failed transaction.
+   explained by failed traffic or an incomplete transfer at a capture boundary.
+
+The engine must not classify a transaction as a command/response pair because its own
+submission and completion have opposite directions. A single `UrbTransaction` represents one
+URB id lifecycle, while command/response inference is a protocol-level relationship between
+separate directional analysis events.
 
 **Endpoint scope:** pairing is scoped by device and endpoint number. An OUT on endpoint
 `0x01` may pair with an IN on endpoint `0x81` because both refer to endpoint number 1
@@ -315,6 +327,7 @@ class ProtocolHypothesis:
     observations: tuple[AnalysisObservation, ...]
     unsolicited_responses: tuple[UnsolicitedResponse, ...]
     unanswered_commands: tuple[UnansweredCommand, ...]
+    incomplete_transfers: tuple[IncompleteTransfer, ...]
     marker_correlations: tuple[MarkerCorrelation, ...]
     result_limits: ResultLimits
     analysis_notes: tuple[str, ...]         # free-text warnings from the engine
@@ -430,7 +443,24 @@ class UnansweredCommand:
     payload_signature: tuple[int | None, ...]
 ```
 
-### 5.10 `MarkerCorrelation`
+### 5.10 `IncompleteTransfer`
+
+```python
+@dataclass(frozen=True)
+class IncompleteTransfer:
+    endpoint_number: int
+    endpoint_address: str
+    direction: Direction
+    transfer_type: TransferType
+    reason: Literal["orphan_submission", "orphan_completion", "missing_payload_side"]
+    occurrence_count: int
+```
+
+Incomplete transfers report neutral capture-boundary or malformed-lifecycle evidence from
+`UrbTransaction` pairing. They can help explain missing protocol pairs, but they are not
+themselves sufficient evidence for `UnsolicitedResponse` or `UnansweredCommand`.
+
+### 5.11 `MarkerCorrelation`
 
 ```python
 @dataclass(frozen=True)
@@ -446,7 +476,7 @@ class MarkerCorrelation:
 `CommandPattern` references it by `marker_correlation_id` so marker names and percentages
 cannot disagree across two output locations.
 
-### 5.11 MCP Tool Output
+### 5.12 MCP Tool Output
 
 The engine result is returned from a new MCP tool `analyze_protocol`. The tool accepts an
 optional `device_id` filter. If `device_id` is omitted, it returns one
@@ -470,8 +500,10 @@ JSON and uses it to draft a human-readable protocol description.
 | One packet for normalization | All bytes treated as fixed; no variable byte detection |
 | Sub-pattern has same count as parent | Drop shorter sub-pattern as redundant |
 | Sub-pattern occurs more than parent | Keep both; shorter pattern may represent optional protocol steps |
-| OUT with no IN response | Recorded as `UnansweredCommand`; not treated as error |
-| IN with no preceding OUT | Recorded as `UnsolicitedResponse`; device may be pushing status |
+| OUT analysis event with no following IN response candidate | Recorded as `UnansweredCommand`; not treated as error |
+| IN analysis event with no preceding OUT candidate | Recorded as `UnsolicitedResponse`; device may be pushing status |
+| Orphan submission | Recorded as `IncompleteTransfer`; does not by itself imply an unanswered protocol command |
+| Orphan completion | Recorded as `IncompleteTransfer`; does not by itself imply an unsolicited protocol response |
 | OUT and IN use same endpoint number with opposite directions | Pair as likely command/response, e.g. `0x01` OUT and `0x81` IN |
 | OUT and IN use different endpoint numbers | Preserve as separate endpoint-lane patterns or `AnalysisObservation`; do not force into simple pair |
 | Background endpoint traffic interleaves with command traffic | Analyze per endpoint lane by default so unrelated polling does not contaminate n-gram windows |
@@ -525,7 +557,8 @@ human narrative. Expected assertions:
   requested Goodix device.
 - `result_limits` is present and reports the configured caps.
 - `command_patterns`, `observations`, `marker_correlations`, `analysis_notes`,
-  `unsolicited_responses`, and `unanswered_commands` are present even when empty.
+  `unsolicited_responses`, `unanswered_commands`, and `incomplete_transfers` are present
+  even when empty.
 - every returned `CommandPattern` has at least one `PatternStep`, no more than
   `MAX_SEQUENCE_WINDOW` steps, and JSON-safe payload signatures.
 - if result caps are exceeded, truncation flags and a truncation note are present.

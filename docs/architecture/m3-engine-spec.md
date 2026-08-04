@@ -35,7 +35,7 @@ class Capture:
     source: Path
     metadata: CaptureMetadata
     packets: tuple[CapturePacket, ...]   # raw pcap packets (not used by engine)
-    records: tuple[UrbRecord, ...]        # decoded URBs, one per packet
+    records: tuple[UrbRecord, ...]        # decoded URBs; may be fewer than packets
     transactions: tuple[UrbTransaction, ...]  # paired submission+completion URB pairs
     markers: list[Marker]                 # analyst-placed named timestamps
 ```
@@ -95,8 +95,8 @@ The preprocessing layer has five goals:
    individual IN/OUT records that carry payload data, so multi-step sequences can be
    compared one token at a time.
 4. **Group comparable events:** group by device, endpoint number, direction, transfer type,
-   and payload length. Endpoint number and direction stay separate because decoded
-   `UrbRecord` already stores them separately.
+   header discriminator, and payload length. Endpoint number and direction stay separate
+   because decoded `UrbRecord` already stores them separately.
 5. **Classify payload bytes:** within each group, identify fixed bytes that define command
    identity and variable bytes that likely represent arguments, counters, checksums, or
    response data.
@@ -112,13 +112,16 @@ benefiting from the URB pairing done earlier.
 A **token** is the normalized representation of one analysis event. It is a tuple:
 
 ```
-Token = (endpoint_number, direction, transfer_type, payload_signature)
+Token = (endpoint_number, direction, transfer_type, signature_mode, payload_signature)
 ```
 
 Where:
 - `endpoint_number` — bare endpoint number from `UrbRecord.endpoint` (`0` through `15`)
 - `direction` — `"in"` or `"out"`
 - `transfer_type` — `"bulk"` or `"interrupt"`
+- `signature_mode` — `"full"` for exact-length signatures, `"prefix"` for fallback
+  signatures across observed lengths, or `"full_prefix"` when header discrimination is
+  disabled and the first prefix bytes are kept literal
 - `payload_signature` — see §2.3
 
 The composite USB address form (`0x01` for OUT endpoint 1, `0x81` for IN endpoint 1) is
@@ -130,54 +133,117 @@ use composite endpoint strings as internal identity.
 The payload signature identifies the structural identity of a packet independent of
 variable fields. It is constructed as follows:
 
-**Step 1 — Length bucketing.**
-Packets with different lengths are always different tokens. Length is part of the
-signature: `len(data)`.
+**Step 1 — Header discriminator.**
+Treat the first `HEADER_ID_BYTES` bytes of non-empty payloads as a provisional message
+discriminator. The default is 1 byte because the Goodix reference captures show byte 0 is a
+stable opcode echoed in responses. Primary normalization groups are:
 
-**Step 2 — Fixed vs. variable byte detection.**
-For a group of packets sharing the same endpoint, direction, and length, compare byte
-positions across all packets:
+```
+(device_id, endpoint_number, direction, transfer_type, header, len(data))
+```
+
+The header discriminator prevents unrelated same-length messages from collapsing into one
+over-broad token before fixed/variable byte detection runs.
+
+**Step 2 — Length-aware full signatures.**
+Within each primary group, packets with the same header and length can produce a `"full"`
+signature. Length is represented in `PatternStep.observed_length_range` rather than embedded
+inside `payload_signature`, so variable-size instances of the same message type can still be
+reported coherently by fallback signatures.
+
+**Step 3 — Fixed vs. variable byte detection.**
+For a primary group of packets sharing device, endpoint number, direction, transfer type,
+header, and length, compare byte positions across all packets:
 - A byte position where all packets share the same value → **fixed byte** (part of identity)
 - A byte position where values differ across packets → **variable byte** (argument or counter)
 
 Fixed bytes are included in the signature as their literal value. Variable bytes are
 replaced with a `None` sentinel.
 
-**Step 3 — Signature representation.**
+**Step 4 — Signature representation.**
 The payload signature is a tuple of `int | None` values, one per byte position.
 
 Example: if three packets of length 4 have bytes `[0x01, 0x00, 0x05, 0xA1]`,
 `[0x01, 0x00, 0x07, 0xA3]`, and `[0x01, 0x00, 0x09, 0xA5]`, the signature is
 `(0x01, 0x00, None, None)` — bytes 0 and 1 are fixed, bytes 2 and 3 vary.
 
-**Step 4 — Minimum sample threshold.**
+**Step 5 — Minimum sample threshold.**
 Variable/fixed classification supports a provisional two-sample mode. With **2 packets**
-in the same endpoint+direction+length group, byte positions that differ are treated as
-variable and byte positions that match are treated as fixed. With **3 or more packets**,
-the same rule becomes more reliable because there are enough samples to distinguish
-stable identity bytes from counters, checksums, or arguments with less risk of overfitting.
-This prevents commands seen exactly twice from disappearing simply because one byte varies.
-The threshold is a named constant and can be tuned.
+in the same primary group, byte positions that differ are treated as variable and byte
+positions that match are treated as fixed. With **3 or more packets**, the same rule becomes
+more reliable because there are enough samples to distinguish stable identity bytes from
+counters, checksums, or arguments with less risk of overfitting. This prevents commands seen
+exactly twice from disappearing simply because one byte varies. The threshold is a named
+constant and can be tuned.
+
+**Step 6 — Prefix fallback across lengths.**
+If a `(device_id, endpoint_number, direction, transfer_type, header, len(data))` group has
+fewer than `MIN_NORMALIZATION_SAMPLE_COUNT` samples, re-pool candidate events across lengths
+under:
+
+```
+(device_id, endpoint_number, direction, transfer_type, header)
+```
+
+For these under-sampled groups, classify only the first `PREFIX_SIGNATURE_BYTES` payload
+bytes and emit a `"prefix"` signature. The output records the observed minimum and maximum
+payload lengths in `PatternStep.observed_length_range`. This keeps repeated message types
+visible when a driver chunks the same logical message at different read sizes.
+
+**Step 7 — Header safety valves.**
+The header discriminator is provisional. It can fail in either direction:
+- If a lane's byte-0 cardinality is 1, or below `HEADER_CARDINALITY_FLOOR` relative to the
+  number of distinct payloads, byte 0 may be a sync/framing byte with no useful
+  discrimination.
+- If a lane has too many distinct byte-0 values relative to its packet count, byte 0 may be
+  data rather than an opcode.
+
+When the initial header is too weak, widen the discriminator up to `MAX_HEADER_ID_BYTES`
+until cardinality reaches the floor. If widening still does not produce a useful
+discriminator, fall back to `"full_prefix"` signatures grouped by
+`(device_id, endpoint_number, direction, transfer_type, len(data))`: keep the first
+`PREFIX_SIGNATURE_BYTES` literal bytes with no variable-byte masking, and add an
+`analysis_notes` entry explaining that header discrimination was disabled because the
+candidate header was non-discriminating.
+
+When the initial header is too noisy, meaning
+`distinct_headers > packet_count * HEADER_CARDINALITY_FRACTION_LIMIT`, fall back to the same
+`"full_prefix"` mode and add an `analysis_notes` entry explaining that header
+discrimination was disabled because byte-0 cardinality was too high.
 
 ### 2.4 When Normalization Runs
 
 Normalization is a two-pass process:
-1. **First pass:** collect all packets per (endpoint, direction, length) group, compute
-   variable byte positions
+1. **First pass:** collect all analysis events per full group
+   `(device_id, endpoint_number, direction, transfer_type, header, len(data))`, apply the
+   header safety valve, and compute variable byte positions for full/prefix groups or literal
+   prefix bytes for `full_prefix` groups
 2. **Second pass:** assign each analysis event its token using the variable map from pass 1
 
 ### 2.5 Determinism Guarantee
 
-A token's `payload_signature` is computed only from packets sharing its
-`(device_id, endpoint_number, direction, transfer_type, len(data))` group, processed in
-ascending capture order. The variable-byte map is therefore a pure function of that group.
-Two runs over the same capture always produce identical signatures.
+A token's `payload_signature` is computed only from analysis events sharing its full group
+`(device_id, endpoint_number, direction, transfer_type, header, len(data))`, its prefix
+fallback group `(device_id, endpoint_number, direction, transfer_type, header)`, or its
+header-disabled full-prefix group `(device_id, endpoint_number, direction, transfer_type,
+len(data))`, processed in ascending capture order. The variable-byte map or literal prefix
+map is therefore a pure function of that selected group. Two runs over the same capture
+always produce identical signatures.
 
-Two captures of the same device produce identical signatures for a command when that
-command's group has the same fixed and variable byte positions in both captures. Truncating
-a capture only changes a signature when the truncation removes packets from that command's
-own group. Packets on other endpoints, other devices, or other payload lengths do not
-affect the signature.
+Two captures of the same device should produce the same signature for the same command when
+that command's selected normalization group has the same fixed and variable byte positions in
+both captures. This stability is desirable because it lets analysts compare repeated
+behavior across captures. If unrelated commands produce the same signature, that is an
+over-merging failure and should be avoided by narrower grouping or reported through
+`analysis_notes`. Truncating a capture only changes a signature when the truncation removes
+packets from that command's own full, prefix, or full-prefix group. Packets on other
+endpoints, other devices, other transfer types, or other active header groups do not affect
+the signature.
+
+Message reassembly is a non-goal for the first implementation pass. Continuation reads such
+as fixed-opcode chunks split across multiple IN transfers should remain visible through
+prefix signatures and observed length ranges, but the engine does not reconstruct a larger
+logical application message from multiple URBs.
 
 ---
 
@@ -376,7 +442,9 @@ class PatternStep:
     endpoint_address: str                   # display address, e.g. "0x01" or "0x81"
     direction: Direction                    # "in" or "out"
     transfer_type: TransferType             # "bulk" or "interrupt"
+    signature_mode: Literal["full", "prefix", "full_prefix"]
     payload_signature: tuple[int | None, ...] # None = variable byte
+    observed_length_range: tuple[int, int]   # inclusive min/max len(data)
     variable_byte_ranges: tuple[VariableByteRange, ...]
 ```
 
@@ -428,6 +496,12 @@ class UnsolicitedResponse:
     endpoint_address: str
     transfer_type: TransferType
     occurrence_count: int
+    first_occurrence_index: int
+    last_occurrence_index: int
+    first_occurrence_timestamp: float
+    last_occurrence_timestamp: float
+    signature_mode: Literal["full", "prefix", "full_prefix"]
+    observed_length_range: tuple[int, int]
     payload_signature: tuple[int | None, ...]
 ```
 
@@ -440,6 +514,12 @@ class UnansweredCommand:
     endpoint_address: str
     transfer_type: TransferType
     occurrence_count: int
+    first_occurrence_index: int
+    last_occurrence_index: int
+    first_occurrence_timestamp: float
+    last_occurrence_timestamp: float
+    signature_mode: Literal["full", "prefix", "full_prefix"]
+    observed_length_range: tuple[int, int]
     payload_signature: tuple[int | None, ...]
 ```
 
@@ -498,6 +578,10 @@ JSON and uses it to draft a human-readable protocol description.
 | Sequence seen only once | Not reported as a `CommandPattern`; may be reported as `AnalysisObservation` if marker-adjacent or a long OUT/IN exchange |
 | Two packets for normalization | Differing byte positions are provisionally treated as variable so twice-seen commands can still match |
 | One packet for normalization | All bytes treated as fixed; no variable byte detection |
+| Same header appears at multiple payload lengths | Use prefix fallback for under-sampled exact-length groups; report `observed_length_range` |
+| Byte-0 cardinality is too low for a lane | Widen the header discriminator up to `MAX_HEADER_ID_BYTES`; if still non-discriminating, use `full_prefix` mode and emit an `analysis_notes` warning |
+| Byte-0 cardinality is too high for a lane | Disable header discrimination for that lane, use `full_prefix` mode, and emit an `analysis_notes` warning |
+| Multi-URB continuation message | Do not reassemble in the first pass; preserve chunks as analysis events with prefix signatures where needed |
 | Sub-pattern has same count as parent | Drop shorter sub-pattern as redundant |
 | Sub-pattern occurs more than parent | Keep both; shorter pattern may represent optional protocol steps |
 | OUT analysis event with no following IN response candidate | Recorded as `UnansweredCommand`; not treated as error |
@@ -522,6 +606,11 @@ All tunable values are named constants in the engine module (not magic numbers):
 
 | Constant | Default | Meaning |
 |----------|---------|---------|
+| `HEADER_ID_BYTES` | 1 | Number of leading payload bytes used as a provisional message discriminator |
+| `MAX_HEADER_ID_BYTES` | 4 | Maximum leading payload bytes to try when widening a non-discriminating header |
+| `HEADER_CARDINALITY_FLOOR` | 2 | Minimum distinct header values needed before treating a candidate header as discriminating |
+| `PREFIX_SIGNATURE_BYTES` | 8 | Number of leading payload bytes classified for prefix fallback signatures |
+| `HEADER_CARDINALITY_FRACTION_LIMIT` | 0.5 | Disable header discrimination for a lane when distinct headers exceed this fraction of lane packets |
 | `MIN_NORMALIZATION_SAMPLE_COUNT` | 2 | Minimum packets needed for provisional variable-byte detection |
 | `MAX_SEQUENCE_WINDOW` | 8 | Maximum token sequence length to search for; configurable per analysis run |
 | `MIN_OCCURRENCE_COUNT` | 2 | Minimum occurrences for a pattern to be reported |
@@ -560,7 +649,10 @@ human narrative. Expected assertions:
   `unsolicited_responses`, `unanswered_commands`, and `incomplete_transfers` are present
   even when empty.
 - every returned `CommandPattern` has at least one `PatternStep`, no more than
-  `MAX_SEQUENCE_WINDOW` steps, and JSON-safe payload signatures.
+  `MAX_SEQUENCE_WINDOW` steps, JSON-safe payload signatures, `signature_mode`, and
+  `observed_length_range`.
+- `UnsolicitedResponse` and `UnansweredCommand` entries include first/last occurrence
+  indices and timestamps so analysts can locate the evidence in the capture.
 - if result caps are exceeded, truncation flags and a truncation note are present.
 
 ---

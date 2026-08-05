@@ -69,6 +69,33 @@ The engine operates only on:
 
 Isochronous transfers are excluded at load time and never reach the engine.
 
+### 1.3 Device Context Input
+
+The engine accepts a `DeviceContext` for each device under analysis. Required within the
+analyzers input to strengthen the protocol inference.
+
+```python
+@dataclass(frozen=True)
+class DeviceContext:
+    device_id: str
+    vendor_id: int | None
+    product_id: int | None
+    manufacturer: str | None
+    product: str | None
+    device_class: int | None
+    interfaces: tuple[InterfaceContext, ...] # for the class/subclass/protocol per interface
+    endpoints: tuple[EndpointContext, ...]   # address, direction, transfer type,
+                                             # wMaxPacketSize, bInterval
+                                             # for example: "CH340 USB-serial bridge",
+                                             # "binds kernel driver ch341:
+
+    known_properties: tuple[Str, ...]
+```
+
+`DeviceContext` is built from decoded enumeration descriptors that our `Session.get_enumeration()` 
+already recovers. When a capture does not contain enumeration traffic, context is partial and the 
+engine must emit `analysis_note` saying so and naming which fields were unavailable.
+
 ---
 
 ## 2. Token Normalization
@@ -233,8 +260,12 @@ always produce identical signatures.
 Two captures of the same device should produce the same signature for the same command when
 that command's selected normalization group has the same fixed and variable byte positions in
 both captures. This stability is desirable because it lets analysts compare repeated
-behavior across captures. If unrelated commands produce the same signature, that is an
-over-merging failure and should be avoided by narrower grouping or reported through
+behavior across captures. A command with enough samples at one length in capture A but split
+across lengths in capture B can legitimately classify as `"full"` in one capture and `"prefix"` 
+in the other, producing different signatures for the same physical command. `signature_mode` 
+makes this explicit rather than silent, and cross-capture comparison in that case should use 
+only the first `PREFIX_SIGNATURE_BYTES` bytes. If unrelated commands produce the same signature, 
+that is an over-merging failure and should be avoided by narrower grouping or reported through
 `analysis_notes`. Truncating a capture only changes a signature when the truncation removes
 packets from that command's own full, prefix, or full-prefix group. Packets on other
 endpoints, other devices, other transfer types, or other active header groups do not affect
@@ -292,7 +323,8 @@ discarded silently either.
 Single-occurrence sequences are reported as `AnalysisObservation` objects when they meet
 one of these criteria:
 - The sequence occurs within the marker correlation window of an analyst marker.
-- The sequence is a multi-step exchange that does not repeat but contains at least `MIN_OBSERVATION_STEPS` steps with both OUT and IN traffic on the same device.
+- The sequence is a multi-step exchange that does not repeat but contains at least
+  `MIN_OBSERVATION_STEPS` steps with both OUT and IN traffic on the same device.
 
 This keeps the main `command_patterns` list focused on repeated evidence while preserving
 important one-time behavior for analyst review.
@@ -370,14 +402,19 @@ If a device sends commands and responses on different endpoint numbers, those ev
 not forced into a simple command/response pair. They remain visible as separate endpoint
 lane patterns or as `AnalysisObservation` entries for analyst review.
 
-### 4.2 Control Transfer Exclusion
+### 4.2 Control Transfer Handling
 
-Control transactions (endpoint 0, used for enumeration and device setup) are excluded
-from runtime command/response pairing and repeated pattern detection. Descriptor-related
-control traffic is already summarized through `list_devices`. If later validation shows
-vendor-specific devices use post-enumeration control transfers for meaningful commands,
-that can be added as a separate analyzer mode rather than mixed into the default
-Bulk/Interrupt workflow.
+Standard Control transfers (enumeration and device setup) are excluded from runtime
+command/response pairing and repeated pattern detection. They are summarized through
+`list_devices` and `DeviceContext`.
+
+Vendor-specific Control transfers (`bmRequestType` type field = vendor) that occur
+**after** enumeration are not protocol noise. For USB-serial bridges and similar
+devices they carry the vendor protocol itself. The engine must count them and report
+them in `analysis_notes`, for example: "14 vendor-specific control transfers seen
+after enumeration on ep0 (requests 0x9A, 0xA1, 0xA4); not included in pattern
+detection." Full analysis of vendor control transfers is deferred to a follow-up
+issue.
 
 ---
 
@@ -430,6 +467,9 @@ class CommandPattern:
     response_timing: ResponseTimingStats | None
     parent_pattern_id: str | None           # set only when retained as an optional sub-pattern
     marker_correlation_id: str | None       # references MarkerCorrelation.correlation_id
+    first_occurrence_timestamp: float       # capture time of 1st occurence
+    first_packet_index: int                 # index into Capture.records
+    low_confidence: bool                    # should be True when occurence_count == 2
 ```
 
 ### 5.4 `PatternStep`
@@ -565,8 +605,12 @@ If `device_id` is provided, it returns only that device's hypothesis.
 
 The MCP response must be machine-readable JSON. Dataclasses may be used internally, but
 the MCP wrapper should serialize the result through typed, JSON-friendly models following
-the existing pattern in `bsu_tool/mcp/interfaces.py`. Claude receives this structured
-JSON and uses it to draft a human-readable protocol description.
+the existing pattern in `bsu_tool/mcp/interfaces.py`. The response also includes the `DeviceContext`,
+so Claude can reason about the device and bytes in tandem. 
+
+**Division of labor for prose:** the engine emits a short, deterministic, snapshot-testable summary 
+(counts, pattern ids, headline finding). Claude receives this structured JSON and drafts the full 
+human-readable protocol description. The engine does not attempt narrative prose.
 
 ---
 
@@ -654,7 +698,21 @@ human narrative. Expected assertions:
 - `UnsolicitedResponse` and `UnansweredCommand` entries include first/last occurrence
   indices and timestamps so analysts can locate the evidence in the capture.
 - if result caps are exceeded, truncation flags and a truncation note are present.
+- Content assertions (these must fail on an empty or degenerate result):
+- at least one `CommandPattern` is returned for the Goodix device, with
+  `occurrence_count >= 2`
+- at least one returned `CommandPattern` has more than one `PatternStep`
+- no returned `payload_signature` is entirely `None` (an all-variable signature means
+  normalization erased the command identity)
+- the distinct token count is greater than 1% of the analysis event count (a tripwire
+  for the over-merge failure mode in §2.3)
 
+A second integration test, `tests/int/test_mcp_analyze_relay.py`, runs against the
+CH340 relay capture (to be committed):
+- the six-step toggle sequence is detected as a single `CommandPattern` with
+  `occurrence_count >= 2`
+- at least one `PatternStep` has a variable byte whose observed values include more
+  than one distinct value (the relay channel selector)
 ---
 
 ## Review Decisions
@@ -677,13 +735,3 @@ human narrative. Expected assertions:
    (marker-adjacent and multi-step exchange with `MIN_OBSERVATION_STEPS`) as sufficient
    for initial implementation. Additional computable rules should be defined only after
    validation against reference captures confirms meaningful observations are being dropped.
-
-## Open Questions for Team Review
-
-1. **Single-occurrence observations** — are the two proposed criteria for preserving
-   one-time handshakes enough, or should the team define additional computable rules
-   before implementation?
-
-2. **Control-transfer runtime commands** — should default analysis continue to exclude
-   all Control transfers, or should the engine include an optional mode for devices that
-   use vendor-specific Control transfers after enumeration?

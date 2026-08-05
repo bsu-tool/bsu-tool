@@ -18,7 +18,7 @@ objects already built by Milestone 1 and 2 infrastructure and writes results bac
 structured Python dataclasses that the MCP server can return to Claude.
 
 This is a spec-first issue. Implementation should start after the team reviews this
-document and resolves the open questions at the end.
+document. Earlier open questions are resolved in the Review Decisions at the end.
 
 ---
 
@@ -34,10 +34,10 @@ decoded — the engine does not re-read pcap-ng files.
 class Capture:
     source: Path
     metadata: CaptureMetadata
-    packets: tuple[CapturePacket, ...]   # raw pcap packets (not used by engine)
-    records: tuple[UrbRecord, ...]        # decoded URBs; may be fewer than packets
+    packets: tuple[CapturePacket, ...]  # raw pcap packets (not used by engine)
+    records: tuple[UrbRecord, ...]  # decoded URBs; may be fewer than packets
     transactions: tuple[UrbTransaction, ...]  # paired submission+completion URB pairs
-    markers: list[Marker]                 # analyst-placed named timestamps
+    markers: list[Marker]  # analyst-placed named timestamps
 ```
 
 Key fields per `UrbRecord`:
@@ -60,6 +60,11 @@ Key fields per `Marker`:
 - `packet_index` — index into `Capture.records` at time of marker placement
 - `note` — optional free-text annotation
 
+**Note on indices:** `records` is not one-per-packet. The decoder skips isochronous
+and malformed packets, so `len(records) <= len(packets)`. Analysis indices are
+positions in `records` and do **not** correspond to pcap frame numbers. Markers,
+`get_packet`, and `packets_between_markers` all index `records`.
+
 ### 1.2 Scope Restriction
 
 The engine operates only on:
@@ -71,8 +76,9 @@ Isochronous transfers are excluded at load time and never reach the engine.
 
 ### 1.3 Device Context Input
 
-The engine accepts a `DeviceContext` for each device under analysis. Required within the
-analyzers input to strengthen the protocol inference.
+The engine accepts a `DeviceContext` for each device under analysis. This is a
+required analyzer input, not an enrichment: protocol inference without knowing
+what the device is produces unanchored guesses.
 
 ```python
 @dataclass(frozen=True)
@@ -83,18 +89,17 @@ class DeviceContext:
     manufacturer: str | None
     product: str | None
     device_class: int | None
-    interfaces: tuple[InterfaceContext, ...] # for the class/subclass/protocol per interface
-    endpoints: tuple[EndpointContext, ...]   # address, direction, transfer type,
-                                             # wMaxPacketSize, bInterval
-                                             # for example: "CH340 USB-serial bridge",
-                                             # "binds kernel driver ch341:
-
-    known_properties: tuple[Str, ...]
+    interfaces: tuple[InterfaceContext, ...]  # class/subclass/protocol per interface
+    endpoints: tuple[EndpointContext, ...]  # address, direction, transfer type,
+    # wMaxPacketSize, bInterval
+    known_properties: tuple[str, ...]  # e.g. "CH340 USB-serial bridge",
+    # "binds kernel driver ch341"
 ```
 
-`DeviceContext` is built from decoded enumeration descriptors that our `Session.get_enumeration()` 
-already recovers. When a capture does not contain enumeration traffic, context is partial and the 
-engine must emit `analysis_note` saying so and naming which fields were unavailable.
+`DeviceContext` is built from decoded enumeration descriptors, which
+`Session.get_enumeration()` already recovers. When a capture does not contain
+enumeration traffic, context is partial and the engine must emit an
+`analysis_note` saying so and naming which fields were unavailable.
 
 ---
 
@@ -425,7 +430,7 @@ issue.
 ```python
 @dataclass(frozen=True)
 class ProtocolHypothesis:
-    device_id: str                          # e.g. "dev_001_003"
+    device_id: str  # e.g. "dev_001_003"
     command_patterns: tuple[CommandPattern, ...]
     observations: tuple[AnalysisObservation, ...]
     unsolicited_responses: tuple[UnsolicitedResponse, ...]
@@ -433,7 +438,7 @@ class ProtocolHypothesis:
     incomplete_transfers: tuple[IncompleteTransfer, ...]
     marker_correlations: tuple[MarkerCorrelation, ...]
     result_limits: ResultLimits
-    analysis_notes: tuple[str, ...]         # free-text warnings from the engine
+    analysis_notes: tuple[str, ...]  # free-text warnings from the engine
 ```
 
 ### 5.2 `ResultLimits`
@@ -461,15 +466,15 @@ the relevant `*_truncated` flag and include a short `truncation_note` in both
 ```python
 @dataclass(frozen=True)
 class CommandPattern:
-    pattern_id: str                         # e.g. "pattern_01"
+    pattern_id: str  # e.g. "pattern_01"
     occurrence_count: int
-    steps: tuple[PatternStep, ...]          # ordered, length 1..MAX_SEQUENCE_WINDOW
+    steps: tuple[PatternStep, ...]  # ordered, length 1..MAX_SEQUENCE_WINDOW
     response_timing: ResponseTimingStats | None
-    parent_pattern_id: str | None           # set only when retained as an optional sub-pattern
-    marker_correlation_id: str | None       # references MarkerCorrelation.correlation_id
-    first_occurrence_timestamp: float       # capture time of 1st occurence
-    first_packet_index: int                 # index into Capture.records
-    low_confidence: bool                    # should be True when occurence_count == 2
+    parent_pattern_id: str | None  # set only when retained as an optional sub-pattern
+    marker_correlation_id: str | None  # references MarkerCorrelation.correlation_id
+    first_occurrence_timestamp: float  # capture time of 1st occurence
+    first_packet_index: int  # index into Capture.records
+    low_confidence: bool  # should be True when occurence_count == 2
 ```
 
 ### 5.4 `PatternStep`
@@ -477,14 +482,14 @@ class CommandPattern:
 ```python
 @dataclass(frozen=True)
 class PatternStep:
-    step_index: int                         # 0-based position in the sequence
-    endpoint_number: int                    # bare endpoint number, 0-15
-    endpoint_address: str                   # display address, e.g. "0x01" or "0x81"
-    direction: Direction                    # "in" or "out"
-    transfer_type: TransferType             # "bulk" or "interrupt"
+    step_index: int  # 0-based position in the sequence
+    endpoint_number: int  # bare endpoint number, 0-15
+    endpoint_address: str  # display address, e.g. "0x01" or "0x81"
+    direction: Direction  # "in" or "out"
+    transfer_type: TransferType  # "bulk" or "interrupt"
     signature_mode: Literal["full", "prefix", "full_prefix"]
-    payload_signature: tuple[int | None, ...] # None = variable byte
-    observed_length_range: tuple[int, int]   # inclusive min/max len(data)
+    payload_signature: tuple[int | None, ...]  # None = variable byte
+    observed_length_range: tuple[int, int]  # inclusive min/max len(data)
     variable_byte_ranges: tuple[VariableByteRange, ...]
 ```
 
@@ -507,7 +512,7 @@ followed by an IN event that the pairing algorithm identifies as a likely respon
 ```python
 @dataclass(frozen=True)
 class AnalysisObservation:
-    observation_id: str                     # e.g. "observation_01"
+    observation_id: str  # e.g. "observation_01"
     reason: Literal["near_marker", "multi_step_exchange"]
     steps: tuple[PatternStep, ...]
     nearest_marker: str | None
@@ -524,7 +529,7 @@ class VariableByteRange:
     byte_index: int
     observed_min: int
     observed_max: int
-    observed_values: tuple[int, ...]        # all distinct values seen (capped at 32)
+    observed_values: tuple[int, ...]  # all distinct values seen (capped at 32)
 ```
 
 ### 5.8 `UnsolicitedResponse`
@@ -585,11 +590,11 @@ themselves sufficient evidence for `UnsolicitedResponse` or `UnansweredCommand`.
 ```python
 @dataclass(frozen=True)
 class MarkerCorrelation:
-    correlation_id: str                     # e.g. "marker_corr_01"
+    correlation_id: str  # e.g. "marker_corr_01"
     marker_name: str
-    pattern_ids: tuple[str, ...]            # which CommandPatterns appear near this marker
+    pattern_ids: tuple[str, ...]  # which CommandPatterns appear near this marker
     correlation_percent: float
-    mean_time_delta_ms: float               # average offset between marker and first pattern packet
+    mean_time_delta_ms: float  # average offset between marker and first pattern packet
 ```
 
 `MarkerCorrelation` is the authoritative source for marker-correlation details. A

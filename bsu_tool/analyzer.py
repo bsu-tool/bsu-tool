@@ -24,6 +24,7 @@ each flagged for the spec follow-up:
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Final, Literal, Protocol
 
@@ -196,11 +197,53 @@ class CommandPattern:
 
 
 @dataclass(frozen=True, slots=True)
+class ExcludedTraffic:
+    """Traffic one device contributed that never reaches pattern detection."""
+
+    control_transfers: int = 0
+    vendor_control_transfers: int = 0
+    vendor_requests: tuple[int, ...] = ()
+    missing_payload_side: int = 0
+
+    def notes(self) -> tuple[str, ...]:
+        """Render these exclusions as analysis notes."""
+        notes: list[str] = []
+        if self.control_transfers:
+            notes.append(f"{self.control_transfers} control transfers excluded from pattern detection (spec §1.2)")
+        if self.vendor_control_transfers:
+            requests = ", ".join(f"0x{request:02X}" for request in self.vendor_requests)
+            notes.append(
+                f"{self.vendor_control_transfers} vendor-specific control transfers seen on ep0 "
+                f"(requests {requests}); not included in pattern detection (spec §4.2)"
+            )
+        if self.missing_payload_side:
+            notes.append(
+                f"{self.missing_payload_side} transactions had no payload-bearing side and were skipped "
+                "(incomplete transfers at a capture boundary)"
+            )
+        return tuple(notes)
+
+
+@dataclass(frozen=True, slots=True)
 class AnalysisEventStream:
-    """The payload-bearing events for one capture, plus what was excluded."""
+    """The payload-bearing events for one capture, plus what each device lost.
+
+    ``excluded`` holds one entry per device seen, so a device whose traffic is
+    entirely control still appears and can explain itself.
+    """
 
     events: tuple[AnalysisEvent, ...]
-    analysis_notes: tuple[str, ...]
+    excluded: Mapping[str, ExcludedTraffic]
+
+    @property
+    def analysis_notes(self) -> tuple[str, ...]:
+        """Exclusion notes for every device, device-qualified when several appear."""
+        if len(self.excluded) == 1:
+            return next(iter(self.excluded.values())).notes()
+        notes: list[str] = []
+        for device_id in sorted(self.excluded):
+            notes.extend(f"{device_id}: {note}" for note in self.excluded[device_id].notes())
+        return tuple(notes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +278,29 @@ class _TokenInfo:
     variable_byte_ranges: tuple[VariableByteRange, ...]
 
 
+def _empty_request_set() -> set[int]:
+    return set()
+
+
+@dataclass
+class _ExclusionAccumulator:
+    """Mutable tally of one device's excluded traffic, frozen at the end of a pass."""
+
+    control_transfers: int = 0
+    vendor_control_transfers: int = 0
+    vendor_requests: set[int] = field(default_factory=_empty_request_set)
+    missing_payload_side: int = 0
+
+    def freeze(self) -> ExcludedTraffic:
+        """Return the immutable view of this tally."""
+        return ExcludedTraffic(
+            control_transfers=self.control_transfers,
+            vendor_control_transfers=self.vendor_control_transfers,
+            vendor_requests=tuple(sorted(self.vendor_requests)),
+            missing_payload_side=self.missing_payload_side,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class _HeaderMode:
     """The header discriminator decision for one lane (spec §2.3 step 7)."""
@@ -263,29 +329,30 @@ def build_analysis_events(capture: CaptureLike, *, device_id: str | None = None)
     """
     index_of = {id(record): index for index, record in enumerate(capture.records)}
     events: list[AnalysisEvent] = []
-    control_count = 0
-    vendor_control_count = 0
-    vendor_requests: set[int] = set()
-    missing_payload_count = 0
+    excluded: dict[str, _ExclusionAccumulator] = {}
 
     for transaction in capture.transactions:
         reference = transaction.submission or transaction.completion
         if reference is None:  # pair_urbs guarantees at least one side
             continue
-        if device_id is not None and _device_id(reference) != device_id:
+        device = _device_id(reference)
+        if device_id is not None and device != device_id:
             continue
+        # Tallies are per device: a capture-wide count reported on one device's
+        # result would overstate what that device actually contributed.
+        tally = excluded.setdefault(device, _ExclusionAccumulator())
 
         if reference.transfer_type == "control":
-            control_count += 1
+            tally.control_transfers += 1
             setup = _setup_of(transaction)
             if setup is not None and _is_vendor_request(setup):
-                vendor_control_count += 1
-                vendor_requests.add(setup[1])
+                tally.vendor_control_transfers += 1
+                tally.vendor_requests.add(setup[1])
             continue
 
         payload_record = transaction.submission if reference.direction == "out" else transaction.completion
         if payload_record is None:
-            missing_payload_count += 1
+            tally.missing_payload_side += 1
             continue
 
         completion = transaction.completion
@@ -306,22 +373,10 @@ def build_analysis_events(capture: CaptureLike, *, device_id: str | None = None)
 
     # pair_urbs yields in completion order; analysis needs capture order.
     events.sort(key=lambda event: event.packet_index)
-
-    notes: list[str] = []
-    if control_count:
-        notes.append(f"{control_count} control transfers excluded from pattern detection (spec §1.2)")
-    if vendor_control_count:
-        requests = ", ".join(f"0x{request:02X}" for request in sorted(vendor_requests))
-        notes.append(
-            f"{vendor_control_count} vendor-specific control transfers seen on ep0 "
-            f"(requests {requests}); not included in pattern detection (spec §4.2)"
-        )
-    if missing_payload_count:
-        notes.append(
-            f"{missing_payload_count} transactions had no payload-bearing side and were skipped "
-            "(incomplete transfers at a capture boundary)"
-        )
-    return AnalysisEventStream(events=tuple(events), analysis_notes=tuple(notes))
+    return AnalysisEventStream(
+        events=tuple(events),
+        excluded={device: tally.freeze() for device, tally in excluded.items()},
+    )
 
 
 def _setup_of(transaction: UrbTransaction) -> bytes | None:
@@ -635,9 +690,11 @@ def detect_repeated_sequences(
         by_device.setdefault(event.device_id, []).append(event)
 
     results: list[SequenceDetectionResult] = []
-    for device in sorted(by_device):
-        device_events = tuple(by_device[device])
-        notes = list(stream.analysis_notes)
+    # Devices whose traffic was entirely excluded still get a result, so an
+    # analyst learns why nothing came back instead of the device vanishing (§6).
+    for device in sorted(set(by_device) | set(stream.excluded)):
+        device_events = tuple(by_device.get(device, ()))
+        notes = list(stream.excluded[device].notes()) if device in stream.excluded else []
 
         if suppress_background and scope == "device":
             background = _background_endpoints(device_events)
@@ -668,7 +725,9 @@ def detect_repeated_sequences(
         )
         if truncated:
             notes.append(f"command patterns truncated to the top {max_patterns} by rank")
-        if not patterns:
+        if not device_events:
+            notes.append("no bulk or interrupt traffic for this device; nothing to analyze (spec §1.2)")
+        elif not patterns:
             notes.append("no repeated sequences met the occurrence threshold")
 
         results.append(

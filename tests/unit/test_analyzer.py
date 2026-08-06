@@ -389,10 +389,41 @@ def test_all_zero_payload_is_a_valid_payload() -> None:
     assert _only(detect_repeated_sequences(_cycles(3, command=b"\x00\x00\x00"))).patterns
 
 
-def test_capture_with_no_bulk_or_interrupt_traffic_yields_no_results() -> None:
-    """A control-only capture produces nothing to analyze (§6)."""
+def test_control_only_device_reports_itself_with_a_note() -> None:
+    """A device whose traffic is all control gets an empty result explaining why (§6)."""
     capture = _capture(_transfer(1, "control", "in", 0, b"\x12", setup=b"\x80\x06\x00\x01\x00\x00\x12\x00"))
-    assert detect_repeated_sequences(capture) == ()
+    result = _only(detect_repeated_sequences(capture))
+    assert (result.event_count, result.patterns) == (0, ())
+    assert any("nothing to analyze" in note for note in result.analysis_notes)
+    assert any("control transfers excluded" in note for note in result.analysis_notes)
+
+
+def test_stream_notes_are_device_qualified_when_several_devices_appear() -> None:
+    """build_analysis_events reports whose traffic each note describes."""
+    capture = _capture(
+        _transfer(1, "control", "in", 0, b"\x12", setup=b"\x80\x06\x00\x01\x00\x00\x12\x00", dev_num=2),
+        _transfer(2, "control", "in", 0, b"\x12", setup=b"\x80\x06\x00\x01\x00\x00\x12\x00", dev_num=3),
+    )
+    notes = build_analysis_events(capture).analysis_notes
+    assert any(note.startswith("dev_001_002: ") for note in notes)
+    assert any(note.startswith("dev_001_003: ") for note in notes)
+
+
+def test_exclusion_counts_are_scoped_per_device() -> None:
+    """Each device reports its own excluded traffic, not the capture-wide total."""
+    capture = _capture(
+        _transfer(1, "control", "in", 0, b"\x12", setup=b"\x80\x06\x00\x01\x00\x00\x12\x00", dev_num=2),
+        _transfer(2, "control", "in", 0, b"\x12", setup=b"\x80\x06\x00\x01\x00\x00\x12\x00", dev_num=3),
+        _transfer(3, "control", "in", 0, b"\x12", setup=b"\x80\x06\x00\x01\x00\x00\x12\x00", dev_num=3),
+        _transfer(4, "bulk", "out", 1, b"\x01", timestamp=1.0, dev_num=2),
+        _transfer(5, "bulk", "out", 1, b"\x01", timestamp=2.0, dev_num=3),
+    )
+    counts = {
+        result.device_id: next(note for note in result.analysis_notes if "control transfers excluded" in note)
+        for result in detect_repeated_sequences(capture)
+    }
+    assert counts["dev_001_002"].startswith("1 control transfers")
+    assert counts["dev_001_003"].startswith("2 control transfers")
 
 
 def test_empty_capture_yields_no_results() -> None:

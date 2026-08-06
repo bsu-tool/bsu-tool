@@ -130,12 +130,34 @@ def test_second_goodix_capture_yields_patterns() -> None:
     assert not _spanning(result)
 
 
-def test_capture_without_runtime_traffic_reports_nothing_found() -> None:
-    """A capture with no repeated vendor traffic returns empty results with a note."""
+def test_chaoskey_enumeration_only_capture_excludes_the_vendor_device() -> None:
+    """ChaosKey (1d50:60c6) enumerates but sends no runtime traffic, so it is excluded.
+
+    ``dev_001_005`` is a vendor-specific device (interface class 0xFF) whose entire
+    contribution is control traffic, so §1.2 removes it from analysis. It must still
+    report itself rather than vanish. The only bulk/interrupt events in this capture
+    belong to the root hub, so nothing here validates detection.
+    """
     session = _load(_CHAOSKEY)
     results = session.detect_repeated_sequences()
     assert all(not result.patterns for result in results)
-    assert any("no repeated sequences" in note for result in results for note in result.analysis_notes)
+
+    chaoskey = _for_device(results, "dev_001_005")
+    assert chaoskey.event_count == 0
+    assert any("nothing to analyze" in note for note in chaoskey.analysis_notes)
+    assert any("8 control transfers" in note for note in chaoskey.analysis_notes)
+
+
+def test_per_device_notes_do_not_report_capture_wide_counts() -> None:
+    """A device's exclusion counts cover that device only."""
+    session = _load(_CHAOSKEY)
+    counts = {
+        result.device_id: int(note.split(" ", 1)[0])
+        for result in session.detect_repeated_sequences()
+        for note in result.analysis_notes
+        if "control transfers excluded" in note
+    }
+    assert counts == {"dev_001_000": 1, "dev_001_001": 17, "dev_001_005": 8}
 
 
 def test_detection_is_deterministic_across_loads() -> None:

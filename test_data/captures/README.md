@@ -65,6 +65,18 @@ device-identity problem tracked in #103.
 | `tid[32]`, `payload.data[56]` | Goodix `template_format_t` in `0xA5`, `0xA6`, `0xA3`, `0xA4`, `0xA7` messages, ×11 | zeroed from `accountid` to end of record |
 | Non-target devices | root hub and anything not at address 0/19/20/21 | dropped (322 packets) |
 
+Reproduce with:
+
+```bash
+python tools/sanitize_capture.py raw.pcapng goodix_enroll_verify_sanitized.pcapng \
+  --bus 1 --keep-device 0 --keep-device 19 --keep-device 20 --keep-device 21 \
+  --redact-string "$(whoami)" --redact-string DEVICEUNIQUEID \
+  --zero-after-anchor 650043:3
+```
+
+Running it against the committed file is a no-op that reproduces it byte for
+byte, so the sanitization is verifiable without access to the raw capture.
+
 The template payload carried an fprintd print id of the form
 `FP1-<date>-<n>-<template>-<username>`, embedding the operator's username and
 the enrollment date. Redaction runs to end-of-record rather than to the header's

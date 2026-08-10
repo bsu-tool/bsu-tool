@@ -14,6 +14,7 @@ from bsu_tool.pcapng_reader import (
     PcapNgReader,
 )
 from bsu_tool.session import CaptureSession, USBDevice, USBEndpoint
+from bsu_tool.usb_enum import DEFAULT_SYSFS_ROOT
 
 # ---------------------------------------------------------------------------
 # Link-layer type constants
@@ -226,6 +227,18 @@ def main(argv: list[str] | None = None) -> None:
         help="Destination .pcapng file (must not already exist)",
     )
 
+    detect_cmd = subparsers.add_parser(
+        "detect-device",
+        help="Detect a newly attached USB device by diffing before/after snapshots (Linux only)",
+    )
+
+    detect_cmd.add_argument(
+        "--sysfs-root",
+        type=Path,
+        default=None,
+        help=argparse.SUPPRESS,  # hidden: for testing only
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "mcp":
@@ -245,6 +258,13 @@ def main(argv: list[str] | None = None) -> None:
         from bsu_tool.sniff_command import run_sniff
 
         run_sniff(args.bus, args.device, Path(args.output))
+        return
+
+    if args.command == "detect-device":
+        from bsu_tool.detect_device import run_detect
+
+        sysfs_root = args.sysfs_root if args.sysfs_root is not None else DEFAULT_SYSFS_ROOT
+        sys.exit(run_detect(sysfs_root))
         return
 
     parser.print_help()

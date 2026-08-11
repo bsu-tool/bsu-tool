@@ -219,6 +219,40 @@ def test_non_discriminating_header_widens() -> None:
     assert len(signatures) == 2
 
 
+def test_small_lane_widens_on_grouping_not_on_the_ratio() -> None:
+    """Below the sample floor, widening asks whether the header groups, not the ratio.
+
+    Six payloads behind a constant 0xaa sync byte carry three opcodes twice each.
+    The ratio limit is 4.2, so the six-payload lane fails it at three distinct
+    two-byte headers even though those headers plainly group -- and a ratio needs
+    the sample floor to mean anything in the first place.
+    """
+    capture = _capture(
+        *[
+            _out(index, bytes([0xAA, opcode, 0x00]), float(index))
+            for index, opcode in enumerate((1, 2, 3, 1, 2, 3), start=1)
+        ]
+    )
+    result = _only(detect_repeated_sequences(capture, min_window=1))
+    signatures = {step.payload_signature for step in _steps(result, "out")}
+    assert len(signatures) == 3, "three opcodes seen twice each must not collapse into one token"
+    assert all(signature[1] is not None for signature in signatures)
+
+
+def test_lane_that_no_header_width_groups_is_reported_as_merged() -> None:
+    """An un-groupable lane still merges, but says so instead of merging silently (§6).
+
+    Four one-shot commands behind a sync byte are indistinguishable from one
+    command with a counter at this sample count, so the analyzer keeps the
+    narrow header and merges -- and warns that it may have over-merged.
+    """
+    capture = _capture(
+        *[_out(index, bytes([0xAA, opcode, 0x00]), float(index)) for index, opcode in enumerate((1, 2, 3, 4), start=1)]
+    )
+    result = _only(detect_repeated_sequences(capture, min_window=1))
+    assert any("merge into one token" in note for note in result.analysis_notes)
+
+
 # --- Detection: counting and subsumption (spec §3.1) ----------------------
 
 
@@ -270,6 +304,38 @@ def test_more_frequent_subpattern_is_kept_and_linked_to_parent() -> None:
     assert parent is not None, "a retained sub-pattern must name the parent that subsumes it"
     assert len(parent.steps) > len(shortest.steps)
     assert parent.occurrence_count < shortest.occurrence_count
+
+
+def test_masked_and_literal_bytes_at_one_position_do_not_break_ranking() -> None:
+    """Ordering must survive a signature masking a byte where a sibling keeps a literal.
+
+    Two groups share lane, header and signature mode but differ in length, so the
+    subsumption sort compares their signatures position by position. Byte 3 is
+    masked in the short group and literal in the long one; comparing ``None`` to
+    an ``int`` used to raise ``TypeError`` and take the whole analysis down.
+    """
+    groups: list[list[UrbRecord]] = []
+    urb = 0
+    clock = 0.0
+    # Two 0xa6 commands keep byte 0 discriminating, so the header stays one byte
+    # wide and both 0xe0 groups land in the same lane under the same header.
+    groups.extend(_exchange(urb + 1, b"\xa6\x00", b"\x5a\x00", clock))
+    urb, clock = urb + 2, clock + 1.0
+    groups.extend(_exchange(urb + 1, b"\xa6\x00", b"\x5a\x00", clock))
+    urb, clock = urb + 2, clock + 1.0
+    for counter in range(4):
+        # Short: byte 3 is a counter, so it masks to None.
+        groups.extend(_exchange(urb + 1, bytes([0xE0, 0x11, 0x22, counter, 0x33]), b"\x5a\x01", clock))
+        urb, clock = urb + 2, clock + 1.0
+        # Long: same header, constant byte 3, so it stays literal.
+        groups.extend(_exchange(urb + 1, bytes([0xE0, 0x11, 0x22, 0x55, 0x33, 0x44, 0x66]), b"\x5a\x02", clock))
+        urb, clock = urb + 2, clock + 1.0
+
+    result = _only(detect_repeated_sequences(_capture(*groups)))
+
+    signatures = {step.payload_signature for step in _steps(result, "out")}
+    assert (0xE0, 0x11, 0x22, None, 0x33) in signatures
+    assert (0xE0, 0x11, 0x22, 0x55, 0x33, 0x44, 0x66) in signatures
 
 
 # --- Detection: scoping (spec §3.1, and the documented deviation) ---------
@@ -450,6 +516,21 @@ def test_low_confidence_marks_minimum_occurrence_patterns() -> None:
     """Exactly two occurrences is the weakest evidence a pattern can have (§5.3)."""
     assert _only(detect_repeated_sequences(_cycles(2))).patterns[0].low_confidence is True
     assert _only(detect_repeated_sequences(_cycles(4))).patterns[0].low_confidence is False
+
+
+def test_low_confidence_tracks_the_requested_occurrence_threshold() -> None:
+    """The flag follows the caller's threshold, not the module default (§5.3).
+
+    Raising ``min_occurrences`` raises the bar for the weakest admissible
+    evidence, so the pattern sitting exactly on that bar is the one to flag.
+    """
+    weakest = _only(detect_repeated_sequences(_cycles(3), min_occurrences=3)).patterns[0]
+    assert weakest.occurrence_count == 3
+    assert weakest.low_confidence is True
+
+    stronger = _only(detect_repeated_sequences(_cycles(5), min_occurrences=3)).patterns[0]
+    assert stronger.occurrence_count == 5
+    assert stronger.low_confidence is False
 
 
 def test_patterns_are_capped_and_truncation_is_reported() -> None:

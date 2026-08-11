@@ -28,7 +28,16 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Final, Literal, Protocol
 
-from bsu_tool.urb_decoder import Direction, TransferType, UrbRecord, UrbTransaction
+from bsu_tool.analysis.models import (
+    CommandPattern,
+    Direction,
+    PatternOccurrence,
+    PatternStep,
+    SignatureMode,
+    TransferType,
+    VariableByteRange,
+)
+from bsu_tool.urb_decoder import UrbRecord, UrbTransaction
 
 
 class CaptureLike(Protocol):
@@ -72,8 +81,6 @@ MAX_COMMAND_PATTERNS_RETURNED: Final[int] = 20
 
 # --- Public type aliases ---------------------------------------------------
 
-#: How a payload signature was derived (spec §2.2).
-SignatureMode = Literal["full", "prefix", "full_prefix"]
 #: How events are partitioned before n-gram counting.
 Scope = Literal["device", "endpoint_lane"]
 #: One byte position per entry; ``None`` marks a variable byte.
@@ -129,71 +136,6 @@ class AnalysisEvent:
     def failed(self) -> bool:
         """Whether the URB completed with a non-zero status."""
         return self.status is not None and self.status != 0
-
-
-@dataclass(frozen=True, slots=True)
-class VariableByteRange:
-    """Observed values at one variable byte position (spec §5.7)."""
-
-    byte_index: int
-    observed_min: int
-    observed_max: int
-    observed_values: tuple[int, ...]  # distinct values, sorted, capped
-
-
-@dataclass(frozen=True, slots=True)
-class PatternStep:
-    """One token's worth of a detected pattern (spec §5.4)."""
-
-    step_index: int
-    endpoint_number: int
-    endpoint_address: str
-    direction: Direction
-    transfer_type: TransferType
-    signature_mode: SignatureMode
-    payload_signature: PayloadSignature
-    observed_length_range: tuple[int, int]  # inclusive min/max len(payload)
-    variable_byte_ranges: tuple[VariableByteRange, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class PatternOccurrence:
-    """Where one occurrence of a pattern sits in the capture.
-
-    Additive to spec §5.3, which records only the first. #63 and SRS PROTO-01 ask
-    for every position, and §3.3 correlation needs each occurrence's timestamp.
-    """
-
-    start_packet_index: int
-    end_packet_index: int
-    start_timestamp: float
-    end_timestamp: float
-
-
-@dataclass(frozen=True, slots=True)
-class ResponseTimingStats:
-    """Response-time statistics (spec §5.5); filled by pairing in #64."""
-
-    mean_ms: float
-    median_ms: float
-    min_ms: float
-    max_ms: float
-
-
-@dataclass(frozen=True, slots=True)
-class CommandPattern:
-    """A repeated ordered token sequence promoted to an output pattern (spec §5.3)."""
-
-    pattern_id: str
-    occurrence_count: int
-    steps: tuple[PatternStep, ...]
-    occurrences: tuple[PatternOccurrence, ...]
-    first_occurrence_timestamp: float
-    first_packet_index: int
-    low_confidence: bool  # True at exactly MIN_OCCURRENCE_COUNT occurrences
-    parent_pattern_id: str | None = None
-    response_timing: ResponseTimingStats | None = None  # filled by #64
-    marker_correlation_id: str | None = None  # filled by #66
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,7 +284,12 @@ def build_analysis_events(capture: CaptureLike, *, device_id: str | None = None)
         # result would overstate what that device actually contributed.
         tally = excluded.setdefault(device, _ExclusionAccumulator())
 
-        if reference.transfer_type == "control":
+        # Bound to a local so the control exclusion below narrows the decoder's
+        # three-way type down to the bulk/interrupt pair the output models carry.
+        # Both sides of a transaction share it, so reading it off the reference
+        # rather than the payload record is equivalent.
+        transfer_type = reference.transfer_type
+        if transfer_type == "control":
             tally.control_transfers += 1
             setup = _setup_of(transaction)
             if setup is not None and _is_vendor_request(setup):
@@ -363,7 +310,7 @@ def build_analysis_events(capture: CaptureLike, *, device_id: str | None = None)
                 endpoint_number=payload_record.endpoint,
                 endpoint_address=f"0x{_endpoint_address(payload_record):02x}",
                 direction=payload_record.direction,
-                transfer_type=payload_record.transfer_type,
+                transfer_type=transfer_type,
                 payload=payload_record.data,
                 timestamp=payload_record.timestamp,
                 status=completion.status if completion is not None else None,
@@ -447,13 +394,37 @@ def _choose_header_mode(payloads: list[bytes], config: NormalizationConfig) -> _
     # hit the sequence counter and fragment every payload. Widen only while the
     # wider header still groups; otherwise keep the narrow one, whose single
     # group lets fixed/variable classification mask the counter.
+    #
+    # Which of the two a lane is cannot be settled from the bytes alone at small
+    # sample counts -- four one-shot opcodes behind a sync byte and three copies
+    # of one command with a counter both read as "every payload distinct". So the
+    # ratio, which needs the sample floor to mean anything, only gates widening at
+    # or above that floor; below it the scale-free question is asked instead, the
+    # one the paragraph above describes: does the wider header group at all?
     for size in range(initial + 1, config.max_header_id_bytes + 1):
         distinct = len({payload[:size] for payload in non_empty})
-        if distinct > limit:
+        too_sparse = distinct > limit if check_cardinality else distinct >= len(non_empty)
+        if too_sparse:
             break
         if distinct >= config.header_cardinality_floor:
             return _HeaderMode(use_header=True, header_size=size, note=None)
-    return _HeaderMode(use_header=True, header_size=initial, note=None)
+
+    # Falling through means no width discriminated. The lane collapses into one
+    # group, which is right for a counter and wrong for distinct one-shot
+    # commands, so say so rather than let the merge pass silently (spec §6).
+    # A lane whose payloads are all byte-identical loses nothing by merging and
+    # would only add noise, so it is not worth a note.
+    distinct_payloads = len(set(non_empty))
+    note = (
+        None
+        if distinct_payloads < config.header_cardinality_floor
+        else (
+            f"no header width from {initial} to {config.max_header_id_bytes} bytes groups this lane, "
+            f"so its {distinct_payloads} distinct payloads merge into one token; "
+            "if they are separate messages rather than one message with a counter, they are not told apart"
+        )
+    )
+    return _HeaderMode(use_header=True, header_size=initial, note=note)
 
 
 def _classify(payloads: list[bytes], width: int, *, mask_variable: bool) -> tuple[PayloadSignature, list[int]]:
@@ -636,6 +607,38 @@ def _contains(haystack: tuple[_Token, ...], needle: tuple[_Token, ...]) -> bool:
     return any(haystack[start : start + span] == needle for start in range(len(haystack) - span + 1))
 
 
+#: Stands in for a masked byte when ordering signatures. Real bytes are 0-255,
+#: so it sorts ahead of every literal and can never collide with one.
+_MASKED_BYTE_SORT_VALUE: Final[int] = -1
+
+_TokenSortKey = tuple[int, Direction, TransferType, SignatureMode, tuple[int, ...]]
+
+
+def _sequence_sort_key(sequence: tuple[_Token, ...]) -> tuple[int, tuple[_TokenSortKey, ...]]:
+    """Order sequences longest first, breaking ties on a total order over tokens.
+
+    Tokens cannot be compared directly: a payload signature mixes literal bytes
+    with ``None`` at masked positions, and ``None < int`` raises ``TypeError``.
+    Two tokens reach that comparison whenever they share a lane and signature
+    mode but mask different positions -- same-header groups of differing length
+    do exactly that. Substituting the masked positions keeps the order total and
+    deterministic without touching the tokens themselves.
+    """
+    return (
+        -len(sequence),
+        tuple(
+            (
+                endpoint_number,
+                direction,
+                transfer_type,
+                signature_mode,
+                tuple(_MASKED_BYTE_SORT_VALUE if byte is None else byte for byte in signature),
+            )
+            for endpoint_number, direction, transfer_type, signature_mode, signature in sequence
+        ),
+    )
+
+
 def detect_repeated_sequences(
     capture: CaptureLike,
     *,
@@ -772,7 +775,7 @@ def _detect_for_device(
 
     # Subsumption (spec §3.1 step 6): drop a shorter pattern fully explained by a
     # longer one; keep one that occurs more often, linked to its parent.
-    ordered = sorted(repeated, key=lambda sequence: (-len(sequence), sequence))
+    ordered = sorted(repeated, key=_sequence_sort_key)
     dropped: set[tuple[_Token, ...]] = set()
     parent_of: dict[tuple[_Token, ...], tuple[_Token, ...]] = {}
     for sequence in ordered:
@@ -821,8 +824,10 @@ def _detect_for_device(
                 occurrences=occurrences,
                 first_occurrence_timestamp=occurrences[0].start_timestamp,
                 first_packet_index=occurrences[0].start_packet_index,
-                low_confidence=repeated[sequence] == MIN_OCCURRENCE_COUNT,
+                low_confidence=repeated[sequence] <= min_occurrences,
                 parent_pattern_id=identifiers.get(parent) if parent is not None else None,
+                response_timing=None,  # filled by pairing in #64
+                marker_correlation_id=None,  # filled by marker correlation in #66
             )
         )
     return tuple(patterns), truncated

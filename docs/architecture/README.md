@@ -7,6 +7,8 @@
 ## Contents
 
 - [Overview](overview.md)
+- [Milestone 3 Engine Spec](m3-engine-spec.md)
+- [Protocol Description Layer](protocol-description.md)
 
 <!-- Add links here as sections are written, e.g.:
 - [pcap-ng Reader](pcap-reader.md)

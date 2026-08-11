@@ -1,0 +1,351 @@
+{
+  "capture": "goodix_enroll_verify_sanitized.pcapng",
+  "device_id": "dev_001_021",
+  "provenance": {
+    "recorded": "2026-08-06",
+    "distro": "Ubuntu 24.04.4 LTS",
+    "kernel": "6.17.0-23-generic",
+    "fprintd": "1.94.3-1",
+    "libfprint": "1:1.94.7+tod1-0ubuntu5~24.04.6",
+    "capture_tool": "bsu-tool sniff --bus 1 (bus-only, started before attach)",
+    "vendor_id": "0x27c6",
+    "product_id": "0x63ac",
+    "virtualization": "VirtualBox USB passthrough; attach/detach from the Devices menu is the plug event. Protocol exchange is genuine; inter-packet timing is virtualized.",
+    "marker_sources": "attach/delete/idle from an analyst action log; enroll touches from fprintd stage output; verify spans from fprintd verify start/result."
+  },
+  "sanitization": {
+    "tool": "tools/sanitize_capture.py",
+    "dropped": "all devices except addresses 0, 19, 20, 21 (root hub removed)",
+    "templates_redacted": 11,
+    "descriptors_replaced": 19,
+    "serial_placeholder": "UID00000000_XXXX_MOC_B0",
+    "crc_note": "package CRC32 left stale on redacted records so synthetic bytes stay visible",
+    "detach_note": "final detach not represented; its only evidence was root-hub traffic"
+  },
+  "markers": [
+    {
+      "name": "attach-1-start",
+      "packet_index": 0,
+      "timestamp": 1786057689.70424,
+      "note": "analyst action log"
+    },
+    {
+      "name": "attach-2-start",
+      "packet_index": 43,
+      "timestamp": 1786057690.040678,
+      "note": "analyst action log"
+    },
+    {
+      "name": "attach-1-end",
+      "packet_index": 44,
+      "timestamp": 1786057716.529402,
+      "note": "analyst action log"
+    },
+    {
+      "name": "attach-3-start",
+      "packet_index": 87,
+      "timestamp": 1786057716.863777,
+      "note": "analyst action log"
+    },
+    {
+      "name": "attach-2-end",
+      "packet_index": 88,
+      "timestamp": 1786057746.164049,
+      "note": "analyst action log"
+    },
+    {
+      "name": "delete-start",
+      "packet_index": 131,
+      "timestamp": 1786057746.499617,
+      "note": "analyst action log"
+    },
+    {
+      "name": "attach-3-end",
+      "packet_index": 132,
+      "timestamp": 1786057770.55028,
+      "note": "analyst action log"
+    },
+    {
+      "name": "idle-start",
+      "packet_index": 197,
+      "timestamp": 1786057775.079057,
+      "note": "analyst action log"
+    },
+    {
+      "name": "enroll-start",
+      "packet_index": 197,
+      "timestamp": 1786057775.079057,
+      "note": "fprintd-enroll begins"
+    },
+    {
+      "name": "enroll-touch-1-start",
+      "packet_index": 197,
+      "timestamp": 1786057775.079057,
+      "note": "touch 1"
+    },
+    {
+      "name": "delete-end",
+      "packet_index": 198,
+      "timestamp": 1786057814.005479,
+      "note": "analyst action log"
+    },
+    {
+      "name": "idle-end",
+      "packet_index": 198,
+      "timestamp": 1786057814.005479,
+      "note": "analyst action log"
+    },
+    {
+      "name": "enroll-touch-2-start",
+      "packet_index": 293,
+      "timestamp": 1786057825.363645,
+      "note": "touch 2"
+    },
+    {
+      "name": "enroll-touch-1-end",
+      "packet_index": 294,
+      "timestamp": 1786057825.367253,
+      "note": "fprintd: enroll-stage-passed"
+    },
+    {
+      "name": "enroll-touch-3-start",
+      "packet_index": 345,
+      "timestamp": 1786057825.75839,
+      "note": "touch 3"
+    },
+    {
+      "name": "enroll-touch-2-end",
+      "packet_index": 346,
+      "timestamp": 1786057825.75843,
+      "note": "fprintd: enroll-stage-passed"
+    },
+    {
+      "name": "enroll-touch-4-start",
+      "packet_index": 375,
+      "timestamp": 1786057827.894706,
+      "note": "touch 4"
+    },
+    {
+      "name": "enroll-touch-3-end",
+      "packet_index": 376,
+      "timestamp": 1786057827.894939,
+      "note": "fprintd: enroll-stage-passed"
+    },
+    {
+      "name": "enroll-touch-5-start",
+      "packet_index": 404,
+      "timestamp": 1786057829.923076,
+      "note": "touch 5"
+    },
+    {
+      "name": "enroll-touch-4-end",
+      "packet_index": 405,
+      "timestamp": 1786057829.92406,
+      "note": "fprintd: enroll-stage-passed"
+    },
+    {
+      "name": "enroll-touch-6-start",
+      "packet_index": 435,
+      "timestamp": 1786057831.864049,
+      "note": "touch 6"
+    },
+    {
+      "name": "enroll-touch-5-end",
+      "packet_index": 436,
+      "timestamp": 1786057831.865855,
+      "note": "fprintd: enroll-stage-passed"
+    },
+    {
+      "name": "enroll-touch-7-start",
+      "packet_index": 463,
+      "timestamp": 1786057833.851175,
+      "note": "touch 7"
+    },
+    {
+      "name": "enroll-touch-6-end",
+      "packet_index": 464,
+      "timestamp": 1786057833.852463,
+      "note": "fprintd: enroll-stage-passed"
+    },
+    {
+      "name": "enroll-touch-8-start",
+      "packet_index": 495,
+      "timestamp": 1786057835.735347,
+      "note": "touch 8"
+    },
+    {
+      "name": "enroll-touch-7-end",
+      "packet_index": 496,
+      "timestamp": 1786057835.735417,
+      "note": "fprintd: enroll-remove-and-retry"
+    },
+    {
+      "name": "enroll-touch-9-start",
+      "packet_index": 526,
+      "timestamp": 1786057837.6479,
+      "note": "touch 9"
+    },
+    {
+      "name": "enroll-touch-8-end",
+      "packet_index": 527,
+      "timestamp": 1786057837.649247,
+      "note": "fprintd: enroll-stage-passed"
+    },
+    {
+      "name": "enroll-touch-10-start",
+      "packet_index": 554,
+      "timestamp": 1786057839.53191,
+      "note": "touch 10"
+    },
+    {
+      "name": "enroll-touch-9-end",
+      "packet_index": 555,
+      "timestamp": 1786057839.532302,
+      "note": "fprintd: enroll-remove-and-retry"
+    },
+    {
+      "name": "enroll-touch-11-start",
+      "packet_index": 584,
+      "timestamp": 1786057841.577382,
+      "note": "touch 11"
+    },
+    {
+      "name": "enroll-touch-10-end",
+      "packet_index": 585,
+      "timestamp": 1786057841.57791,
+      "note": "fprintd: enroll-stage-passed"
+    },
+    {
+      "name": "enroll-touch-12-start",
+      "packet_index": 614,
+      "timestamp": 1786057843.486657,
+      "note": "touch 12"
+    },
+    {
+      "name": "enroll-touch-11-end",
+      "packet_index": 615,
+      "timestamp": 1786057843.487663,
+      "note": "fprintd: enroll-stage-passed"
+    },
+    {
+      "name": "enroll-touch-13-start",
+      "packet_index": 644,
+      "timestamp": 1786057845.516915,
+      "note": "touch 13"
+    },
+    {
+      "name": "enroll-touch-12-end",
+      "packet_index": 645,
+      "timestamp": 1786057845.517715,
+      "note": "fprintd: enroll-stage-passed"
+    },
+    {
+      "name": "enroll-touch-14-start",
+      "packet_index": 666,
+      "timestamp": 1786057845.938098,
+      "note": "touch 14"
+    },
+    {
+      "name": "enroll-touch-13-end",
+      "packet_index": 667,
+      "timestamp": 1786057845.939605,
+      "note": "fprintd: enroll-retry-scan"
+    },
+    {
+      "name": "enroll-touch-15-start",
+      "packet_index": 684,
+      "timestamp": 1786057847.893727,
+      "note": "touch 15"
+    },
+    {
+      "name": "enroll-touch-14-end",
+      "packet_index": 685,
+      "timestamp": 1786057847.894445,
+      "note": "fprintd: enroll-stage-passed"
+    },
+    {
+      "name": "enroll-touch-16-start",
+      "packet_index": 706,
+      "timestamp": 1786057848.304637,
+      "note": "touch 16"
+    },
+    {
+      "name": "enroll-touch-15-end",
+      "packet_index": 707,
+      "timestamp": 1786057848.305684,
+      "note": "fprintd: enroll-retry-scan"
+    },
+    {
+      "name": "enroll-touch-17-start",
+      "packet_index": 725,
+      "timestamp": 1786057849.914251,
+      "note": "touch 17"
+    },
+    {
+      "name": "enroll-touch-16-end",
+      "packet_index": 726,
+      "timestamp": 1786057849.914493,
+      "note": "fprintd: enroll-stage-passed"
+    },
+    {
+      "name": "enroll-end",
+      "packet_index": 784,
+      "timestamp": 1786057872.718007,
+      "note": "fprintd: enroll-completed"
+    },
+    {
+      "name": "enroll-touch-17-end",
+      "packet_index": 784,
+      "timestamp": 1786057872.718007,
+      "note": "fprintd: enroll-completed"
+    },
+    {
+      "name": "verify-match-1-start",
+      "packet_index": 828,
+      "timestamp": 1786057873.374827,
+      "note": "fprintd: verify started"
+    },
+    {
+      "name": "verify-match-1-end",
+      "packet_index": 857,
+      "timestamp": 1786057875.566336,
+      "note": "fprintd: verify-match"
+    },
+    {
+      "name": "verify-match-2-start",
+      "packet_index": 912,
+      "timestamp": 1786057884.809976,
+      "note": "fprintd: verify started"
+    },
+    {
+      "name": "verify-match-2-end",
+      "packet_index": 940,
+      "timestamp": 1786057886.476694,
+      "note": "fprintd: verify-match"
+    },
+    {
+      "name": "verify-match-3-start",
+      "packet_index": 994,
+      "timestamp": 1786057894.875952,
+      "note": "fprintd: verify started"
+    },
+    {
+      "name": "verify-match-3-end",
+      "packet_index": 1023,
+      "timestamp": 1786057897.300081,
+      "note": "fprintd: verify-match"
+    },
+    {
+      "name": "verify-nomatch-1-start",
+      "packet_index": 1074,
+      "timestamp": 1786057913.607652,
+      "note": "fprintd: verify started"
+    },
+    {
+      "name": "verify-nomatch-1-end",
+      "packet_index": 1105,
+      "timestamp": 1786057917.508601,
+      "note": "fprintd: verify-no-match"
+    }
+  ]
+}

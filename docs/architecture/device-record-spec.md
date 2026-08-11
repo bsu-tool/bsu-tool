@@ -43,36 +43,21 @@ close. Records are partly written by a person (provenance, physical observations
 attempt narratives), and they are reviewed in pull requests, so the format has to support
 comments and produce readable diffs.
 
-Records live **in the bsu-tool repository**, under `device-records/`, keyed by
-`<record-id>` as defined in §M.3.
+Records live **in the bsu-tool repository**, keyed by `<record-id>` as defined in §M.3.
+Everything for one device lives in one directory:
 
-> **Open decision for team review: record placement.** Two layouts are on the table.
-> Reply on the PR with which one we adopt. The spec ships with whichever wins.
->
-> **Option A, everything in one directory per device:**
-> ```
-> device-records/1a86_7523-2ch-relay/
->   record.yaml
->   corpus/
->     0000-1a86_7523-idle.pcapng
->     ...
-> ```
-> One directory holds the record and all its captures. Hand the directory to someone and
-> they have everything, and a project set aside for months can be picked up cold by
-> reading one file. This is also the sponsor's own preferred workflow.
->
-> **Option B, record beside the directory:**
-> ```
-> device-records/1a86_7523-2ch-relay.yaml
-> device-records/1a86_7523-2ch-relay/
->   corpus/
->     ...
-> ```
-> All records sit flat in `device-records/`, so listing the yaml files is itself a crude
-> registry. With the generated index (§M.10) that advantage mostly disappears.
->
-> Section §M.4.9 and the capture spec's rule for committed corpora work unchanged under
-> either option, since the corpus path is the same in both.
+```
+device-records/1a86_7523-2ch-relay/
+  record.yaml
+  corpus/
+    0000-1a86_7523-idle.pcapng
+    ...
+```
+
+The record MUST be at `device-records/<record-id>/record.yaml`, and its corpus at
+`device-records/<record-id>/corpus/`. Hand someone the directory and they have everything,
+and a project set aside for months can be picked up cold by reading `record.yaml`. This is
+the sponsor's own workflow (2026-08-05) and the team's chosen layout.
 
 > Decided: a separate repository would need its own CI configuration, license, and merge
 > policy, and none of that helps the project now. Splitting later would take an

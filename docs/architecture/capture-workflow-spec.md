@@ -115,8 +115,17 @@ and SHOULD report the orphan.
 
 ## N.4 Manifest
 
-One manifest per capture. All timestamps used for correlation MUST be monotonic. Wall
-clock values MAY be recorded for human reference but MUST NOT be used for ordering.
+One manifest per capture. A marker or event that must be ordered against other marks MUST
+be ordered by a monotonic clock, because a wall clock can step and invert two marks.
+
+Wall clock is not only for human reference. It is required to place a live mark onto a
+packet. The pcapng carries only wall clock: packet timestamps come from the usbmon header
+in epoch seconds. A mark recorded during a capture therefore carries both clocks. Its
+`time.time()` reading resolves it to a packet index, because the packets share that
+realtime clock and a step moves the mark and the packets together. Its `time.monotonic()`
+reading orders it against other marks and survives a clock step. Sampling both clocks once
+at capture start gives the offset needed to report every mark on the monotonic timeline.
+The live-marking tool is specified separately (see the mark_now issue).
 
 ```json
 {

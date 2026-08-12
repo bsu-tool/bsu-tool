@@ -24,7 +24,7 @@ _CAPTURE = _CAPTURES / "goodix_enroll_verify_sanitized.pcapng"
 _SIDECAR = _CAPTURES / "goodix_enroll_verify_sanitized.markers.json"
 
 #: The reader's address during the third attach, when the session traffic ran.
-_DEVICE_ID = "dev_001_021"
+_DEVICE_ID = "27c6_63ac"
 
 #: Placeholder written over the real serial by tools/sanitize_capture.py.
 _SERIAL_PLACEHOLDER = "UID00000000_XXXX_MOC_B0"
@@ -55,18 +55,22 @@ def test_capture_loads_with_expected_devices() -> None:
     assert len(capture.records) == 1122
 
     devices = {device.device_id: device for device in session.list_devices()}
-    # Address 0 is the enumeration phase shared by all three attaches; 19, 20
-    # and 21 are the same physical reader re-addressed on each replug.
-    assert set(devices) == {"dev_001_000", "dev_001_019", "dev_001_020", _DEVICE_ID}
+    # Address 0 is the enumeration phase shared by all three attaches; 19, 20 and
+    # 21 are the same physical reader re-addressed on each replug. All four fold
+    # into one vid:pid identity, so this whole capture is a single device.
+    assert set(devices) == {_DEVICE_ID}
+    assert [(a.bus_num, a.dev_num) for a in devices[_DEVICE_ID].addresses] == [(1, 0), (1, 19), (1, 20), (1, 21)]
 
     session_device = devices[_DEVICE_ID]
     assert session_device.vendor_id == "0x27c6"
     assert session_device.product_id == "0x63ac"
+    # Endpoint tallies now cover all four addresses, so they sum to the whole capture.
     assert [(endpoint.address, endpoint.packet_count) for endpoint in session_device.endpoints_seen] == [
-        ("0x00", 114),
-        ("0x01", 182),
-        ("0x83", 720),
+        ("0x00", 196),
+        ("0x01", 190),
+        ("0x83", 736),
     ]
+    assert sum(endpoint.packet_count for endpoint in session_device.endpoints_seen) == 1122
 
 
 def test_enumeration_is_complete_and_serial_is_redacted() -> None:

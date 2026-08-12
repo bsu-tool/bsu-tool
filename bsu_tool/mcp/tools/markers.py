@@ -86,7 +86,7 @@ def register(mcp: FastMCP, session: Session) -> None:
         the markers themselves are the boundaries and are excluded. Raises if
         either name is unknown or the start marker is anchored after the end marker.
 
-        Pass ``device_id`` (a ``dev_bbb_ddd`` id from list_devices) to keep only
+        Pass ``device_id`` (an id from list_devices) to keep only
         that device's packets within the span, mirroring get_packets; an unknown id
         yields an empty span. When a ``device_id`` is given, ``span_count`` is the
         post-filter total, so pagination stays coherent.

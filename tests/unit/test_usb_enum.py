@@ -9,9 +9,11 @@ import pytest
 
 from bsu_tool.usb_enum import (
     USBMON_ALL_BUSES_PATH,
+    LiveUsbDevice,
     UsbEnumerationError,
     device_id_for,
     enumerate_usb_devices,
+    identity_capture_id,
     usbmon_path_for_bus,
 )
 
@@ -188,3 +190,21 @@ def test_usbmon_path_helpers() -> None:
     """Bus N maps to /dev/usbmonN and the all-buses device is usbmon0."""
     assert usbmon_path_for_bus(3) == "/dev/usbmon3"
     assert USBMON_ALL_BUSES_PATH == "/dev/usbmon0"
+
+
+def test_identity_capture_id_bridges_a_live_device_to_its_capture_id() -> None:
+    """A live row converts to the vid:pid id a capture would report for it."""
+    device = LiveUsbDevice(
+        device_id="dev_001_011",
+        bus_num=1,
+        dev_num=11,
+        vendor_id="0x27c6",
+        product_id="0x63ac",
+        description="Goodix Fingerprint USB Device",
+        usbmon_path="/dev/usbmon1",
+    )
+
+    assert identity_capture_id(device) == "27c6_63ac"
+    # The live id stays address-based: several attached devices can share a
+    # vid:pid, so identity would collide within one snapshot.
+    assert device.device_id == "dev_001_011"

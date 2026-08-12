@@ -20,7 +20,7 @@ _ENUM_AND_ENROLL = _CAPTURES / "goodix_enum_and_enroll_sanitized.pcapng"
 _ENROLL = _CAPTURES / "goodix_enroll_sanitized.pcapng"
 _CHAOSKEY = _CAPTURES / "chaoskey_enum.pcapng"
 
-_GOODIX_DEVICE = "dev_001_011"
+_GOODIX_DEVICE = "27c6_63ac"
 
 
 def _load(path: pathlib.Path) -> Session:
@@ -133,7 +133,7 @@ def test_second_goodix_capture_yields_patterns() -> None:
 def test_chaoskey_enumeration_only_capture_excludes_the_vendor_device() -> None:
     """ChaosKey (1d50:60c6) enumerates but sends no runtime traffic, so it is excluded.
 
-    ``dev_001_005`` is a vendor-specific device (interface class 0xFF) whose entire
+    ``1d50_60c6`` is a vendor-specific device (interface class 0xFF) whose entire
     contribution is control traffic, so §1.2 removes it from analysis. It must still
     report itself rather than vanish. The only bulk/interrupt events in this capture
     belong to the root hub, so nothing here validates detection.
@@ -142,10 +142,11 @@ def test_chaoskey_enumeration_only_capture_excludes_the_vendor_device() -> None:
     results = session.detect_repeated_sequences()
     assert all(not result.patterns for result in results)
 
-    chaoskey = _for_device(results, "dev_001_005")
+    chaoskey = _for_device(results, "1d50_60c6")
     assert chaoskey.event_count == 0
     assert any("nothing to analyze" in note for note in chaoskey.analysis_notes)
-    assert any("8 control transfers" in note for note in chaoskey.analysis_notes)
+    # 8 control transfers at address 5 plus the 1 at address 0 it enumerated on.
+    assert any("9 control transfers" in note for note in chaoskey.analysis_notes)
 
 
 def test_per_device_notes_do_not_report_capture_wide_counts() -> None:
@@ -157,7 +158,9 @@ def test_per_device_notes_do_not_report_capture_wide_counts() -> None:
         for note in result.analysis_notes
         if "control transfers excluded" in note
     }
-    assert counts == {"dev_001_000": 1, "dev_001_001": 17, "dev_001_005": 8}
+    # The ChaosKey's address-0 and address-5 phases are one device, so its
+    # control-transfer count is the sum of both (1 + 8).
+    assert counts == {"dev_001_001": 17, "1d50_60c6": 9}
 
 
 def test_detection_is_deterministic_across_loads() -> None:

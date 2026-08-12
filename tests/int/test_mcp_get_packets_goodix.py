@@ -26,12 +26,12 @@ def test_get_packets_goodix_capture() -> None:
     assert len(everything.matches) == 253
     assert [packet.index for packet in everything.matches[:3]] == [0, 1, 2]
 
-    device = session.get_packets(device_id="dev_001_011")
+    device = session.get_packets(device_id="27c6_63ac")
     assert device.total_count == 253
     assert 0 < len(device.matches) < everything.total_count
-    assert {packet.device_id for packet in device.matches} == {"dev_001_011"}
+    assert {packet.device_id for packet in device.matches} == {"27c6_63ac"}
 
-    bulk_in = session.get_packets(device_id="dev_001_011", transfer_type="bulk", direction="in")
+    bulk_in = session.get_packets(device_id="27c6_63ac", transfer_type="bulk", direction="in")
     assert bulk_in.matches
     for packet in bulk_in.matches:
         assert packet.transfer_type == "bulk"
@@ -40,9 +40,9 @@ def test_get_packets_goodix_capture() -> None:
 
     # Endpoint filters by number: "3" and full address "0x83" both reach EP3 IN
     # once direction is pinned.
-    by_number = session.get_packets(device_id="dev_001_011", endpoint="3", direction="in")
+    by_number = session.get_packets(device_id="27c6_63ac", endpoint="3", direction="in")
     assert by_number.matches == bulk_in.matches
-    assert session.get_packets(device_id="dev_001_011", endpoint="0x83", direction="in").matches == bulk_in.matches
+    assert session.get_packets(device_id="27c6_63ac", endpoint="0x83", direction="in").matches == bulk_in.matches
 
 
 def test_get_packets_tool_assembles_paginated_result() -> None:

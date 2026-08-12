@@ -20,7 +20,7 @@ import pathlib
 from bsu_tool.session import Session
 
 _CAPTURE = pathlib.Path(__file__).parent.parent.parent / "test_data" / "captures" / "chaoskey_enum.pcapng"
-_CHAOSKEY_DEVICE_ID = "dev_001_005"
+_CHAOSKEY_DEVICE_ID = "1d50_60c6"
 
 
 def test_list_devices_reports_chaoskey_classes() -> None:
@@ -81,9 +81,12 @@ def test_get_enumeration_enumeration_only_capture_has_no_runtime() -> None:
 
     assert enumeration.is_complete is True
     assert enumeration.runtime_start_index is None
-    assert enumeration.enumeration_start_index == 36
+    # The address-0 phase belongs to the same device, so enumeration starts there.
+    assert enumeration.enumeration_start_index == 28
     assert enumeration.enumeration_end_index == 51
-    assert enumeration.enumeration_packet_indices == tuple(range(36, 52))
+    # Two address-0 packets precede the contiguous address-5 run; both phases
+    # belong to the same device now that identity keys on vid:pid.
+    assert enumeration.enumeration_packet_indices == (28, 29, *range(36, 52))
     # The phase carries only endpoint-0 control packets.
     for index in enumeration.enumeration_packet_indices:
         packet = session.get_packet(index)

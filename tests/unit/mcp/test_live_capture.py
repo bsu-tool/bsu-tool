@@ -293,12 +293,12 @@ def test_stop_capture_returns_stats_and_autoloads(tmp_path: Path) -> None:
     assert payload["output_bytes"] == 4242
     # the summary comes from a real decode of the captured file
     assert payload["packet_count"] == 253
-    assert "dev_001_011" in payload["device_ids"]
+    assert "27c6_63ac" in payload["device_ids"]
     # the SHARED session now holds that capture for the other tools
     assert session.capture is not None
     assert len(session.capture.records) == 253
     devices_payload = _call(server, "list_devices", {})
-    assert "dev_001_011" in {device["device_id"] for device in devices_payload["devices"]}
+    assert "27c6_63ac" in {device["device_id"] for device in devices_payload["devices"]}
     # the capture slot is free again
     _call(server, "start_capture", {"bus": 1, "output_path": str(tmp_path / "next.pcapng")})
 

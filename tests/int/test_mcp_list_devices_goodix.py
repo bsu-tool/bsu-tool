@@ -20,12 +20,28 @@ def test_list_devices_goodix_capture() -> None:
 
     assert capture.metadata.packet_count == 253
     assert len(capture.records) == 253
-    assert [device.device_id for device in devices] == ["dev_001_000", "dev_001_001", "dev_001_011"]
-    assert [device.packet_count for device in devices] == [8, 78, 167]
-    assert devices[1].transfer_types_seen == ("control", "interrupt")
-    assert [ep.address for ep in devices[2].endpoints_seen] == ["0x00", "0x01", "0x83"]
-    assert devices[2].transfer_types_seen == ("control", "bulk")
-    assert devices[2].vendor_id == "0x27c6"
-    assert devices[2].product_id == "0x63ac"
-    assert devices[2].manufacturer == "Goodix Technology Co., Ltd."
-    assert devices[2].product == "Goodix Fingerprint USB Device"
+    # The reader occupied address 0 during enumeration and address 11 afterwards;
+    # both fold into one vid:pid identity. The unnamed root hub sent no
+    # descriptors, so it keeps its address id.
+    assert [device.device_id for device in devices] == ["dev_001_001", "27c6_63ac"]
+    assert [device.packet_count for device in devices] == [78, 175]
+    assert devices[0].transfer_types_seen == ("control", "interrupt")
+    assert [ep.address for ep in devices[1].endpoints_seen] == ["0x00", "0x01", "0x83"]
+    assert devices[1].transfer_types_seen == ("control", "bulk")
+    assert devices[1].vendor_id == "0x27c6"
+    assert devices[1].product_id == "0x63ac"
+    assert devices[1].manufacturer == "Goodix Technology Co., Ltd."
+    assert devices[1].product == "Goodix Fingerprint USB Device"
+
+
+def test_merged_device_reports_both_addresses() -> None:
+    """A device seen at two addresses reports both, with the operational one last."""
+    session = Session()
+    session.load(_CAPTURE)
+
+    goodix = next(device for device in session.list_devices() if device.device_id == "27c6_63ac")
+
+    assert [(a.bus_num, a.dev_num) for a in goodix.addresses] == [(1, 0), (1, 11)]
+    # bus_num/dev_num report the last address held, not the enumeration address.
+    assert (goodix.bus_num, goodix.dev_num) == (1, 11)
+    assert goodix.identity_source == "descriptors"

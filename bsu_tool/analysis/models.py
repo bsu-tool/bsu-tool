@@ -1,4 +1,9 @@
-"""Shared protocol-analysis output models from the M3 engine specification."""
+"""Shared protocol-analysis output models from the M3 engine specification.
+
+Transcribed from spec §5 field for field, with one addition: ``CommandPattern``
+carries an ``occurrences`` tuple, and :class:`PatternOccurrence` describes its
+entries. See that class for why, and the spec follow-up it is queued behind.
+"""
 
 from __future__ import annotations
 
@@ -52,6 +57,22 @@ class CommandPattern:
     first_occurrence_timestamp: float
     first_packet_index: int
     low_confidence: bool
+    occurrences: tuple[PatternOccurrence, ...] = ()
+
+
+@dataclass(frozen=True)
+class PatternOccurrence:
+    """Where one occurrence of a pattern sits in the capture.
+
+    Additive to spec §5.3, which records only the first occurrence. Issue #63 and
+    SRS PROTO-01 both call for every position, and §3.3 marker correlation needs
+    each occurrence's timestamp to measure its distance from a marker.
+    """
+
+    start_packet_index: int
+    end_packet_index: int
+    start_timestamp: float
+    end_timestamp: float
 
 
 @dataclass(frozen=True)

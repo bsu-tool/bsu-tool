@@ -8,6 +8,14 @@ from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Final, Literal, TypeAlias, cast
 
+from bsu_tool.analyzer import (
+    MAX_SEQUENCE_WINDOW,
+    MIN_OCCURRENCE_COUNT,
+    MIN_SEQUENCE_WINDOW,
+    Scope,
+    SequenceDetectionResult,
+    detect_repeated_sequences,
+)
 from bsu_tool.descriptors import (
     CONFIGURATION_DESCRIPTOR,
     DEVICE_DESCRIPTOR,
@@ -521,6 +529,53 @@ class Session:
         if not 0 <= index < len(records):
             return None
         return _packet_record(index, records[index])
+
+    def detect_repeated_sequences(
+        self,
+        *,
+        device_id: str | None = None,
+        scope: Scope = "device",
+        suppress_background: bool = True,
+        min_window: int = MIN_SEQUENCE_WINDOW,
+        max_window: int = MAX_SEQUENCE_WINDOW,
+        min_occurrences: int = MIN_OCCURRENCE_COUNT,
+    ) -> tuple[SequenceDetectionResult, ...]:
+        """Detect repeated URB sequences in the active capture, one result per device.
+
+        Thin wrapper over :func:`bsu_tool.analyzer.detect_repeated_sequences`; see
+        that function for the normalization and detection rules.
+
+        Args:
+            device_id: Restrict analysis to one ``dev_bbb_ddd`` device. ``None``
+                analyzes every device independently.
+            scope: ``"device"`` counts sequences across one device's endpoints,
+                which is required to see command/response cycles that cross
+                endpoint numbers. ``"endpoint_lane"`` partitions by endpoint.
+            suppress_background: Drop interrupt IN-only endpoints that look like
+                background status polls.
+            min_window: Shortest token sequence to search for.
+            max_window: Longest token sequence to search for.
+            min_occurrences: Occurrences required before a sequence is reported.
+
+        Returns:
+            One :class:`~bsu_tool.analyzer.SequenceDetectionResult` per device,
+            ordered by device id.
+
+        Raises:
+            RuntimeError: No capture has been loaded.
+            ValueError: A window or occurrence bound is out of range.
+        """
+        if self.capture is None:
+            raise RuntimeError("No capture loaded. Call load_capture() first.")
+        return detect_repeated_sequences(
+            self.capture,
+            device_id=device_id,
+            scope=scope,
+            suppress_background=suppress_background,
+            min_window=min_window,
+            max_window=max_window,
+            min_occurrences=min_occurrences,
+        )
 
     def get_enumeration(self, device_id: str) -> DeviceEnumeration:
         """Return the descriptors and enumeration-phase span for one device.

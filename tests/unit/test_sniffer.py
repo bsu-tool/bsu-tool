@@ -114,47 +114,26 @@ def _read_epbs(path: Path) -> list[EnhancedPacketBlock]:
 
 
 # ---------------------------------------------------------------------------
-# capture() — filtering and stats
+# capture() — bus-wide recording and stats
 # ---------------------------------------------------------------------------
 
 
-def test_device_filter_counts_seen_vs_matched(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_every_device_on_the_bus_is_written(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # Capture is bus-wide: addresses are recorded regardless of which device
+    # they belong to, so a device that re-addresses mid-capture stays whole.
     events = [
         (_header(devnum=5), b"\x01"),
-        (_header(devnum=9), b"\x02"),  # different device
-        (_header(devnum=5), b"\x03"),
+        (_header(devnum=9), b"\x02"),  # a different device on the same bus
+        (_header(devnum=0), b"\x03"),  # the enumeration address
     ]
     _install_source(monkeypatch, _FakeSource(events))
     out = tmp_path / "cap.pcapng"
 
-    stats = capture(bus=3, device=5, output_path=out, stop_event=Event())
+    stats = capture(bus=3, output_path=out, stop_event=Event())
 
     assert stats.seen == 3
-    assert stats.matched == 2
     payloads = [epb.packet_data[64:] for epb in _read_epbs(out)]
-    assert payloads == [b"\x01", b"\x03"]
-
-
-def test_bus_only_mode_matches_everything(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    events = [(_header(devnum=d), bytes([d])) for d in (5, 9, 0)]
-    _install_source(monkeypatch, _FakeSource(events))
-    out = tmp_path / "cap.pcapng"
-
-    stats = capture(bus=3, device=None, output_path=out, stop_event=Event())
-
-    assert stats.matched == stats.seen == 3
-
-
-def test_device_zero_is_not_a_wildcard(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    # device=0 must match only address-0 events, not "everything".
-    events = [(_header(devnum=0), b"\xa0"), (_header(devnum=1), b"\xa1")]
-    _install_source(monkeypatch, _FakeSource(events))
-    out = tmp_path / "cap.pcapng"
-
-    stats = capture(bus=3, device=0, output_path=out, stop_event=Event())
-
-    assert stats.seen == 2
-    assert stats.matched == 1
+    assert payloads == [b"\x01", b"\x02", b"\x03"]
 
 
 def test_timestamp_is_derived_from_header(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -162,7 +141,7 @@ def test_timestamp_is_derived_from_header(monkeypatch: pytest.MonkeyPatch, tmp_p
     _install_source(monkeypatch, _FakeSource(events))
     out = tmp_path / "cap.pcapng"
 
-    capture(bus=3, device=None, output_path=out, stop_event=Event())
+    capture(bus=3, output_path=out, stop_event=Event())
 
     (epb,) = _read_epbs(out)
     expected = 1234 * 1_000_000 + 567
@@ -173,7 +152,7 @@ def test_output_bytes_matches_file_size(monkeypatch: pytest.MonkeyPatch, tmp_pat
     _install_source(monkeypatch, _FakeSource([(_header(), b"\x01\x02")]))
     out = tmp_path / "cap.pcapng"
 
-    stats = capture(bus=3, device=None, output_path=out, stop_event=Event())
+    stats = capture(bus=3, output_path=out, stop_event=Event())
 
     assert stats.output_bytes == out.stat().st_size
 
@@ -183,7 +162,7 @@ def test_existing_output_path_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     out = tmp_path / "cap.pcapng"
     out.write_bytes(b"existing")  # already exists -> "xb" open fails
     with pytest.raises(FileExistsError):
-        capture(bus=3, device=None, output_path=out, stop_event=Event())
+        capture(bus=3, output_path=out, stop_event=Event())
     assert out.read_bytes() == b"existing"
 
 
@@ -192,7 +171,7 @@ def test_startup_failure_does_not_create_output(monkeypatch: pytest.MonkeyPatch,
     out = tmp_path / "cap.pcapng"
 
     with pytest.raises(UsbmonPermissionError):
-        capture(bus=3, device=None, output_path=out, stop_event=Event())
+        capture(bus=3, output_path=out, stop_event=Event())
 
     assert not out.exists()
 
@@ -200,29 +179,27 @@ def test_startup_failure_does_not_create_output(monkeypatch: pytest.MonkeyPatch,
 def test_ready_event_is_set_once_live(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _install_source(monkeypatch, _FakeSource([]))
     ready = Event()
-    capture(bus=3, device=None, output_path=tmp_path / "c.pcapng", stop_event=Event(), ready_event=ready)
+    capture(bus=3, output_path=tmp_path / "c.pcapng", stop_event=Event(), ready_event=ready)
     assert ready.is_set()
 
 
-def test_progress_callback_fires_on_matched_and_filtered(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_progress_callback_ticks_per_event(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # Force every event past the throttle by advancing a fake clock a full
     # second per tick.
     ticks = iter(range(0, 1000))
     monkeypatch.setattr(sniffer.time, "monotonic", lambda: float(next(ticks)))
 
-    events = [(_header(devnum=5), b"\x01"), (_header(devnum=9), b"\x02")]  # one matched, one filtered
+    events = [(_header(devnum=5), b"\x01"), (_header(devnum=9), b"\x02")]
     _install_source(monkeypatch, _FakeSource(events))
 
-    calls: list[tuple[int, int]] = []
+    calls: list[int] = []
     capture(
         bus=3,
-        device=5,
         output_path=tmp_path / "c.pcapng",
         stop_event=Event(),
-        on_progress=lambda s: calls.append((s.seen, s.matched)),
+        on_progress=lambda s: calls.append(s.seen),
     )
-    assert (1, 1) in calls  # matched branch
-    assert (2, 1) in calls  # filtered branch: seen climbs, matched stuck
+    assert calls == [1, 2]
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +210,7 @@ def test_progress_callback_fires_on_matched_and_filtered(monkeypatch: pytest.Mon
 def test_controller_start_then_stop_returns_stats(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _install_source(monkeypatch, _FakeSource([(_header(), b"\x01")]))
     controller = CaptureController()
-    controller.start(bus=3, device=None, output_path=tmp_path / "c.pcapng")
+    controller.start(bus=3, output_path=tmp_path / "c.pcapng")
     stats = controller.stop()
     assert isinstance(stats, CaptureStats)
 
@@ -241,9 +218,9 @@ def test_controller_start_then_stop_returns_stats(monkeypatch: pytest.MonkeyPatc
 def test_controller_double_start_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _install_source(monkeypatch, _FakeSource([]))
     controller = CaptureController()
-    controller.start(bus=3, device=None, output_path=tmp_path / "c.pcapng")
+    controller.start(bus=3, output_path=tmp_path / "c.pcapng")
     with pytest.raises(CaptureStateError):
-        controller.start(bus=3, device=None, output_path=tmp_path / "d.pcapng")
+        controller.start(bus=3, output_path=tmp_path / "d.pcapng")
     controller.stop()
 
 
@@ -257,7 +234,7 @@ def test_controller_startup_error_surfaces_from_start(monkeypatch: pytest.Monkey
     _install_source(monkeypatch, source)
     controller = CaptureController()
     with pytest.raises(UsbmonPermissionError):
-        controller.start(bus=3, device=None, output_path=tmp_path / "c.pcapng")
+        controller.start(bus=3, output_path=tmp_path / "c.pcapng")
 
 
 def test_controller_post_live_error_surfaces_from_stop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -266,7 +243,7 @@ def test_controller_post_live_error_surfaces_from_stop(monkeypatch: pytest.Monke
     _install_source(monkeypatch, source)
     out = tmp_path / "c.pcapng"
     controller = CaptureController()
-    controller.start(bus=3, device=None, output_path=out)
+    controller.start(bus=3, output_path=out)
     with pytest.raises(RuntimeError, match="bus vanished"):
         controller.stop()
     assert out.exists()
@@ -279,7 +256,7 @@ def test_controller_start_times_out_when_never_live(monkeypatch: pytest.MonkeyPa
     controller = CaptureController()
     out = tmp_path / "c.pcapng"
     with pytest.raises(TimeoutError):
-        controller.start(bus=3, device=None, output_path=out, ready_timeout=0.15)
+        controller.start(bus=3, output_path=out, ready_timeout=0.15)
     assert not out.exists()
     with pytest.raises(TimeoutError):
         controller.stop(timeout=0.01)
@@ -296,7 +273,7 @@ def test_controller_thread_start_failure_is_not_active(monkeypatch: pytest.Monke
     controller = CaptureController()
 
     with pytest.raises(RuntimeError, match="cannot start thread"):
-        controller.start(bus=3, device=None, output_path=tmp_path / "c.pcapng")
+        controller.start(bus=3, output_path=tmp_path / "c.pcapng")
 
     assert not controller.is_active
 
@@ -309,14 +286,13 @@ def test_controller_stop_times_out_without_losing_active_state(
 
     def blocked_capture(
         bus: int,
-        device: int | None,
         output_path: Path,
         *,
         stop_event: Event,
         ready_event: Event | None = None,
         on_progress: sniffer.ProgressCallback | None = None,
     ) -> CaptureStats:
-        del bus, device, stop_event, on_progress
+        del bus, stop_event, on_progress
         output_path.write_bytes(b"capture")
         assert ready_event is not None
         ready_event.set()
@@ -325,7 +301,7 @@ def test_controller_stop_times_out_without_losing_active_state(
 
     monkeypatch.setattr(sniffer, "capture", blocked_capture)
     controller = CaptureController()
-    controller.start(bus=3, device=None, output_path=tmp_path / "c.pcapng")
+    controller.start(bus=3, output_path=tmp_path / "c.pcapng")
 
     with pytest.raises(TimeoutError, match="did not stop"):
         controller.stop(timeout=0.01)
@@ -340,7 +316,7 @@ def test_is_running_reflects_lifecycle(monkeypatch: pytest.MonkeyPatch, tmp_path
     _install_source(monkeypatch, _FakeSource([(_header(), b"\x01")], hold_until_stop=True))
     controller = CaptureController()
     assert controller.is_running is False
-    controller.start(bus=3, device=None, output_path=tmp_path / "c.pcapng")
+    controller.start(bus=3, output_path=tmp_path / "c.pcapng")
     assert controller.is_running is True
     controller.stop()
     assert controller.is_running is False

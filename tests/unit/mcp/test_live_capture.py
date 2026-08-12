@@ -50,12 +50,12 @@ class _FakeController:
     active_results: ClassVar[list[bool]] = []
 
     def __init__(self) -> None:
-        self.start_args: tuple[int, int | None, Path] | None = None
+        self.start_args: tuple[int, Path] | None = None
         self.stop_calls = 0
         _FakeController.instances.append(self)
 
-    def start(self, bus: int, device: int | None, output_path: Path) -> None:
-        self.start_args = (bus, device, output_path)
+    def start(self, bus: int, output_path: Path) -> None:
+        self.start_args = (bus, output_path)
         if _FakeController.start_entered is not None:
             _FakeController.start_entered.set()
             assert _FakeController.start_release is not None
@@ -85,9 +85,8 @@ class _FakeController:
             raise _FakeController.stop_error
         assert self.start_args is not None
         return CaptureStats(
-            output_path=self.start_args[2],
+            output_path=self.start_args[1],
             seen=500,
-            matched=253,
             elapsed_seconds=2.5,
             output_bytes=4242,
         )
@@ -122,9 +121,9 @@ def test_start_capture_starts_controller_and_reports(tmp_path: Path) -> None:
 
     payload = _call(server, "start_capture", {"bus": 1, "output_path": str(out)})
 
-    assert payload == {"bus": 1, "device": None, "output_path": str(out)}
+    assert payload == {"bus": 1, "output_path": str(out)}
     (controller,) = _FakeController.instances
-    assert controller.start_args == (1, None, out)
+    assert controller.start_args == (1, out)
 
 
 def test_start_capture_normalizes_relative_output_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -136,7 +135,7 @@ def test_start_capture_normalizes_relative_output_path(monkeypatch: pytest.Monke
     payload = _call(server, "start_capture", {"bus": 1, "output_path": "live.pcapng"})
 
     assert payload["output_path"] == str(expected)
-    assert _FakeController.instances[0].start_args == (1, None, expected)
+    assert _FakeController.instances[0].start_args == (1, expected)
     _call(server, "stop_capture", {})
 
 
@@ -283,14 +282,13 @@ def test_stop_capture_returns_stats_and_autoloads(tmp_path: Path) -> None:
     session = Session()
     server = build_server(session=session)
     out = tmp_path / "live.pcapng"
-    _call(server, "start_capture", {"bus": 1, "device": 11, "output_path": str(out)})
-    assert _FakeController.instances[0].start_args == (1, 11, out)
+    _call(server, "start_capture", {"bus": 1, "output_path": str(out)})
+    assert _FakeController.instances[0].start_args == (1, out)
 
     payload = _call(server, "stop_capture", {})
 
     assert payload["output_path"] == str(out)
-    assert payload["events_seen"] == 500
-    assert payload["events_matched"] == 253
+    assert payload["events_captured"] == 500
     assert payload["elapsed_seconds"] == 2.5
     assert payload["output_bytes"] == 4242
     # the summary comes from a real decode of the captured file
@@ -407,14 +405,13 @@ def test_start_capture_waits_for_monkeypatched_capture_readiness(
 
     def fake_capture(
         bus: int,
-        device: int | None,
         output_path: Path,
         *,
         stop_event: Event,
         ready_event: Event | None = None,
         on_progress: ProgressCallback | None = None,
     ) -> CaptureStats:
-        del bus, device, on_progress
+        del bus, on_progress
         shutil.copyfile(_GOODIX, output_path)
         assert ready_event is not None
         ready_event.set()
@@ -422,7 +419,6 @@ def test_start_capture_waits_for_monkeypatched_capture_readiness(
         return CaptureStats(
             output_path=output_path,
             seen=253,
-            matched=253,
             elapsed_seconds=0.1,
             output_bytes=output_path.stat().st_size,
         )

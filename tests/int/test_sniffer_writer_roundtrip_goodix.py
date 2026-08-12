@@ -142,10 +142,10 @@ def roundtrip(
             return _ReplaySource(events)
 
         mp.setattr(sniffer, "UsbmonSource", _factory)
-        stats = capture(bus=_GOODIX_BUS, device=None, output_path=out_path, stop_event=Event())
+        stats = capture(bus=_GOODIX_BUS, output_path=out_path, stop_event=Event())
 
     # Bus-only capture writes every event it sees.
-    assert stats.matched == stats.seen == len(original_epbs)
+    assert stats.seen == len(original_epbs)
 
     _, reemitted_epbs = _read_epbs(out_path)
     return original_epbs, reemitted_epbs, link_type

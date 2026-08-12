@@ -182,8 +182,18 @@ def pair_command_responses(
     vendor_requests: list[int] = []
     vendor_endpoints: set[int] = set()
     failed_count = 0
+    capture_end = 0.0
 
     for transaction in transactions:
+        # The end of the capture is the last timestamp across all traffic,
+        # including control transfers and boundary orphans that never enter a
+        # lane. Deriving it from the filtered lane events would let a capture
+        # whose tail is control traffic suppress real unanswered commands near
+        # that tail (spec section 4.1 step 5).
+        for boundary_record in (transaction.submission, transaction.completion):
+            if boundary_record is not None:
+                capture_end = max(capture_end, boundary_record.timestamp)
+
         record = transaction.submission or transaction.completion
         if record is None:
             continue
@@ -214,7 +224,6 @@ def pair_command_responses(
     # Sort by timestamp, and on an exact tie put OUT before IN so a command and
     # its same-microsecond response are not inverted into unsolicited/unanswered.
     events.sort(key=lambda event: (event.timestamp, 0 if event.direction == "out" else 1))
-    capture_end = max((event.timestamp for event in events), default=0.0)
 
     pairs: list[CommandResponsePair] = []
     unanswered: list[UnpairedCommand] = []
@@ -279,7 +288,7 @@ def _pair_lane(
         while pending and event.timestamp - pending[0].timestamp > timeout_seconds:
             _flush_out(pending.popleft(), capture_end, timeout_seconds, unanswered)
         if pending:
-            command = pending.popleft()
+            command = _take_command(pending)
             if command.successful and event.successful:
                 pairs.append(_build_pair(command, event))
             # else: one side failed, the pair is explained by failed traffic.
@@ -290,6 +299,21 @@ def _pair_lane(
 
     while pending:
         _flush_out(pending.popleft(), capture_end, timeout_seconds, unanswered)
+
+
+def _take_command(pending: deque[AnalysisEvent]) -> AnalysisEvent:
+    """Remove and return the pending OUT this IN answers.
+
+    Prefers the oldest successful command, because spec section 4.1 step 3 pairs
+    a successful OUT with a successful IN and a failed OUT can never be the
+    command half of a pair. Only when no successful command is outstanding does
+    the oldest failed one come out, so it still explains the IN under step 4.
+    """
+    for index, candidate in enumerate(pending):
+        if candidate.successful:
+            del pending[index]
+            return candidate
+    return pending.popleft()
 
 
 def _flush_out(
@@ -417,7 +441,8 @@ def _incomplete_from(transaction: UrbTransaction) -> IncompleteTransferEvent:
         record = transaction.submission
         reason: IncompleteTransferReason = "orphan_submission"
     else:
-        assert transaction.completion is not None  # pair_urbs guarantees one side is present
+        if transaction.completion is None:
+            raise ValueError("pair_urbs guarantees a transaction has a submission or a completion")
         record = transaction.completion
         reason = "orphan_completion"
     return IncompleteTransferEvent(

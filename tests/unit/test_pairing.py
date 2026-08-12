@@ -435,3 +435,59 @@ def test_no_pairs_means_no_timing_stats() -> None:
     """With zero pairs the timing statistics are absent, not zeroed."""
     result = _run(_out_transaction(1, _BASE_TIME))
     assert result.response_timing is None
+
+
+def test_failed_out_does_not_consume_the_in_that_answers_a_later_good_out() -> None:
+    """A STALLed OUT then a retry OUT then one IN pairs the retry, not the failure.
+
+    Spec section 4.1 step 3 pairs a successful OUT with a successful IN. A failed
+    OUT can never be the command half, so the IN must answer the retry. Consuming
+    the failed OUT first would drop the real pair and report the retry as a false
+    unanswered command, the exact false positive this module exists to prevent.
+    """
+    result = _run(
+        _out_transaction(1, _BASE_TIME, data=b"\xaa\x01", completion_status=-32),
+        _out_transaction(2, _BASE_TIME + 0.100, data=b"\xaa\x01"),
+        _in_transaction(3, _BASE_TIME + 0.200, data=b"\xbb\x01"),
+    )
+    assert len(result.pairs) == 1
+    assert result.pairs[0].command.timestamp == _BASE_TIME + 0.100
+    assert not result.unanswered_commands
+    assert not result.unsolicited_responses
+    assert result.failed_event_count == 1
+
+
+def test_unanswered_command_survives_trailing_control_traffic() -> None:
+    """An unanswered OUT is still reported when the capture tail is control traffic.
+
+    The end of the capture is the last timestamp across all traffic, including
+    vendor control transfers that never enter a lane. Deriving it from the lane
+    events alone would place the capture end at the OUT itself and suppress this
+    genuine unanswered command.
+    """
+    late = _BASE_TIME + COMMAND_RESPONSE_TIMEOUT_SECONDS + 100.0
+    result = _run(
+        _out_transaction(1, _BASE_TIME),
+        _control_transaction(2, late, setup=b"\x40\x9a\x00\x00\x00\x00\x00\x00"),
+    )
+    assert len(result.unanswered_commands) == 1
+    assert result.vendor_control_count == 1
+
+
+def test_failed_out_explains_one_in_and_a_second_in_is_unsolicited() -> None:
+    """A failed OUT explains only one IN. A second IN with nothing pending stands.
+
+    Spec section 4.1 step 4: an IN is unsolicited only when nothing explains it.
+    The failed OUT explains the first IN and is then spent, so the second IN has
+    no pending command and is a real unsolicited response.
+    """
+    result = _run(
+        _out_transaction(1, _BASE_TIME, completion_status=-71),
+        _in_transaction(2, _BASE_TIME + 0.100),
+        _in_transaction(3, _BASE_TIME + 0.200),
+    )
+    assert not result.pairs
+    assert len(result.unsolicited_responses) == 1
+    assert result.unsolicited_responses[0].timestamp == _BASE_TIME + 0.200
+    assert not result.unanswered_commands
+    assert result.failed_event_count == 1

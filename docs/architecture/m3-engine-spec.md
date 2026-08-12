@@ -430,7 +430,7 @@ issue.
 ```python
 @dataclass(frozen=True)
 class ProtocolHypothesis:
-    device_id: str  # e.g. "dev_001_003"
+    device_id: str  # e.g. "27c6_63ac" (vid_pid), or "dev_001_003" when undescribed
     command_patterns: tuple[CommandPattern, ...]
     observations: tuple[AnalysisObservation, ...]
     unsolicited_responses: tuple[UnsolicitedResponse, ...]

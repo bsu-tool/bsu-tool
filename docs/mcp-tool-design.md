@@ -10,7 +10,7 @@ Suggested workflow:
 
 1. Call `load_capture` with a `.pcapng` path.
 2. Call `list_devices` to identify USB devices in the capture.
-3. Select the target device using `bus_num` / `dev_num`, endpoints seen, packet counts, and any visible descriptor data.
+3. Select the target device by its `device_id`, using endpoints seen, packet counts, and any visible descriptor data.
 4. Call `get_packets` with a narrow filter: target device, endpoint, direction, transfer type, URB event, and packet index range.
 5. Separate enumeration traffic from runtime communication when the evidence supports it.
 6. Summarize likely device behavior using packet-level evidence.
@@ -135,7 +135,9 @@ MCP protocol errors should be reserved for invalid MCP requests, unknown tools, 
 
 `device_id` is a tool/session-level stable identifier derived from the device record.
 
-Use `bus_num` and `dev_num` for USB topology because those names match the current session model.
+Use `bus_num` and `dev_num` for USB topology because those names match the current session model. They are
+*observations*, not identity: a device changes address while enumerating and on every replug, so `device_id`
+(vid:pid when descriptors were captured) is what identifies it, and `addresses` lists every address it held.
 
 ### Enums
 
@@ -197,7 +199,7 @@ For non-paginated tools, `pagination` may be omitted.
     "code": "INVALID_DEVICE_ID",
     "message": "The requested device_id was not found.",
     "details": {
-      "device_id": "dev_99"
+      "device_id": "1d50_60c6"
     }
   }
 }
@@ -435,7 +437,7 @@ Example `structuredContent.data`:
 {
   "devices": [
     {
-      "device_id": "dev_01",
+      "device_id": "27c6_63ac",
       "bus_num": 1,
       "dev_num": 4,
       "vendor_id": "0x1234",
@@ -557,7 +559,7 @@ Example usage:
 
 ```python
 get_packets(
-    device_id="dev_01",
+    device_id="27c6_63ac",
     endpoint_address="0x81",
     direction="in",
     transfer_type="bulk",
@@ -581,7 +583,7 @@ Example `structuredContent.data`:
       "interface_id": 0,
       "timestamp_us": 421231,
       "urb_id": "urb_7f2b0010",
-      "device_id": "dev_01",
+      "device_id": "27c6_63ac",
       "bus_num": 1,
       "dev_num": 4,
       "endpoint_address": "0x81",
@@ -709,7 +711,7 @@ Likely output:
 Example usage:
 
 ```python
-list_endpoints(device_id="dev_01", include_ep0=True)
+list_endpoints(device_id="27c6_63ac", include_ep0=True)
 ```
 
 ---
@@ -771,7 +773,7 @@ Likely output:
 Example usage:
 
 ```python
-infer_traffic_phase(device_id="dev_01", method="heuristic_v1", include_reasons=True)
+infer_traffic_phase(device_id="27c6_63ac", method="heuristic_v1", include_reasons=True)
 ```
 
 ---
@@ -805,7 +807,7 @@ Example usage:
 
 ```python
 summarize_device_activity(
-    device_id="dev_01", traffic_phase="any", include_repeated_payload_previews=False, top_n_previews=10
+    device_id="27c6_63ac", traffic_phase="any", include_repeated_payload_previews=False, top_n_previews=10
 )
 ```
 
@@ -891,10 +893,10 @@ load_capture(path="/captures/device_trace.pcapng")
 
 list_devices(include_descriptor_summary=True)
 
-get_packets(device_id="dev_01", limit=40, include_data_preview=True)
+get_packets(device_id="27c6_63ac", limit=40, include_data_preview=True)
 
 get_packets(
-    device_id="dev_01",
+    device_id="27c6_63ac",
     endpoint_address="0x81",
     direction="in",
     transfer_type="bulk",
@@ -908,12 +910,12 @@ get_packets(
 ## Extended workflow if supporting tools are available
 
 ```python
-list_endpoints(device_id="dev_01", include_ep0=True)
+list_endpoints(device_id="27c6_63ac", include_ep0=True)
 
-infer_traffic_phase(device_id="dev_01", method="heuristic_v1", include_reasons=True)
+infer_traffic_phase(device_id="27c6_63ac", method="heuristic_v1", include_reasons=True)
 
 get_packets(
-    device_id="dev_01", transfer_type="control", traffic_phase="enumeration", limit=40, include_setup_summary=True
+    device_id="27c6_63ac", transfer_type="control", traffic_phase="enumeration", limit=40, include_setup_summary=True
 )
 
 get_control_transfer_details(packet_index=12, include_descriptor_decode=True)
@@ -921,12 +923,12 @@ get_control_transfer_details(packet_index=12, include_descriptor_decode=True)
 mark_session_marker(
     name="suspected_runtime_loop",
     packet_index=421,
-    device_id="dev_01",
+    device_id="27c6_63ac",
     note="Possible start of repeated runtime communication.",
     tags=["hypothesis", "runtime"],
 )
 
-list_session_markers(device_id="dev_01", tag="runtime")
+list_session_markers(device_id="27c6_63ac", tag="runtime")
 
-summarize_device_activity(device_id="dev_01", traffic_phase="any", include_repeated_payload_previews=False)
+summarize_device_activity(device_id="27c6_63ac", traffic_phase="any", include_repeated_payload_previews=False)
 ```

@@ -212,7 +212,7 @@ marker hits. With the M3 spec's current model, each `CommandPattern` has at most
 The deterministic summary should be compact:
 
 ```text
-Device dev_001_011 has 3 repeated command patterns across endpoints 0x01 and 0x83.
+Device 27c6_63ac has 3 repeated command patterns across endpoints 0x01 and 0x83.
 pattern_01 occurs 12 times near marker enroll-start and contains 2 steps: OUT bulk 0x01,
 then IN bulk 0x83. Median response time is 4.2 ms. 1 incomplete transfer was observed at a
 capture boundary.

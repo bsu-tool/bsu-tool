@@ -3,8 +3,9 @@
 Wraps the Milestone 3 protocol hypothesis engine (``docs/architecture/m3-engine-spec.md``)
 so Claude can request an analysis of the active capture.
 
-The engine is not merged yet; it lands with issues #63, #64, and #66. Everything that
-does not depend on it is implemented here.
+Nothing assembles a ``ProtocolHypothesis`` yet — sequence detection (#63) and
+command/response pairing (#64) have landed, assembly (#66) has not. Everything that
+does not depend on that assembly step is implemented here.
 """
 
 from __future__ import annotations
@@ -13,41 +14,42 @@ from dataclasses import dataclass
 
 from mcp.server.fastmcp import FastMCP
 
-from bsu_tool.session import Capture, JsonDict, Session
-
-# JsonDict is a recursive alias whose forward references name JsonValue. FastMCP
-# resolves this module's annotations when it builds the tool schema, so JsonValue
-# must be importable from here or registration fails with a NameError.
-from bsu_tool.session import JsonValue as JsonValue
+from bsu_tool.analysis.models import ProtocolHypothesis
+from bsu_tool.session import Capture, Session
 
 
-@dataclass(frozen=True, slots=True)
+# Not slots=True: pydantic reads a slot descriptor as an unserializable default and
+# drops the whole output schema, which is why the other tools expose none.
+@dataclass(frozen=True)
 class AnalyzeProtocolResult:
     """Protocol hypotheses for the analyzed devices, one entry per device.
 
-    Entries are JSON objects shaped by the engine's ``ProtocolHypothesis`` (spec
-    section 5.1) — each naming its own ``device_id`` and carrying that device's
-    ``analysis_notes``. They stay plain JSON until the engine's output types are
-    merged, at which point they become typed models in
-    :mod:`bsu_tool.mcp.interfaces`.
+    Entries are the engine's own :class:`ProtocolHypothesis` (spec section 5.1),
+    each naming its ``device_id`` and carrying that device's ``analysis_notes``.
+    Those models are already JSON-safe, so they are returned directly rather than
+    mirrored into :mod:`bsu_tool.mcp.interfaces`.
     """
 
-    hypotheses: tuple[JsonDict, ...]
+    hypotheses: tuple[ProtocolHypothesis, ...]
 
 
-def _generate_hypotheses(capture: Capture, device_ids: tuple[str, ...]) -> tuple[JsonDict, ...]:
+def _generate_hypotheses(capture: Capture, device_ids: tuple[str, ...]) -> tuple[ProtocolHypothesis, ...]:
     """Run the protocol hypothesis engine over ``device_ids``.
 
     This is the single seam between the MCP layer and the engine; tests replace it
     to exercise the surrounding plumbing.
 
+    The signature is provisional. Spec section 1.3 makes a ``DeviceContext`` per
+    device a required engine input rather than an enrichment, built from the
+    descriptors :meth:`Session.get_enumeration` already recovers; and section 5.12
+    puts that context plus the engine's deterministic summary in the response
+    alongside the hypotheses. Wiring the engine means satisfying all three.
+
     Raises:
-        NotImplementedError: The engine is not available yet.
+        NotImplementedError: No hypothesis assembly is available yet.
     """
     del capture, device_ids
-    raise NotImplementedError(
-        "the protocol hypothesis engine is not available yet; it lands with issues #63, #64, and #66"
-    )
+    raise NotImplementedError("no protocol hypothesis assembly is available yet; it lands with issue #66")
 
 
 def register(mcp: FastMCP, session: Session) -> None:

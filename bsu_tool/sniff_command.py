@@ -126,7 +126,7 @@ def run_sniff(
     resolved_vid = "0000"
     resolved_pid = "0000"
     resolved_address = str(device) if device is not None else "0"
-    
+
     # Calculate a sequence block id based on epoch tracking
     sequence_num = int(time.time()) % 10000
 

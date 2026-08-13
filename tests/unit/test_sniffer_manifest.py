@@ -27,22 +27,21 @@ def mock_capture_stats(tmp_path: Path) -> CaptureStats:
 def test_capture_controller_writes_manifest_on_stop(tmp_path: Path, mock_capture_stats: CaptureStats) -> None:
     """Verifies that CaptureController.stop() generates a valid sidecar manifest."""
     controller = CaptureController()
-    
+
     # Target path inside our temporary test sandbox
     target_pcap = tmp_path / "test_run.pcapng"
 
     # Mock out the internal blocking core loop
     with patch("bsu_tool.sniffer.capture", return_value=mock_capture_stats):
-        
         # Create a mock thread that says it is no longer alive so join() finishes instantly
         mock_thread = MagicMock()
         mock_thread.is_alive.return_value = False
 
         # Simulate active worker instance state variables manually
-        controller._started = True
-        controller._output_path = target_pcap
-        controller._stats = mock_capture_stats
-        controller._thread = mock_thread
+        controller._started = True  # pyright: ignore[reportPrivateUsage]
+        controller._output_path = target_pcap  # pyright: ignore[reportPrivateUsage]
+        controller._stats = mock_capture_stats  # pyright: ignore[reportPrivateUsage]
+        controller._thread = mock_thread  # pyright: ignore[reportPrivateUsage]
 
         # Stop the session programmatically (triggers manifest generation hook)
         final_stats = controller.stop()

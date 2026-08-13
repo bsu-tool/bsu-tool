@@ -21,6 +21,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from anyio import Lock
 from anyio.to_thread import run_sync
 from mcp.server.fastmcp import FastMCP
 
@@ -76,12 +77,18 @@ def ask_human(
 
 
 class _HumanChannel:
-    """The analyst input/output channel, with a latch so an ended session stays ended.
+    """The analyst input/output channel: one question at a time, and an ended session stays ended.
 
-    Once the channel aborts (end of input, terminal gone), every later call
-    returns the same aborted result instead of blocking on a reader that will
-    only fail again. Without the latch a model that keeps calling the tool after
-    an abort spins tightly on instant failures.
+    There is one analyst and one terminal, so questions are serialized. The MCP
+    server dispatches tool calls concurrently, and without the turn lock a model
+    that emits two ``wait_for_human`` calls in one turn prints both prompts over
+    each other and puts two worker threads on the same stdin, where whichever
+    thread wins takes the analyst's line.
+
+    The channel also latches its abort. Once it aborts (end of input, terminal
+    gone), every later call returns the same aborted result instead of blocking
+    on a reader that will only fail again. Without the latch a model that keeps
+    calling the tool after an abort spins tightly on instant failures.
     """
 
     def __init__(self, write: Callable[[str], None], read: Callable[[], str]) -> None:
@@ -89,15 +96,23 @@ class _HumanChannel:
         self._write = write
         self._read = read
         self._aborted_reason: str | None = None
+        self._turn = Lock()
 
     async def ask(self, question: str) -> WaitForHumanResult:
-        """Ask one question, offloading the blocking read off the event loop."""
-        if self._aborted_reason is not None:
-            return WaitForHumanResult(answer=None, aborted=True, reason=self._aborted_reason)
-        result: WaitForHumanResult = await run_sync(lambda: ask_human(question, write=self._write, read=self._read))
-        if result.aborted:
-            self._aborted_reason = result.reason
-        return result
+        """Ask one question, offloading the blocking read off the event loop.
+
+        The latch is checked inside the turn lock, not outside it. Checked
+        outside, a caller queued behind another passes the check before its
+        predecessor aborts and then reads anyway; inside, it sees the abort and
+        returns without ever touching the reader.
+        """
+        async with self._turn:
+            if self._aborted_reason is not None:
+                return WaitForHumanResult(answer=None, aborted=True, reason=self._aborted_reason)
+            result: WaitForHumanResult = await run_sync(lambda: ask_human(question, write=self._write, read=self._read))
+            if result.aborted:
+                self._aborted_reason = result.reason
+            return result
 
 
 def build_human_server(

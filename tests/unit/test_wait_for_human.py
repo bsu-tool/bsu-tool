@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import builtins
-import importlib
 import json
-import pkgutil
+import subprocess
+import sys
+import textwrap
+import threading
 from collections.abc import Callable
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent
 
-import bsu_tool.mcp
 from bsu_tool.guided.human import WaitForHumanResult, ask_human, build_human_server
 
 
@@ -132,11 +133,117 @@ def test_mcp_package_never_imports_guided() -> None:
 
     This is the load-bearing safety property: if any bsu_tool.mcp module pulled
     in bsu_tool.guided, the stdin-reading tool could end up on the transport.
+
+    Asserted on module objects rather than on source text. A text search for
+    "bsu_tool.guided" misses a relative import (``from ...guided.human import
+    ask_human``), which is the likelier way this gets reintroduced, and walking
+    submodules never scans the package root. Importing the whole package in a
+    clean subprocess and inspecting ``sys.modules`` catches relative, absolute,
+    and transitive imports, in any file including ``__init__.py``.
     """
-    for module in pkgutil.walk_packages(bsu_tool.mcp.__path__, prefix="bsu_tool.mcp."):
-        loaded = importlib.import_module(module.name)
-        source = getattr(loaded, "__file__", None)
-        if source is None:
-            continue
-        with open(source, encoding="utf-8") as handle:
-            assert "bsu_tool.guided" not in handle.read(), f"{module.name} imports bsu_tool.guided"
+    probe = textwrap.dedent(
+        """
+        import importlib
+        import pkgutil
+        import sys
+
+        import bsu_tool.mcp
+
+        for module in pkgutil.walk_packages(bsu_tool.mcp.__path__, prefix="bsu_tool.mcp."):
+            importlib.import_module(module.name)
+
+        leaked = sorted(
+            name
+            for name in sys.modules
+            if name == "bsu_tool.guided" or name.startswith("bsu_tool.guided.")
+        )
+        print(",".join(leaked))
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    leaked = completed.stdout.strip()
+    assert leaked == "", f"bsu_tool.mcp pulled in guided modules: {leaked}"
+
+
+def test_concurrent_calls_are_serialized_on_one_analyst() -> None:
+    """Two overlapping calls take turns: one prompt, one read, then the next.
+
+    There is one analyst and one stdin. Without the turn lock both prompts print
+    over each other and two threads race on the reader.
+    """
+    events: list[str] = []
+    in_reader = threading.Semaphore(0)
+    release = threading.Semaphore(0)
+
+    def read() -> str:
+        events.append("read-start")
+        in_reader.release()
+        # Bounded, so a regression fails this test instead of hanging it: on the
+        # unlocked code both reader threads park here and never come back.
+        release.acquire(timeout=10)
+        events.append("read-end")
+        return "answer"
+
+    def write(text: str) -> None:
+        if text.strip():
+            events.append(f"write:{text.strip()}")
+
+    server = build_human_server(write=write, read=read)
+
+    async def drive() -> None:
+        async def unblock() -> None:
+            # Let the first call reach the reader, prove the second has not
+            # started, then release both in turn.
+            assert await asyncio.to_thread(in_reader.acquire, True, 10)
+            concurrent = events.count("read-start")
+            release.release()
+            assert await asyncio.to_thread(in_reader.acquire, True, 10)
+            release.release()
+            assert concurrent == 1, f"the second call read while the first held the terminal: {events}"
+
+        await asyncio.gather(
+            server.call_tool("wait_for_human", {"question": "one?"}),
+            server.call_tool("wait_for_human", {"question": "two?"}),
+            unblock(),
+        )
+
+    asyncio.run(drive())
+    # Each read is fully bracketed by its own turn: no interleaving.
+    assert events.count("read-start") == 2
+    for first, second in zip(events, events[1:]):
+        assert not (first == "read-start" and second == "read-start"), events
+
+
+def test_abort_latch_holds_against_a_queued_concurrent_call() -> None:
+    """A call queued behind an aborting call must not read: it sees the latch.
+
+    This is the concurrent form of test_abort_is_latched_so_repeated_calls_do_not_spin.
+    With the latch checked outside the turn lock the queued caller passes the
+    check before its predecessor aborts and reads anyway (reader called twice).
+    """
+    reads = 0
+    lock = threading.Lock()
+
+    def read() -> str:
+        nonlocal reads
+        with lock:
+            reads += 1
+        raise EOFError
+
+    server = build_human_server(write=lambda text: None, read=read)
+
+    async def drive() -> list[object]:
+        return list(
+            await asyncio.gather(
+                server.call_tool("wait_for_human", {"question": "one?"}),
+                server.call_tool("wait_for_human", {"question": "two?"}),
+            )
+        )
+
+    asyncio.run(drive())
+    assert reads == 1, f"the queued call read past the abort latch (reads={reads})"

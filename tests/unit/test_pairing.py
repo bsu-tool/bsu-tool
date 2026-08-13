@@ -7,6 +7,7 @@ from bsu_tool.analysis.pairing import (
     PairingResult,
     pair_command_responses,
 )
+from bsu_tool.device_identity import DeviceIdMap, address_device_id
 from bsu_tool.urb_decoder import Direction, EventType, TransferType, UrbRecord, UrbTransaction
 
 _BASE_TIME = 1_000_000.0
@@ -144,9 +145,21 @@ def _control_transaction(urb_id: int, at: float, *, setup: bytes) -> UrbTransact
     return UrbTransaction(urb_id=urb_id, submission=submission, completion=completion)
 
 
-def _run(*transactions: UrbTransaction) -> PairingResult:
-    """Run the pairing pass over the given transactions."""
-    return pair_command_responses(tuple(transactions))
+def _run(*transactions: UrbTransaction, device_ids: DeviceIdMap | None = None) -> PairingResult:
+    """Run the pairing pass over the given transactions.
+
+    Defaults to one address-derived id per address, the resolution a capture
+    with no descriptors gets, so each address is its own device. Pass
+    ``device_ids`` to model a device seen at more than one address.
+    """
+    if device_ids is None:
+        device_ids = {
+            (record.bus_num, record.dev_num): address_device_id(record.bus_num, record.dev_num)
+            for transaction in transactions
+            for record in (transaction.submission, transaction.completion)
+            if record is not None
+        }
+    return pair_command_responses(tuple(transactions), device_ids=device_ids)
 
 
 def test_out_then_in_on_same_lane_pairs() -> None:
@@ -491,3 +504,30 @@ def test_failed_out_explains_one_in_and_a_second_in_is_unsolicited() -> None:
     assert result.unsolicited_responses[0].timestamp == _BASE_TIME + 0.200
     assert not result.unanswered_commands
     assert result.failed_event_count == 1
+
+
+def test_a_device_that_re_addresses_stays_one_lane() -> None:
+    """A command sent before a replug pairs with the response that follows it.
+
+    The kernel assigns a new address on every replug, so the same device speaks
+    from two addresses within one capture. Lanes key on the resolved device_id
+    for exactly this reason: keying on the address splits the exchange in two
+    and invents an unsolicited response out of the real answer.
+    """
+    transactions = (
+        _out_transaction(1, _BASE_TIME, dev_num=5, data=b"\xd0\x01"),
+        _in_transaction(2, _BASE_TIME + 0.1, dev_num=9, data=b"\xd0\x99"),
+    )
+    one_device = {(1, 5): "1a86_7523", (1, 9): "1a86_7523"}
+
+    result = _run(*transactions, device_ids=one_device)
+
+    assert len(result.pairs) == 1
+    assert result.pairs[0].device_id == "1a86_7523"
+    assert not result.unsolicited_responses
+
+    # The same traffic under address-derived ids is what the old keying saw: two
+    # lanes, no pair, and the answer misreported as unsolicited.
+    split = _run(*transactions)
+    assert not split.pairs
+    assert len(split.unsolicited_responses) == 1

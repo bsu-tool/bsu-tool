@@ -10,6 +10,12 @@ A single transaction is never a pair. One transaction is one URB id lifecycle,
 while a command/response pair is a protocol level relationship between two
 directional events.
 
+"Same device" means the same resolved ``device_id``, not the same bus/address
+pair. A device answers at address 0 while the kernel reads its descriptors and
+takes a fresh address on every replug, so an address-keyed lane would split one
+device several ways and lose any exchange that straddles a replug. Callers pass
+``Capture.device_ids`` for that resolution.
+
 Scope, per spec section 4.2: standard Control transfers are excluded entirely.
 Vendor specific Control transfers are counted and reported in the result notes,
 and are not fed into pairing.
@@ -36,6 +42,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from bsu_tool.analysis.models import IncompleteTransferReason, ResponseTimingStats
+from bsu_tool.device_identity import DeviceIdMap, resolve_device_id
 from bsu_tool.urb_decoder import Direction, TransferType, UrbTransaction
 
 COMMAND_RESPONSE_TIMEOUT_SECONDS: Final[float] = 5.0
@@ -61,8 +68,7 @@ _REQUEST_TYPE_MASK: Final[int] = 0x03
 class AnalysisEvent:
     """One directional, payload-bearing event derived from a transaction."""
 
-    bus_num: int
-    dev_num: int
+    device_id: str
     endpoint_number: int
     endpoint_address: str
     direction: Direction
@@ -79,8 +85,7 @@ class AnalysisEvent:
 class CommandResponsePair:
     """A likely command and its response on one endpoint lane."""
 
-    bus_num: int
-    dev_num: int
+    device_id: str
     endpoint_number: int
     command: AnalysisEvent
     response: AnalysisEvent
@@ -101,8 +106,7 @@ class UnpairedCommand:
     the aggregated :class:`bsu_tool.analysis.models.UnansweredCommand`.
     """
 
-    bus_num: int
-    dev_num: int
+    device_id: str
     endpoint_number: int
     endpoint_address: str
     transfer_type: TransferType
@@ -118,8 +122,7 @@ class UnpairedResponse:
     the aggregated :class:`bsu_tool.analysis.models.UnsolicitedResponse`.
     """
 
-    bus_num: int
-    dev_num: int
+    device_id: str
     endpoint_number: int
     endpoint_address: str
     transfer_type: TransferType
@@ -135,8 +138,7 @@ class IncompleteTransferEvent:
     :class:`bsu_tool.analysis.models.IncompleteTransfer`.
     """
 
-    bus_num: int
-    dev_num: int
+    device_id: str
     endpoint_number: int
     endpoint_address: str
     direction: Direction
@@ -162,6 +164,7 @@ class PairingResult:
 def pair_command_responses(
     transactions: tuple[UrbTransaction, ...],
     *,
+    device_ids: DeviceIdMap,
     timeout_seconds: float = COMMAND_RESPONSE_TIMEOUT_SECONDS,
 ) -> PairingResult:
     """Run the section 4.1 pairing pass over decoded transactions.
@@ -169,6 +172,9 @@ def pair_command_responses(
     Args:
         transactions: The ``UrbTransaction`` objects from a loaded capture,
             exactly as ``Capture.transactions`` holds them.
+        device_ids: ``Capture.device_ids``, mapping each observed address to the
+            device that owns it. Lanes are keyed on the resolved id so a device
+            that re-addresses mid-capture stays one lane.
         timeout_seconds: Maximum capture-time gap for an IN to answer an OUT.
 
     Returns:
@@ -204,9 +210,9 @@ def pair_command_responses(
                 vendor_endpoints.add(record.endpoint)
             continue
 
-        event = _to_event(transaction)
+        event = _to_event(transaction, device_ids)
         if event is None:
-            incomplete.append(_incomplete_from(transaction))
+            incomplete.append(_incomplete_from(transaction, device_ids))
             continue
         if event.boundary_orphan:
             # A URB in flight at a capture edge is a lifecycle orphan, not a
@@ -232,9 +238,15 @@ def pair_command_responses(
     # Scope is device and endpoint number only, per spec section 4.1. Transfer
     # type is determined by (device, endpoint number, direction) in USB, so it
     # is not part of the key.
-    lanes: dict[tuple[int, int, int], list[AnalysisEvent]] = {}
+    #
+    # The device half is the resolved device_id, not the bus/address pair. A
+    # device answers at address 0 while enumerating and takes a new address on
+    # every replug, so keying on the address would split one device into a lane
+    # per address and leave a command before a replug unable to pair with the
+    # response after it.
+    lanes: dict[tuple[str, int], list[AnalysisEvent]] = {}
     for event in events:
-        key = (event.bus_num, event.dev_num, event.endpoint_number)
+        key = (event.device_id, event.endpoint_number)
         lanes.setdefault(key, []).append(event)
 
     for lane_events in lanes.values():
@@ -344,8 +356,7 @@ def _record_unanswered(
     """File an unpaired OUT as an unanswered command."""
     unanswered.append(
         UnpairedCommand(
-            bus_num=event.bus_num,
-            dev_num=event.dev_num,
+            device_id=event.device_id,
             endpoint_number=event.endpoint_number,
             endpoint_address=event.endpoint_address,
             transfer_type=event.transfer_type,
@@ -362,8 +373,7 @@ def _record_unsolicited(
     """File an unpaired IN as an unsolicited response."""
     unsolicited.append(
         UnpairedResponse(
-            bus_num=event.bus_num,
-            dev_num=event.dev_num,
+            device_id=event.device_id,
             endpoint_number=event.endpoint_number,
             endpoint_address=event.endpoint_address,
             transfer_type=event.transfer_type,
@@ -381,8 +391,7 @@ def _build_pair(command: AnalysisEvent, response: AnalysisEvent) -> CommandRespo
         echoed += 1
     differing = tuple(index for index in range(compare) if command.data[index] != response.data[index])
     return CommandResponsePair(
-        bus_num=command.bus_num,
-        dev_num=command.dev_num,
+        device_id=command.device_id,
         endpoint_number=command.endpoint_number,
         command=command,
         response=response,
@@ -393,7 +402,7 @@ def _build_pair(command: AnalysisEvent, response: AnalysisEvent) -> CommandRespo
     )
 
 
-def _to_event(transaction: UrbTransaction) -> AnalysisEvent | None:
+def _to_event(transaction: UrbTransaction, device_ids: DeviceIdMap) -> AnalysisEvent | None:
     """Build the payload-bearing analysis event for one transaction.
 
     OUT commands take their payload from the submission record. IN responses
@@ -416,8 +425,7 @@ def _to_event(transaction: UrbTransaction) -> AnalysisEvent | None:
     status = transaction.completion.status if transaction.completion is not None else None
     successful = status == 0
     return AnalysisEvent(
-        bus_num=payload.bus_num,
-        dev_num=payload.dev_num,
+        device_id=resolve_device_id(device_ids, payload),
         endpoint_number=payload.endpoint,
         endpoint_address=_endpoint_address(payload.endpoint, payload.direction),
         direction=payload.direction,
@@ -430,7 +438,7 @@ def _to_event(transaction: UrbTransaction) -> AnalysisEvent | None:
     )
 
 
-def _incomplete_from(transaction: UrbTransaction) -> IncompleteTransferEvent:
+def _incomplete_from(transaction: UrbTransaction, device_ids: DeviceIdMap) -> IncompleteTransferEvent:
     """Build an incomplete-transfer record for a transaction with no payload side.
 
     The reason follows which half survived. A submission with no completion is
@@ -446,8 +454,7 @@ def _incomplete_from(transaction: UrbTransaction) -> IncompleteTransferEvent:
         record = transaction.completion
         reason = "orphan_completion"
     return IncompleteTransferEvent(
-        bus_num=record.bus_num,
-        dev_num=record.dev_num,
+        device_id=resolve_device_id(device_ids, record),
         endpoint_number=record.endpoint,
         endpoint_address=_endpoint_address(record.endpoint, record.direction),
         direction=record.direction,
@@ -459,8 +466,7 @@ def _incomplete_from(transaction: UrbTransaction) -> IncompleteTransferEvent:
 def _incomplete_from_event(event: AnalysisEvent, reason: IncompleteTransferReason) -> IncompleteTransferEvent:
     """Build an incomplete-transfer record from an event at a capture boundary."""
     return IncompleteTransferEvent(
-        bus_num=event.bus_num,
-        dev_num=event.dev_num,
+        device_id=event.device_id,
         endpoint_number=event.endpoint_number,
         endpoint_address=event.endpoint_address,
         direction=event.direction,

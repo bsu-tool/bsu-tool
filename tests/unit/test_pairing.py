@@ -145,8 +145,8 @@ def _control_transaction(urb_id: int, at: float, *, setup: bytes) -> UrbTransact
     return UrbTransaction(urb_id=urb_id, submission=submission, completion=completion)
 
 
-def _run(*transactions: UrbTransaction, device_ids: DeviceIdMap | None = None) -> PairingResult:
-    """Run the pairing pass over the given transactions.
+def _run_all(*transactions: UrbTransaction, device_ids: DeviceIdMap | None = None) -> tuple[PairingResult, ...]:
+    """Run the pairing pass and return every device's result.
 
     Defaults to one address-derived id per address, the resolution a capture
     with no descriptors gets, so each address is its own device. Pass
@@ -160,6 +160,31 @@ def _run(*transactions: UrbTransaction, device_ids: DeviceIdMap | None = None) -
             if record is not None
         }
     return pair_command_responses(tuple(transactions), device_ids=device_ids)
+
+
+def _run(*transactions: UrbTransaction, device_ids: DeviceIdMap | None = None) -> PairingResult:
+    """Run the pairing pass over transactions from a single device.
+
+    Most tests exercise one device, so this collapses the per-device tuple to
+    the one result and asserts that assumption rather than letting a second
+    device slip past unnoticed.
+    """
+    results = _run_all(*transactions, device_ids=device_ids)
+    if not results:
+        return PairingResult(
+            device_id="",
+            pairs=(),
+            unanswered_commands=(),
+            unsolicited_responses=(),
+            incomplete_transfers=(),
+            response_timing=None,
+            vendor_control_count=0,
+            vendor_control_requests=(),
+            analysis_notes=(),
+            failed_event_count=0,
+        )
+    assert len(results) == 1, f"expected one device, got {[r.device_id for r in results]}"
+    return results[0]
 
 
 def test_out_then_in_on_same_lane_pairs() -> None:
@@ -268,14 +293,21 @@ def test_cross_endpoint_events_do_not_pair() -> None:
 
 
 def test_cross_device_events_do_not_pair() -> None:
-    """Events from two devices on the same endpoint number stay unpaired."""
-    result = _run(
+    """Events from two devices on the same endpoint number stay unpaired.
+
+    They also land in separate results, so neither device's counts are inflated
+    by the other's traffic.
+    """
+    commander, responder = _run_all(
         _out_transaction(1, _BASE_TIME, dev_num=5),
         _in_transaction(2, _BASE_TIME + 6.0, dev_num=6),
     )
-    assert not result.pairs
-    assert len(result.unanswered_commands) == 1
-    assert len(result.unsolicited_responses) == 1
+    assert (commander.device_id, responder.device_id) == ("dev_001_005", "dev_001_006")
+    assert not commander.pairs and not responder.pairs
+    assert len(commander.unanswered_commands) == 1
+    assert not commander.unsolicited_responses
+    assert len(responder.unsolicited_responses) == 1
+    assert not responder.unanswered_commands
 
 
 def test_failed_out_does_not_produce_a_false_unsolicited_response() -> None:
@@ -380,7 +412,9 @@ def test_standard_control_is_excluded_entirely() -> None:
     result = _run(_control_transaction(1, _BASE_TIME, setup=b"\x80\x06\x00\x01\x00\x00\x12\x00"))
     assert not result.pairs
     assert result.vendor_control_count == 0
-    assert not result.analysis_notes
+    # The device still reports itself, so a reader can tell "nothing to pair"
+    # apart from "device absent from the capture".
+    assert result.analysis_notes == ("no bulk or interrupt traffic for this device, nothing to pair",)
 
 
 def test_vendor_control_is_counted_with_request_codes() -> None:
@@ -527,7 +561,90 @@ def test_a_device_that_re_addresses_stays_one_lane() -> None:
     assert not result.unsolicited_responses
 
     # The same traffic under address-derived ids is what the old keying saw: two
-    # lanes, no pair, and the answer misreported as unsolicited.
-    split = _run(*transactions)
-    assert not split.pairs
-    assert len(split.unsolicited_responses) == 1
+    # separate devices, no pair, and the answer misreported as unsolicited.
+    split = _run_all(*transactions)
+    assert [r.device_id for r in split] == ["dev_001_005", "dev_001_009"]
+    assert not any(r.pairs for r in split)
+    assert len(split[1].unsolicited_responses) == 1
+
+
+def test_results_are_scoped_per_device() -> None:
+    """One device's traffic never inflates another's counts or timing.
+
+    Captures are bus-wide since the capture-time device filter was removed, so
+    a target device always shares a capture with root hubs and unrelated
+    peripherals. A capture-wide result would average their response times
+    together with nothing in the value to say so.
+    """
+    results = _run_all(
+        # Device 5: a real exchange.
+        _out_transaction(1, _BASE_TIME, dev_num=5),
+        _in_transaction(2, _BASE_TIME + 0.1, dev_num=5),
+        # Device 6: unrelated inbound polling, the shape a root hub produces.
+        _in_transaction(3, _BASE_TIME + 0.2, dev_num=6),
+        _in_transaction(4, _BASE_TIME + 0.3, dev_num=6),
+    )
+
+    by_id = {result.device_id: result for result in results}
+    assert set(by_id) == {"dev_001_005", "dev_001_006"}
+
+    assert len(by_id["dev_001_005"].pairs) == 1
+    assert not by_id["dev_001_005"].unsolicited_responses
+    # Timing covers this device's one pair only.
+    timing = by_id["dev_001_005"].response_timing
+    assert timing is not None
+    assert 99.0 < timing.mean_ms < 101.0
+
+    assert not by_id["dev_001_006"].pairs
+    assert len(by_id["dev_001_006"].unsolicited_responses) == 2
+    # No pairs means no timing to report, rather than the other device's.
+    assert by_id["dev_001_006"].response_timing is None
+
+
+def test_results_are_sorted_by_device_id() -> None:
+    """Result order is deterministic regardless of which device spoke first."""
+    results = _run_all(
+        _in_transaction(1, _BASE_TIME, dev_num=9),
+        _in_transaction(2, _BASE_TIME + 0.1, dev_num=4),
+    )
+    assert [result.device_id for result in results] == ["dev_001_004", "dev_001_009"]
+
+
+def test_device_id_filter_returns_only_that_device() -> None:
+    """The filter narrows to one device, mirroring detect_repeated_sequences."""
+    transactions = (
+        _out_transaction(1, _BASE_TIME, dev_num=5),
+        _in_transaction(2, _BASE_TIME + 0.1, dev_num=5),
+        _in_transaction(3, _BASE_TIME + 0.2, dev_num=6),
+    )
+    device_ids = {(1, 5): "dev_001_005", (1, 6): "dev_001_006"}
+
+    (only,) = pair_command_responses(transactions, device_ids=device_ids, device_id="dev_001_005")
+
+    assert only.device_id == "dev_001_005"
+    assert len(only.pairs) == 1
+
+
+def test_unknown_device_id_filter_yields_no_results() -> None:
+    """An id absent from the capture returns nothing rather than an empty shell."""
+    results = pair_command_responses(
+        (_out_transaction(1, _BASE_TIME, dev_num=5),),
+        device_ids={(1, 5): "dev_001_005"},
+        device_id="1a86_7523",
+    )
+    assert results == ()
+
+
+def test_capture_boundary_is_shared_across_devices() -> None:
+    """Boundary suppression measures against the capture end, not per device.
+
+    Device 5 goes quiet early while device 6 keeps the capture running. Its
+    unanswered command is real and must still be reported, which would not
+    happen if each device carried its own private notion of the capture end.
+    """
+    results = _run_all(
+        _out_transaction(1, _BASE_TIME, dev_num=5),
+        _in_transaction(2, _BASE_TIME + 30.0, dev_num=6),
+    )
+    by_id = {result.device_id: result for result in results}
+    assert len(by_id["dev_001_005"].unanswered_commands) == 1

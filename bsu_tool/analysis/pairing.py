@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import statistics
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Final
 
 from bsu_tool.analysis.models import IncompleteTransferReason, ResponseTimingStats
@@ -148,8 +148,17 @@ class IncompleteTransferEvent:
 
 @dataclass(frozen=True, slots=True)
 class PairingResult:
-    """Everything the pairing pass produced from one set of transactions."""
+    """Everything the pairing pass produced for **one device**.
 
+    One result per device, mirroring
+    :func:`~bsu_tool.analyzer.detect_repeated_sequences`. Captures are bus-wide,
+    so a single capture routinely holds a target device alongside root hubs and
+    unrelated peripherals. A capture-wide result would let ``response_timing``
+    average a fingerprint reader together with a hub's interrupt polling, with
+    nothing in the value to say it had done so.
+    """
+
+    device_id: str
     pairs: tuple[CommandResponsePair, ...]
     unanswered_commands: tuple[UnpairedCommand, ...]
     unsolicited_responses: tuple[UnpairedResponse, ...]
@@ -161,13 +170,25 @@ class PairingResult:
     analysis_notes: tuple[str, ...]
 
 
+@dataclass
+class _DeviceAccumulator:
+    """Per-device working state for one pairing pass."""
+
+    events: list[AnalysisEvent] = field(default_factory=lambda: list[AnalysisEvent]())
+    incomplete: list[IncompleteTransferEvent] = field(default_factory=lambda: list[IncompleteTransferEvent]())
+    vendor_requests: list[int] = field(default_factory=lambda: list[int]())
+    vendor_endpoints: set[int] = field(default_factory=lambda: set[int]())
+    failed_count: int = 0
+
+
 def pair_command_responses(
     transactions: tuple[UrbTransaction, ...],
     *,
     device_ids: DeviceIdMap,
+    device_id: str | None = None,
     timeout_seconds: float = COMMAND_RESPONSE_TIMEOUT_SECONDS,
-) -> PairingResult:
-    """Run the section 4.1 pairing pass over decoded transactions.
+) -> tuple[PairingResult, ...]:
+    """Run the section 4.1 pairing pass over decoded transactions, one result per device.
 
     Args:
         transactions: The ``UrbTransaction`` objects from a loaded capture,
@@ -175,19 +196,20 @@ def pair_command_responses(
         device_ids: ``Capture.device_ids``, mapping each observed address to the
             device that owns it. Lanes are keyed on the resolved id so a device
             that re-addresses mid-capture stays one lane.
+        device_id: Restrict the pass to one device. ``None`` analyzes each
+            device seen in the capture.
         timeout_seconds: Maximum capture-time gap for an IN to answer an OUT.
 
     Returns:
-        A :class:`PairingResult`. Failed events and standard Control traffic
-        are counted, never promoted. Events whose missing half fell outside
-        the capture are reported as incomplete transfers instead of unanswered
-        or unsolicited, because a capture boundary explains them.
+        One :class:`PairingResult` per device, sorted by ``device_id``. A device
+        whose traffic is entirely Control still gets a result, so it reports
+        itself rather than vanishing. An unknown ``device_id`` yields an empty
+        tuple. Failed events and standard Control traffic are counted, never
+        promoted. Events whose missing half fell outside the capture are
+        reported as incomplete transfers instead of unanswered or unsolicited,
+        because a capture boundary explains them.
     """
-    events: list[AnalysisEvent] = []
-    incomplete: list[IncompleteTransferEvent] = []
-    vendor_requests: list[int] = []
-    vendor_endpoints: set[int] = set()
-    failed_count = 0
+    devices: dict[str, _DeviceAccumulator] = {}
     capture_end = 0.0
 
     for transaction in transactions:
@@ -203,30 +225,57 @@ def pair_command_responses(
         record = transaction.submission or transaction.completion
         if record is None:
             continue
+
+        owner = resolve_device_id(device_ids, record)
+        # Filter here rather than after accumulating: a device excluded by the
+        # caller should not appear in the results at all.
+        if device_id is not None and owner != device_id:
+            continue
+        accumulator = devices.setdefault(owner, _DeviceAccumulator())
+
         if record.transfer_type == "control":
             request = _vendor_control_request(transaction)
             if request is not None:
-                vendor_requests.append(request)
-                vendor_endpoints.add(record.endpoint)
+                accumulator.vendor_requests.append(request)
+                accumulator.vendor_endpoints.add(record.endpoint)
             continue
 
         event = _to_event(transaction, device_ids)
         if event is None:
-            incomplete.append(_incomplete_from(transaction, device_ids))
+            accumulator.incomplete.append(_incomplete_from(transaction, device_ids))
             continue
         if event.boundary_orphan:
             # A URB in flight at a capture edge is a lifecycle orphan, not a
             # protocol-level unanswered or unsolicited event.
             reason: IncompleteTransferReason = "orphan_submission" if event.direction == "out" else "orphan_completion"
-            incomplete.append(_incomplete_from_event(event, reason))
+            accumulator.incomplete.append(_incomplete_from_event(event, reason))
             continue
         if not event.successful:
-            failed_count += 1
+            accumulator.failed_count += 1
         # Failed events stay in the lane. Spec section 4.1 step 2 keeps them
         # visible so a failed OUT or IN does not turn a nearby event into a
         # false unanswered command or unsolicited response.
-        events.append(event)
+        accumulator.events.append(event)
 
+    return tuple(
+        _result_for(device, accumulator, capture_end, timeout_seconds)
+        for device, accumulator in sorted(devices.items())
+    )
+
+
+def _result_for(
+    device_id: str,
+    accumulator: _DeviceAccumulator,
+    capture_end: float,
+    timeout_seconds: float,
+) -> PairingResult:
+    """Pair one device's lanes and assemble its result.
+
+    ``capture_end`` stays capture-wide rather than per-device: it marks when the
+    recording stopped, which is the same instant for every device, and is what
+    the section 4.1 step 5 boundary suppression measures against.
+    """
+    events = accumulator.events
     # Sort by timestamp, and on an exact tie put OUT before IN so a command and
     # its same-microsecond response are not inverted into unsolicited/unanswered.
     events.sort(key=lambda event: (event.timestamp, 0 if event.direction == "out" else 1))
@@ -235,43 +284,42 @@ def pair_command_responses(
     unanswered: list[UnpairedCommand] = []
     unsolicited: list[UnpairedResponse] = []
 
-    # Scope is device and endpoint number only, per spec section 4.1. Transfer
-    # type is determined by (device, endpoint number, direction) in USB, so it
-    # is not part of the key.
-    #
-    # The device half is the resolved device_id, not the bus/address pair. A
-    # device answers at address 0 while enumerating and takes a new address on
-    # every replug, so keying on the address would split one device into a lane
-    # per address and leave a command before a replug unable to pair with the
-    # response after it.
-    lanes: dict[tuple[str, int], list[AnalysisEvent]] = {}
+    # Scope within a device is the endpoint number, per spec section 4.1.
+    # Transfer type is determined by (device, endpoint number, direction) in
+    # USB, so it is not part of the key. The device half of the scope is already
+    # settled: events reached here bucketed by their resolved device_id, which
+    # is what keeps a device that re-addresses mid-capture in one lane instead
+    # of one lane per address.
+    lanes: dict[int, list[AnalysisEvent]] = {}
     for event in events:
-        key = (event.device_id, event.endpoint_number)
-        lanes.setdefault(key, []).append(event)
+        lanes.setdefault(event.endpoint_number, []).append(event)
 
     for lane_events in lanes.values():
         _pair_lane(lane_events, timeout_seconds, capture_end, pairs, unanswered, unsolicited)
 
     notes: list[str] = []
-    if vendor_requests:
-        codes = ", ".join(f"0x{code:02X}" for code in sorted(set(vendor_requests)))
-        endpoints = ", ".join(f"ep{number}" for number in sorted(vendor_endpoints))
+    if accumulator.vendor_requests:
+        codes = ", ".join(f"0x{code:02X}" for code in sorted(set(accumulator.vendor_requests)))
+        endpoints = ", ".join(f"ep{number}" for number in sorted(accumulator.vendor_endpoints))
         notes.append(
-            f"{len(vendor_requests)} vendor-specific control transfers seen on {endpoints} "
+            f"{len(accumulator.vendor_requests)} vendor-specific control transfers seen on {endpoints} "
             f"(requests {codes}), not included in pattern detection"
         )
-    if failed_count:
-        notes.append(f"{failed_count} failed bulk/interrupt events kept visible, not promoted into pairs")
+    if accumulator.failed_count:
+        notes.append(f"{accumulator.failed_count} failed bulk/interrupt events kept visible, not promoted into pairs")
+    if not events and not accumulator.incomplete:
+        notes.append("no bulk or interrupt traffic for this device, nothing to pair")
 
     return PairingResult(
+        device_id=device_id,
         pairs=tuple(pairs),
         unanswered_commands=tuple(unanswered),
         unsolicited_responses=tuple(unsolicited),
-        incomplete_transfers=tuple(incomplete),
+        incomplete_transfers=tuple(accumulator.incomplete),
         response_timing=_timing_stats(pairs),
-        vendor_control_count=len(vendor_requests),
-        vendor_control_requests=tuple(sorted(set(vendor_requests))),
-        failed_event_count=failed_count,
+        vendor_control_count=len(accumulator.vendor_requests),
+        vendor_control_requests=tuple(sorted(set(accumulator.vendor_requests))),
+        failed_event_count=accumulator.failed_count,
         analysis_notes=tuple(notes),
     )
 

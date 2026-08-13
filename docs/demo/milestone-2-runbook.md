@@ -36,6 +36,10 @@ bsu-tool parse test_data/captures/goodix_enum_and_enroll_sanitized.pcapng
 Confirm the output reports `Total packets: 253`, three devices, and device
 `001:011` with endpoints `0x00`, `0x01`, and `0x03`.
 
+> The CLI summary still keys devices by address and masks endpoint direction,
+> so it reports three devices where `list_devices` below reports two, and shows
+> endpoint `0x03` where the device answers on `0x83`. Tracked in #105.
+
 ## Claude Code demo
 
 Start Claude Code from the repository root:

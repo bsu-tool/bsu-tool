@@ -127,6 +127,7 @@ def register(mcp: FastMCP, session: Session) -> None:
         try:
             try:
                 stats = controller.stop()
+                output_path = stats.output_path
             except TimeoutError as exc:
                 retry_stop = True
                 raise RuntimeError(
@@ -136,7 +137,7 @@ def register(mcp: FastMCP, session: Session) -> None:
                 raise RuntimeError(f"capture could not stop: {exc}") from exc
             except UsbmonError as exc:
                 raise RuntimeError(f"usbmon capture failed while stopping: {exc}") from exc
-            capture = session.load_stopped_capture(live_capture)
+            capture = session.load_stopped_capture(live_capture, output_path)
             return StopCaptureResult(
                 output_path=str(output_path),
                 output_bytes=stats.output_bytes,

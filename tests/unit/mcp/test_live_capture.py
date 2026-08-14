@@ -317,10 +317,13 @@ def test_stopping_capture_rejects_second_stop_and_start_until_autoload(
     load_release = Event()
     original_load = session.load_stopped_capture
 
-    def blocking_load(live_capture: LiveCapture) -> Capture:
+    def blocking_load(
+        live_capture: LiveCapture,
+        output_path: Path | None = None,
+    ) -> Capture:
         load_entered.set()
         assert load_release.wait(timeout=_SYNC_TIMEOUT_SECONDS)
-        return original_load(live_capture)
+        return original_load(live_capture, output_path)
 
     monkeypatch.setattr(session, "load_stopped_capture", blocking_load)
 

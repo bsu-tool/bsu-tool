@@ -308,12 +308,18 @@ class Session:
                 raise RuntimeError("cannot load a capture file while a live capture is active")
         return self._load_capture(path)
 
-    def load_stopped_capture(self, live_capture: LiveCapture) -> Capture:
-        """Load the output owned by the current live capture."""
+    def load_stopped_capture(
+        self,
+        live_capture: LiveCapture,
+        output_path: Path | None = None,
+    ) -> Capture:
+        """Load the output produced by the current live capture."""
         with self._live_capture_lock:
             if self.live_capture is not live_capture:
                 raise RuntimeError("capture no longer owns this session")
-        return self._load_capture(live_capture.output_path)
+
+        path = output_path if output_path is not None else live_capture.output_path
+        return self._load_capture(path)
 
     def _load_capture(self, path: Path) -> Capture:
         source = _validate_capture_path(path)

@@ -328,7 +328,9 @@ def test_list_devices_summarizes_multiple_devices(tmp_path: Path) -> None:
 
     assert len(capture.records) == 9
     assert capture.metadata.packet_count == 9
-    assert [device.device_id for device in device_summaries] == ["dev_001_004", "dev_001_007"]
+    # Device 4 sends no descriptors, so it keeps its address id; device 7's
+    # descriptor exchange gives it a vid:pid identity.
+    assert [device.device_id for device in device_summaries] == ["dev_001_004", "27c6_533c"]
     assert device_summaries[0].packet_count == 2
     assert device_summaries[0].endpoints_seen == (
         EndpointSummary(address="0x01", packet_count=1, byte_count=0),
@@ -1004,3 +1006,249 @@ def test_session_round_trips_json_safe_dict(tmp_path: Path) -> None:
     assert packet["data_hex"] == "61"
     assert packet["data_preview"] == "61"
     assert packet["setup_hex"] is None
+
+
+# ---------------------------------------------------------------------------
+# Device identity: merging across addresses, and keeping distinct devices apart
+# ---------------------------------------------------------------------------
+
+
+def _enumerating_device(
+    *,
+    dev_num: int,
+    bus_num: int = 1,
+    vendor_id: int,
+    product_id: int,
+    urb_id: int,
+    serial_number_index: int = 0,
+) -> tuple[bytes, ...]:
+    """A GET_DESCRIPTOR(DEVICE) exchange identifying one device at one address."""
+    setup = _get_descriptor_setup(descriptor_type=1, descriptor_index=0, length=18)
+    descriptor = bytearray(
+        _device_descriptor(vendor_id=vendor_id, product_id=product_id, manufacturer_index=0, product_index=0)
+    )
+    descriptor[16] = serial_number_index  # iSerialNumber
+    return (
+        _usbmon_packet(
+            urb_id=urb_id, transfer_type=_CONTROL, endpoint=0x80, dev_num=dev_num, bus_num=bus_num, setup=setup
+        ),
+        _usbmon_packet(
+            urb_id=urb_id,
+            event=_COMPLETION,
+            transfer_type=_CONTROL,
+            endpoint=0x80,
+            dev_num=dev_num,
+            bus_num=bus_num,
+            flag_setup=0x3E,
+            data=bytes(descriptor),
+        ),
+    )
+
+
+def _write_packets(tmp_path: Path, packets: tuple[bytes, ...], name: str = "identity.pcapng") -> Path:
+    path = tmp_path / name
+    path.write_bytes(_capture_bytes(packets))
+    return path
+
+
+def test_one_device_across_two_addresses_is_reported_once(tmp_path: Path) -> None:
+    """A device that re-addresses (enumeration, or a replug) is a single device.
+
+    This is the shape every real enumeration capture has: the device answers at
+    address 0 while its descriptors are read, then moves to its assigned address.
+    """
+    path = _write_packets(
+        tmp_path,
+        (
+            *_enumerating_device(dev_num=0, vendor_id=0x1A86, product_id=0x7523, urb_id=1),
+            *_enumerating_device(dev_num=9, vendor_id=0x1A86, product_id=0x7523, urb_id=2),
+        ),
+    )
+    session = Session()
+    session.load(path)
+
+    (device,) = session.list_devices()
+    assert device.device_id == "1a86_7523"
+    assert device.packet_count == 4
+    assert [(a.bus_num, a.dev_num) for a in device.addresses] == [(1, 0), (1, 9)]
+    assert (device.bus_num, device.dev_num) == (1, 9)  # the operational address, not address 0
+    assert device.identity_source == "descriptors"
+
+
+def test_same_address_on_two_buses_does_not_cross_match(tmp_path: Path) -> None:
+    """Device 5 on bus 1 and device 5 on bus 2 are distinct devices.
+
+    The address alone is ambiguous across buses, so identity must not collapse
+    them, and a device_id filter must return only its own device's packets.
+    """
+    path = _write_packets(
+        tmp_path,
+        (
+            *_enumerating_device(bus_num=1, dev_num=5, vendor_id=0x1A86, product_id=0x7523, urb_id=1),
+            *_enumerating_device(bus_num=2, dev_num=5, vendor_id=0x0403, product_id=0x6001, urb_id=2),
+        ),
+    )
+    session = Session()
+    session.load(path)
+
+    assert [device.device_id for device in session.list_devices()] == ["1a86_7523", "0403_6001"]
+
+    selection = session.get_packets(device_id="1a86_7523")
+    assert len(selection.matches) == 2
+    assert {packet.bus_num for packet in selection.matches} == {1}
+
+
+def test_devices_without_descriptors_keep_separate_address_ids(tmp_path: Path) -> None:
+    """Unidentifiable devices are never merged with each other.
+
+    Two descriptor-less devices share no vid:pid to key on, so folding them
+    together would invent an identity the capture does not support.
+    """
+    path = _write_packets(
+        tmp_path,
+        (
+            _usbmon_packet(urb_id=1, dev_num=4, endpoint=0x01, data=b"a"),
+            _usbmon_packet(urb_id=2, dev_num=8, endpoint=0x01, data=b"b"),
+        ),
+    )
+    session = Session()
+    session.load(path)
+
+    devices = session.list_devices()
+    assert [device.device_id for device in devices] == ["dev_001_004", "dev_001_008"]
+    assert all(device.identity_source == "address" for device in devices)
+    assert all(device.has_serial is False for device in devices)
+
+
+def test_has_serial_reports_presence_without_exposing_the_value(tmp_path: Path) -> None:
+    """has_serial reflects iSerialNumber != 0; no serial value reaches the summary."""
+    path = _write_packets(
+        tmp_path,
+        (
+            *_enumerating_device(dev_num=5, vendor_id=0x1A86, product_id=0x7523, urb_id=1, serial_number_index=3),
+            *_enumerating_device(bus_num=2, dev_num=6, vendor_id=0x0403, product_id=0x6001, urb_id=2),
+        ),
+    )
+    session = Session()
+    session.load(path)
+
+    with_serial, without_serial = session.list_devices()
+    assert with_serial.has_serial is True
+    assert without_serial.has_serial is False
+    # The id is built from vid:pid alone, so no unit fingerprint can leak through it.
+    assert with_serial.device_id == "1a86_7523"
+
+
+def test_packet_records_carry_the_merged_device_id(tmp_path: Path) -> None:
+    """Packets report the same id list_devices does, so filters cannot silently miss.
+
+    A packet at the enumeration address must resolve to the merged id; if it
+    reported its raw address instead, a device_id filter would drop it.
+    """
+    path = _write_packets(
+        tmp_path,
+        (
+            *_enumerating_device(dev_num=0, vendor_id=0x1A86, product_id=0x7523, urb_id=1),
+            *_enumerating_device(dev_num=9, vendor_id=0x1A86, product_id=0x7523, urb_id=2),
+        ),
+    )
+    session = Session()
+    session.load(path)
+
+    assert {packet.device_id for packet in session.get_packets().matches} == {"1a86_7523"}
+    # Every packet in the capture belongs to the one device, address 0 included.
+    assert len(session.get_packets(device_id="1a86_7523").matches) == 4
+
+
+def test_validate_flags_one_address_reporting_two_identities(tmp_path: Path) -> None:
+    """Two devices enumerating in one capture both use address 0, and that is a fault.
+
+    Their address-0 traffic is indistinguishable by address, so the merge folds
+    one device's packets into the other. Reporting it beats silently overstating
+    a device's counts.
+    """
+    path = _write_packets(
+        tmp_path,
+        (
+            *_enumerating_device(dev_num=0, vendor_id=0x1A86, product_id=0x7523, urb_id=1),
+            *_enumerating_device(dev_num=0, vendor_id=0x0403, product_id=0x6001, urb_id=2),
+        ),
+    )
+    session = Session()
+    session.load(path)
+
+    (problem,) = session.validate()
+    assert "address 1:0" in problem
+    assert "0403_6001" in problem
+    assert "1a86_7523" in problem
+
+
+def test_validate_accepts_one_device_enumerating_at_address_zero(tmp_path: Path) -> None:
+    """The ordinary case — a single device using address 0 — is not a fault."""
+    path = _write_packets(
+        tmp_path,
+        (
+            *_enumerating_device(dev_num=0, vendor_id=0x1A86, product_id=0x7523, urb_id=1),
+            *_enumerating_device(dev_num=9, vendor_id=0x1A86, product_id=0x7523, urb_id=2),
+        ),
+    )
+    session = Session()
+    session.load(path)
+
+    assert session.validate() == []
+
+
+def test_validate_flags_two_identical_devices_active_at_once(tmp_path: Path) -> None:
+    """Two units of one model attached together merge into one device, and that is a fault.
+
+    The id is vid:pid, so identical hardware on two buses folds together with
+    counts summed. A device cannot transmit at two addresses simultaneously, so
+    the interleaved traffic here is proof of two units rather than one that
+    re-addressed.
+    """
+    path = _write_packets(
+        tmp_path,
+        (
+            *_enumerating_device(bus_num=1, dev_num=5, vendor_id=0x1D6B, product_id=0x0002, urb_id=1),
+            *_enumerating_device(bus_num=2, dev_num=5, vendor_id=0x1D6B, product_id=0x0002, urb_id=2),
+            # Bus 1 speaks again after bus 2 started, so the two ranges overlap.
+            _usbmon_packet(urb_id=3, bus_num=1, dev_num=5, endpoint=0x01, data=b"a"),
+        ),
+    )
+    session = Session()
+    session.load(path)
+
+    # The merge itself is unchanged — this is a report, not a resolution.
+    (device,) = session.list_devices()
+    assert device.device_id == "1d6b_0002"
+
+    (problem,) = session.validate()
+    assert "1d6b_0002" in problem
+    assert "1:5" in problem
+    assert "2:5" in problem
+
+
+def test_validate_accepts_a_replug_reusing_the_enumeration_address(tmp_path: Path) -> None:
+    """A replug is disjoint activity, not concurrent, so it is never flagged.
+
+    This is the case the whole PR exists to merge, and the reference captures
+    all have this shape: address 0 recurs at each enumeration, so its index
+    range spans the gap between them and overlaps every operational address.
+    Only assigned addresses can be compared for concurrency.
+    """
+    path = _write_packets(
+        tmp_path,
+        (
+            *_enumerating_device(dev_num=0, vendor_id=0x27C6, product_id=0x63AC, urb_id=1),
+            *_enumerating_device(dev_num=19, vendor_id=0x27C6, product_id=0x63AC, urb_id=2),
+            # Replug: back to address 0, then on to a fresh assigned address.
+            *_enumerating_device(dev_num=0, vendor_id=0x27C6, product_id=0x63AC, urb_id=3),
+            *_enumerating_device(dev_num=20, vendor_id=0x27C6, product_id=0x63AC, urb_id=4),
+        ),
+    )
+    session = Session()
+    session.load(path)
+
+    (device,) = session.list_devices()
+    assert [(a.bus_num, a.dev_num) for a in device.addresses] == [(1, 0), (1, 19), (1, 20)]
+    assert session.validate() == []

@@ -3,8 +3,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal, TypeAlias
 
 from bsu_tool.urb_decoder import Direction, EventType, TransferType
+
+IdentitySource: TypeAlias = Literal["descriptors", "host", "address"]
+"""Where a :class:`DeviceSummary`'s identity came from.
+
+``"descriptors"`` — vid:pid was read from a device descriptor inside the
+capture. Portable: it holds for any reader of the file.
+
+``"host"`` — vid:pid came from a sysfs snapshot taken on the capturing host.
+Reserved; no code path produces it yet.
+
+``"address"`` — no descriptor was captured, so the device is known only by the
+bus/address it occupied. Not stable across a replug.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,8 +64,28 @@ class EndpointSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class DeviceAddress:
+    """One bus/address a device occupied during a capture.
+
+    A device answers at address 0 while the kernel reads its descriptors, then
+    moves to the address ``SET_ADDRESS`` assigns, and takes a fresh one on every
+    replug. So one physical device routinely occupies several of these within a
+    single capture.
+    """
+
+    bus_num: int
+    dev_num: int
+
+
+@dataclass(frozen=True, slots=True)
 class DeviceSummary:
-    """A USB device observed in a loaded capture."""
+    """A USB device observed in a loaded capture.
+
+    Identity is keyed on vid:pid when the capture contains a device descriptor,
+    so a device that re-addresses mid-capture is reported once rather than once
+    per address. ``bus_num``/``dev_num`` are the *last* address observed — the
+    operational one — and ``addresses`` lists every address the device held.
+    """
 
     device_id: str
     bus_num: int
@@ -66,6 +100,13 @@ class DeviceSummary:
     descriptor_summary: str | None = None
     device_class: int | None = None  # bDeviceClass; often 0x00/0xef for composite devices
     interface_class: int | None = None  # first interface's bInterfaceClass; 0xff marks vendor-specific
+    addresses: tuple[DeviceAddress, ...] = ()
+    identity_source: IdentitySource = "address"
+    # Whether the device *reports* a serial number (iSerialNumber != 0). The value
+    # is deliberately not carried here: device_id propagates into every packet
+    # record and every serialized session, and a serial is a unit fingerprint.
+    # Read it from get_enumeration when it is genuinely needed.
+    has_serial: bool = False
 
 
 @dataclass(frozen=True, slots=True)

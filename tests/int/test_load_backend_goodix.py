@@ -39,7 +39,7 @@ def test_load_populates_session_from_real_capture() -> None:
     )
     # derived devices: bind capture-specific identity, descriptor, and endpoints to one device
     devices_by_id = {device.device_id: device for device in session.list_devices()}
-    goodix = devices_by_id["dev_001_011"]
+    goodix = devices_by_id["27c6_63ac"]
     assert goodix.vendor_id == "0x27c6"
     assert goodix.endpoints_seen
     # packet store: valid indexes return a record, both out-of-range branches return None
@@ -78,7 +78,7 @@ def test_load_capture_tool_reports_real_metadata() -> None:
     assert session.capture.metadata.packet_count == 253
     assert len(session.capture.records) == 253
     devices_by_id = {device.device_id: device for device in session.list_devices()}
-    assert devices_by_id["dev_001_011"].vendor_id == "0x27c6"
+    assert devices_by_id["27c6_63ac"].vendor_id == "0x27c6"
 
 
 def test_load_enroll_only_capture_without_enumeration_traffic() -> None:

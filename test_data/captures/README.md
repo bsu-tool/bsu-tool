@@ -31,11 +31,13 @@ Three plug-in enumerations, a template delete, an eight-second idle baseline, a
 one continuous capture, because `get_enumeration` derives descriptors and the
 runtime boundary from a single record stream.
 
-The same physical reader appears as **three device ids** (`dev_001_019`,
-`dev_001_020`, `dev_001_021`) because usbmon addresses shift on every replug;
-`dev_001_000` is the address-0 phase shared by all three. `dev_001_021` carried
-the delete, enrollment and verifies. This capture is direct evidence for the
-device-identity problem tracked in #103.
+The reader occupies **four usbmon addresses** across this capture — `1:0`
+during each enumeration, then `1:19`, `1:20` and `1:21` as the kernel
+re-addresses it on every replug. Since #103 all four resolve to the single
+identity **`27c6_63ac`**, keyed on vid:pid, so the whole capture reads as one
+device and analysis no longer splits at a replug. `DeviceSummary.addresses`
+lists the four; `bus_num`/`dev_num` report `1:21`, the address that carried the
+delete, enrollment and verifies.
 
 ### Notes for anyone reading it
 

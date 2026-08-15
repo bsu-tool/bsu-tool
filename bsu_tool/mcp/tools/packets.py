@@ -43,7 +43,8 @@ def register(mcp: FastMCP, session: Session) -> None:
         Filters compose — a packet must satisfy all that are given. Two need
         explaining beyond their schema:
 
-        - device_id: a ``dev_bbb_ddd`` id from list_devices.
+        - device_id: an id from list_devices (``vid_pid`` when the capture holds the
+          device's descriptors, otherwise ``dev_bbb_ddd``).
         - endpoint: a decimal endpoint number such as ``"3"`` or ``"15"``. A
           ``0x``-prefixed address like ``"0x83"`` is also accepted (its endpoint
           number is used; direction bit ignored). Direction is orthogonal — use

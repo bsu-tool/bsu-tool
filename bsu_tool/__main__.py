@@ -208,19 +208,13 @@ def main(argv: list[str] | None = None) -> None:
 
     sniff_cmd = subparsers.add_parser(
         "sniff",
-        help="Capture USB traffic from one device to a pcap-ng file (Linux only)",
+        help="Capture all USB traffic on one bus to a pcap-ng file (Linux only)",
     )
     sniff_cmd.add_argument(
         "--bus",
         type=int,
         required=True,
-        help="usbmon bus number (the N in /dev/usbmonN), as shown by lsusb",
-    )
-    sniff_cmd.add_argument(
-        "--device",
-        type=int,
-        default=None,
-        help="USB device number on that bus, as shown by lsusb; omit to capture all devices on the bus (bus-only)",
+        help="usbmon bus number (the N in /dev/usbmonN), as shown by lsusb; 0 captures every bus",
     )
     sniff_cmd.add_argument(
         "output",
@@ -257,7 +251,7 @@ def main(argv: list[str] | None = None) -> None:
         # machines, where fcntl is absent.
         from bsu_tool.sniff_command import run_sniff
 
-        run_sniff(args.bus, args.device, Path(args.output))
+        run_sniff(args.bus, Path(args.output))
         return
 
     if args.command == "detect-device":

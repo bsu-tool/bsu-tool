@@ -29,11 +29,11 @@ stories covering how the analyst captures USB traffic from a device under analys
 
 | id | user story | acceptance criteria | milestone | priority |
 |---|---|---|---|---|
-| CAP-01 | as an analyst, I want to plug in a USB device and have bsu-tool identify which bus and device number it is on, so that I know where to point the capture tool. | running get_bus (or equivalent) returns the correct bus and device number for a connected USB device. output is human-readable. | M1 | high |
+| CAP-01 | as an analyst, I want to plug in a USB device and have bsu-tool identify which bus and device number it is on, so that I know where to point the capture tool. | running bsu-tool detect-device reports the bus and device number of a newly attached USB device. output is human-readable. | M1 | high |
 | CAP-02 | as an analyst, I want to start a USB traffic capture against a specific device, so that I can record the communication between the host and the device while I operate it. | capture starts successfully against the specified usbmon interface. a .pcapng file is produced that Wireshark can open and display correctly. | M1 | high |
 | CAP-03 | as an analyst, I want to stop a capture and have the resulting file saved with a clear, consistent filename, so that I can find and reference it later. | capture stops cleanly on command. output file is named with a timestamp and device identifier. file is saved to a predictable location. | M1 | high |
 | CAP-04 | as an analyst, I want to drop a named marker at any point during a capture, so that I can correlate specific physical actions with the corresponding USB traffic. | add_marker tool records a marker with a name and timestamp into the session. markers are preserved and retrievable after capture ends. | M2 | high |
-| CAP-05 | as an AI assistant, I want to start and stop captures programmatically via MCP tools, so that I can control the capture workflow without requiring the analyst to run terminal commands manually. (DRAFT — pending Bart confirmation) | MCP tools start_cap and stop_cap exist and function. Claude can initiate and terminate a capture given a device bus/number. analyst only needs to physically operate the device. | M2 | high |
+| CAP-05 | as an AI assistant, I want to start and stop captures programmatically via MCP tools, so that I can control the capture workflow without requiring the analyst to run terminal commands manually. (DRAFT — pending Bart confirmation) | MCP tools start_capture and stop_capture exist and function. Claude can initiate and terminate a capture given a device bus/number. analyst only needs to physically operate the device. | M2 | high |
 
 ---
 

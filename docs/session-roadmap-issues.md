@@ -42,7 +42,7 @@ The existing user stories emphasize these near-term goals:
 - `MCP-04`: MCP tools should retrieve decoded packets by device and endpoint.
 - `MCP-05`: MCP tools should retrieve packets between named markers.
 
-The existing MCP draft uses both packet indexes and timestamps. The shared `bsu_tool/session.py` model currently uses `packet_index` for markers, which is useful for deterministic analysis and unit tests. Later MCP integration can add timestamp-derived marker placement without changing the basic marker concept.
+Markers use `packet_index` as their anchor, with the timestamp derived from the anchored packet. Anchoring on the index is useful for deterministic analysis and unit tests. Later MCP integration can add timestamp-derived marker placement without changing the basic marker concept.
 
 ## Recommended Order
 

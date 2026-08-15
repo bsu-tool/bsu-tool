@@ -1196,3 +1196,59 @@ def test_validate_accepts_one_device_enumerating_at_address_zero(tmp_path: Path)
     session.load(path)
 
     assert session.validate() == []
+
+
+def test_validate_flags_two_identical_devices_active_at_once(tmp_path: Path) -> None:
+    """Two units of one model attached together merge into one device, and that is a fault.
+
+    The id is vid:pid, so identical hardware on two buses folds together with
+    counts summed. A device cannot transmit at two addresses simultaneously, so
+    the interleaved traffic here is proof of two units rather than one that
+    re-addressed.
+    """
+    path = _write_packets(
+        tmp_path,
+        (
+            *_enumerating_device(bus_num=1, dev_num=5, vendor_id=0x1D6B, product_id=0x0002, urb_id=1),
+            *_enumerating_device(bus_num=2, dev_num=5, vendor_id=0x1D6B, product_id=0x0002, urb_id=2),
+            # Bus 1 speaks again after bus 2 started, so the two ranges overlap.
+            _usbmon_packet(urb_id=3, bus_num=1, dev_num=5, endpoint=0x01, data=b"a"),
+        ),
+    )
+    session = Session()
+    session.load(path)
+
+    # The merge itself is unchanged — this is a report, not a resolution.
+    (device,) = session.list_devices()
+    assert device.device_id == "1d6b_0002"
+
+    (problem,) = session.validate()
+    assert "1d6b_0002" in problem
+    assert "1:5" in problem
+    assert "2:5" in problem
+
+
+def test_validate_accepts_a_replug_reusing_the_enumeration_address(tmp_path: Path) -> None:
+    """A replug is disjoint activity, not concurrent, so it is never flagged.
+
+    This is the case the whole PR exists to merge, and the reference captures
+    all have this shape: address 0 recurs at each enumeration, so its index
+    range spans the gap between them and overlaps every operational address.
+    Only assigned addresses can be compared for concurrency.
+    """
+    path = _write_packets(
+        tmp_path,
+        (
+            *_enumerating_device(dev_num=0, vendor_id=0x27C6, product_id=0x63AC, urb_id=1),
+            *_enumerating_device(dev_num=19, vendor_id=0x27C6, product_id=0x63AC, urb_id=2),
+            # Replug: back to address 0, then on to a fresh assigned address.
+            *_enumerating_device(dev_num=0, vendor_id=0x27C6, product_id=0x63AC, urb_id=3),
+            *_enumerating_device(dev_num=20, vendor_id=0x27C6, product_id=0x63AC, urb_id=4),
+        ),
+    )
+    session = Session()
+    session.load(path)
+
+    (device,) = session.list_devices()
+    assert [(a.bus_num, a.dev_num) for a in device.addresses] == [(1, 0), (1, 19), (1, 20)]
+    assert session.validate() == []

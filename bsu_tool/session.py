@@ -84,6 +84,9 @@ _ENDPOINT_NUMBER_MASK: Final[int] = 0x0F
 _TRANSFER_TYPE_ORDER: Final[tuple[TransferType, ...]] = ("control", "bulk", "interrupt")
 _DATA_PREVIEW_BYTES: Final[int] = 32
 _CONTROL_ENDPOINT: Final[int] = 0
+#: The address a device answers on before SET_ADDRESS assigns it one. Shared by
+#: every device that enumerates, so it identifies no single unit.
+_UNADDRESSED_DEV_NUM: Final[int] = 0
 
 
 @dataclass(frozen=True)
@@ -683,6 +686,10 @@ class Session:
            share it, and their traffic cannot be told apart by address alone.
            Whichever identity won absorbed the other's address-0 packets, so the
            merge is unsafe and the affected device's counts are overstated.
+        4. One identity merged from two addresses active at the same time — the
+           reverse fault. Identity keys on vid:pid, so two identical units
+           attached at once (two root hubs on a two-bus machine, say) report as
+           one device with their counts summed. See :func:`_over_merge_conflicts`.
 
         In-flight submissions (no matching completion) and orphan completions
         (submission not captured) are NOT faults: usbmon captures routinely begin
@@ -706,6 +713,7 @@ class Session:
                     f"outside the decoded range 0..{len(records) - 1}"
                 )
         problems.extend(_identity_conflicts(records, self.capture.transactions))
+        problems.extend(_over_merge_conflicts(records, self.capture.transactions))
         return problems
 
     def to_dict(self) -> JsonDict:
@@ -1170,13 +1178,8 @@ def _merge_by_identity(
     """
     merged: dict[str, _DeviceAccumulator] = {}
     for (bus_num, dev_num), accumulator in sorted(devices.items()):
-        descriptor = accumulator.device_descriptor
-        if descriptor is None:
-            device_id = address_device_id(bus_num, dev_num)
-            accumulator.identity_source = "address"
-        else:
-            device_id = identity_device_id(descriptor.vendor_id, descriptor.product_id)
-            accumulator.identity_source = "descriptors"
+        device_id = _accumulator_device_id(bus_num, dev_num, accumulator)
+        accumulator.identity_source = "address" if accumulator.device_descriptor is None else "descriptors"
         accumulator.addresses = [(bus_num, dev_num)]
 
         existing = merged.get(device_id)
@@ -1211,6 +1214,29 @@ def _absorb(target: _DeviceAccumulator, other: _DeviceAccumulator) -> None:
         target.last_index = other.last_index
         target.bus_num = other.bus_num
         target.dev_num = other.dev_num
+
+
+def _accumulator_device_id(bus_num: int, dev_num: int, accumulator: _DeviceAccumulator) -> str:
+    """Return the id one address resolves to, before any merging.
+
+    The single definition of how an accumulator picks between the identity id
+    and the address fallback, so the merge and the checks that audit the merge
+    cannot drift apart the way the two hand-synchronised ``_device_id`` copies
+    did before :mod:`bsu_tool.device_identity` existed.
+
+    Args:
+        bus_num: USB bus number of the observed address.
+        dev_num: Device address on that bus.
+        accumulator: Tallies for that address, carrying any captured descriptor.
+
+    Returns:
+        The ``vid_pid`` id when a device descriptor was captured, else the
+        ``dev_bbb_ddd`` address fallback.
+    """
+    descriptor = accumulator.device_descriptor
+    if descriptor is None:
+        return address_device_id(bus_num, dev_num)
+    return identity_device_id(descriptor.vendor_id, descriptor.product_id)
 
 
 def _device_accumulator(
@@ -1249,6 +1275,69 @@ def _identity_conflicts(
             f"its packets cannot be attributed by address alone and the merge overstates one device"
         )
     return problems
+
+
+def _over_merge_conflicts(
+    records: tuple[UrbRecord, ...],
+    transactions: tuple[UrbTransaction, ...],
+) -> list[str]:
+    """Report one identity merged from addresses that were active at the same time.
+
+    Identity keys on vid:pid alone, so two identical units attached at once fold
+    into one reported device with packet counts summed and endpoints unioned.
+    The common case is a machine with two USB buses: the generic Linux root hub
+    ``1d6b_0002`` sits on each of them.
+
+    One physical device cannot transmit at two addresses simultaneously, so
+    overlapping activity is positive evidence of two units. A replug produces
+    disjoint ranges instead, which is what keeps that case quiet.
+
+    Address 0 is excluded, and must be: it is the address every device answers
+    on before ``SET_ADDRESS`` assigns one, so a device that replugs returns to
+    it and its index range spans the whole capture by construction. Only an
+    assigned address carries the one-unit-at-a-time guarantee this rests on.
+
+    Args:
+        records: Decoded URB records for the capture.
+        transactions: Paired URBs, the source of the device descriptors.
+
+    Returns:
+        One message per over-merged identity, empty when none is detected.
+    """
+    spans_by_identity: dict[str, list[tuple[tuple[int, int], int, int]]] = {}
+    for (bus_num, dev_num), accumulator in sorted(_accumulate_devices(records, transactions).items()):
+        if dev_num == _UNADDRESSED_DEV_NUM:
+            continue
+        device_id = _accumulator_device_id(bus_num, dev_num, accumulator)
+        spans_by_identity.setdefault(device_id, []).append(
+            ((bus_num, dev_num), accumulator.first_index, accumulator.last_index)
+        )
+
+    problems: list[str] = []
+    for device_id, spans in sorted(spans_by_identity.items()):
+        overlapping = _concurrently_active_addresses(spans)
+        if not overlapping:
+            continue
+        addresses = ", ".join(f"{bus_num}:{dev_num}" for bus_num, dev_num in sorted(overlapping))
+        problems.append(
+            f"device {device_id} merges addresses active at the same time ({addresses}); "
+            f"one device cannot transmit at two addresses at once, so these are separate "
+            f"units of the same model reported as one, with their counts summed"
+        )
+    return problems
+
+
+def _concurrently_active_addresses(
+    spans: list[tuple[tuple[int, int], int, int]],
+) -> set[tuple[int, int]]:
+    """Return the addresses whose packet index ranges overlap another's."""
+    overlapping: set[tuple[int, int]] = set()
+    for position, (address, first_index, last_index) in enumerate(spans):
+        for other_address, other_first, other_last in spans[position + 1 :]:
+            if first_index <= other_last and other_first <= last_index:
+                overlapping.add(address)
+                overlapping.add(other_address)
+    return overlapping
 
 
 def _device_ids_by_address(

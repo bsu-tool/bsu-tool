@@ -712,8 +712,11 @@ class Session:
                     f"marker {marker.name!r} references packet index {marker.packet_index} "
                     f"outside the decoded range 0..{len(records) - 1}"
                 )
-        problems.extend(_identity_conflicts(records, self.capture.transactions))
-        problems.extend(_over_merge_conflicts(records, self.capture.transactions))
+        # Accumulated once and shared: both checks read the same per-address
+        # tallies, and walking the records twice to build them would be waste.
+        devices = _accumulate_devices(records, self.capture.transactions)
+        problems.extend(_identity_conflicts(devices))
+        problems.extend(_over_merge_conflicts(devices))
         return problems
 
     def to_dict(self) -> JsonDict:
@@ -1253,17 +1256,22 @@ def _device_accumulator(
 
 
 def _identity_conflicts(
-    records: tuple[UrbRecord, ...],
-    transactions: tuple[UrbTransaction, ...],
+    devices: dict[tuple[int, int], _DeviceAccumulator],
 ) -> list[str]:
     """Report addresses where more than one vid:pid identity was seen.
 
     Devices all enumerate at address 0, so two of them enumerating within one
     capture leave descriptors for both under the same address. Merging then
     attributes every address-0 packet to whichever identity won.
+
+    Args:
+        devices: Address-keyed accumulators from :func:`_accumulate_devices`.
+
+    Returns:
+        One message per address reporting several identities, empty when none does.
     """
     problems: list[str] = []
-    for (bus_num, dev_num), accumulator in sorted(_accumulate_devices(records, transactions).items()):
+    for (bus_num, dev_num), accumulator in sorted(devices.items()):
         if len(accumulator.observed_identities) <= 1:
             continue
         identities = ", ".join(
@@ -1278,8 +1286,7 @@ def _identity_conflicts(
 
 
 def _over_merge_conflicts(
-    records: tuple[UrbRecord, ...],
-    transactions: tuple[UrbTransaction, ...],
+    devices: dict[tuple[int, int], _DeviceAccumulator],
 ) -> list[str]:
     """Report one identity merged from addresses that were active at the same time.
 
@@ -1298,14 +1305,13 @@ def _over_merge_conflicts(
     assigned address carries the one-unit-at-a-time guarantee this rests on.
 
     Args:
-        records: Decoded URB records for the capture.
-        transactions: Paired URBs, the source of the device descriptors.
+        devices: Address-keyed accumulators from :func:`_accumulate_devices`.
 
     Returns:
         One message per over-merged identity, empty when none is detected.
     """
     spans_by_identity: dict[str, list[tuple[tuple[int, int], int, int]]] = {}
-    for (bus_num, dev_num), accumulator in sorted(_accumulate_devices(records, transactions).items()):
+    for (bus_num, dev_num), accumulator in sorted(devices.items()):
         if dev_num == _UNADDRESSED_DEV_NUM:
             continue
         device_id = _accumulator_device_id(bus_num, dev_num, accumulator)

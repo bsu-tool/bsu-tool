@@ -56,7 +56,7 @@ def register(mcp: FastMCP, session: Session) -> None:
         enumeration, and reports the packet-index range of the enumeration
         phase — the standard endpoint-0 control transfers that precede the
         device's runtime traffic. Use this to learn what a device is before
-        interpreting its vendor protocol. ``device_id`` is a ``dev_bbb_ddd``
+        interpreting its vendor protocol. ``device_id`` is an id
         id from list_devices.
         """
         return session.get_enumeration(device_id)

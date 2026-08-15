@@ -36,6 +36,10 @@ bsu-tool parse test_data/captures/goodix_enum_and_enroll_sanitized.pcapng
 Confirm the output reports `Total packets: 253`, three devices, and device
 `001:011` with endpoints `0x00`, `0x01`, and `0x03`.
 
+> The CLI summary still keys devices by address and masks endpoint direction,
+> so it reports three devices where `list_devices` below reports two, and shows
+> endpoint `0x03` where the device answers on `0x83`. Tracked in #105.
+
 ## Claude Code demo
 
 Start Claude Code from the repository root:
@@ -54,10 +58,14 @@ time. Ask Claude to show each tool result before continuing.
 
 2. `Call the bsu-tool list_devices tool and show every device and endpoint.`
 
-   Confirm `dev_001_011` is the Goodix reader, with vendor ID `0x27c6`, product
-   ID `0x63ac`, and endpoints `0x00`, `0x01`, and `0x83`.
+   Confirm two devices are listed. `27c6_63ac` is the Goodix reader, with vendor
+   ID `0x27c6`, product ID `0x63ac`, endpoints `0x00`, `0x01`, and `0x83`, and
+   `packet_count` `175`. Its `addresses` field shows `1:0` and `1:11` — the
+   address it answered on while enumerating and the one it was assigned — folded
+   into one identity. The other device, `dev_001_001`, sent no descriptors, so it
+   keeps an address-derived id.
 
-3. `Call the bsu-tool get_packets tool with device_id dev_001_011 and limit 5. Show the decoded records and pagination fields.`
+3. `Call the bsu-tool get_packets tool with device_id 27c6_63ac and limit 5. Show the decoded records and pagination fields.`
 
    Confirm five decoded control/bulk records are returned and `has_more` is
    `true`.
@@ -70,7 +78,7 @@ time. Ask Claude to show each tool result before continuing.
 
    Confirm both markers are present with packet indexes `145` and `252`.
 
-7. `Call the bsu-tool packets_between_markers tool with start_name goodix-bulk-start, end_name goodix-bulk-end, device_id dev_001_011, and limit 5.`
+7. `Call the bsu-tool packets_between_markers tool with start_name goodix-bulk-start, end_name goodix-bulk-end, device_id 27c6_63ac, and limit 5.`
 
    Confirm `span_count` is `106`, five Goodix bulk packets are returned,
    endpoints `0x01` and/or `0x83` are shown, and `has_more` is `true`. This is

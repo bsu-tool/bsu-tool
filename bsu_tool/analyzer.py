@@ -37,6 +37,7 @@ from bsu_tool.analysis.models import (
     TransferType,
     VariableByteRange,
 )
+from bsu_tool.device_identity import DeviceIdMap, resolve_device_id
 from bsu_tool.urb_decoder import UrbRecord, UrbTransaction
 
 
@@ -49,6 +50,7 @@ class CaptureLike(Protocol):
 
     records: tuple[UrbRecord, ...]
     transactions: tuple[UrbTransaction, ...]
+    device_ids: DeviceIdMap
 
 
 # --- Configuration constants (spec §7) ------------------------------------
@@ -264,7 +266,7 @@ def build_analysis_events(capture: CaptureLike, *, device_id: str | None = None)
 
     Args:
         capture: The loaded capture to read.
-        device_id: Restrict to one ``dev_bbb_ddd`` device; ``None`` keeps all.
+        device_id: Restrict to one device by its ``device_id``; ``None`` keeps all.
 
     Returns:
         Events in capture order, plus notes on what was excluded.
@@ -277,7 +279,7 @@ def build_analysis_events(capture: CaptureLike, *, device_id: str | None = None)
         reference = transaction.submission or transaction.completion
         if reference is None:  # pair_urbs guarantees at least one side
             continue
-        device = _device_id(reference)
+        device = resolve_device_id(capture.device_ids, reference)
         if device_id is not None and device != device_id:
             continue
         # Tallies are per device: a capture-wide count reported on one device's
@@ -306,7 +308,7 @@ def build_analysis_events(capture: CaptureLike, *, device_id: str | None = None)
         events.append(
             AnalysisEvent(
                 packet_index=index_of[id(payload_record)],
-                device_id=_device_id(payload_record),
+                device_id=resolve_device_id(capture.device_ids, payload_record),
                 endpoint_number=payload_record.endpoint,
                 endpoint_address=f"0x{_endpoint_address(payload_record):02x}",
                 direction=payload_record.direction,
@@ -337,14 +339,6 @@ def _setup_of(transaction: UrbTransaction) -> bytes | None:
 def _is_vendor_request(setup: bytes) -> bool:
     """Whether a setup packet's bmRequestType marks a vendor-specific request."""
     return (setup[0] >> _REQUEST_TYPE_SHIFT) & _REQUEST_TYPE_MASK == _VENDOR_REQUEST_TYPE
-
-
-def _device_id(record: UrbRecord) -> str:
-    """Format a bus/device pair as ``dev_bbb_ddd``.
-
-    Must match ``bsu_tool.session._device_id``; the ids are compared across tools.
-    """
-    return f"dev_{record.bus_num:03d}_{record.dev_num:03d}"
 
 
 def _endpoint_address(record: UrbRecord) -> int:
@@ -661,7 +655,7 @@ def detect_repeated_sequences(
 
     Args:
         capture: The loaded capture to analyze.
-        device_id: Restrict to one ``dev_bbb_ddd`` device; ``None`` analyzes each
+        device_id: Restrict to one device by its ``device_id``; ``None`` analyzes each
             device independently.
         scope: ``"device"`` counts over a device's whole stream, needed to see
             command/response cycles crossing endpoint numbers.

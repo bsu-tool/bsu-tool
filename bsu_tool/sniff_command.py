@@ -30,13 +30,12 @@ from bsu_tool.usbmon_source import (
 )
 
 
-def run_sniff(bus: int, device: int | None, output: Path) -> None:
+def run_sniff(bus: int, output: Path) -> None:
     """Run a capture from the CLI. Prints progress and stats to stderr.
 
-    ``device`` is a USB device address to filter on, or ``None`` for
-    bus-only capture (every device on the bus). Translates the library's
-    structured exceptions into ``bsu-tool: ...`` error messages and clean
-    exit codes. Does not return on error.
+    Capture is bus-wide: every device on ``bus`` is recorded. Translates the
+    library's structured exceptions into ``bsu-tool: ...`` error messages and
+    clean exit codes. Does not return on error.
     """
     stop_event = threading.Event()
 
@@ -45,25 +44,21 @@ def run_sniff(bus: int, device: int | None, output: Path) -> None:
 
     signal.signal(signal.SIGINT, _handle_sigint)
 
-    target = "all devices" if device is None else f"device {device}"
     print(
-        f"Capturing bus {bus} {target} to {output}. Press Ctrl+C to stop.",
+        f"Capturing bus {bus} (all devices) to {output}. Press Ctrl+C to stop.",
         file=sys.stderr,
     )
 
-    if bus == 0 and device is None:
-        # /dev/usbmon0 spans every bus; with no device filter this records
-        # the entire host, and device addresses are not unique across buses.
+    if bus == 0:
+        # /dev/usbmon0 spans every bus, so this records the entire host.
         print(
-            "  Warning: bus 0 captures all buses. With no --device filter this "
-            "records the whole host, and device addresses collide across buses.",
+            "  Warning: bus 0 captures all buses, so this records the whole host.",
             file=sys.stderr,
         )
 
     try:
         stats = capture(
             bus=bus,
-            device=device,
             output_path=output,
             stop_event=stop_event,
             on_progress=_print_progress,
@@ -91,40 +86,31 @@ def _print_progress(stats: CaptureStats) -> None:
     a longer earlier line.
     """
     line = (
-        f"  seen={stats.seen:>7d}  matched={stats.matched:>7d}  "
-        f"elapsed={stats.elapsed_seconds:>6.1f}s  "
-        f"size={_format_bytes(stats.output_bytes)}"
+        f"  events={stats.seen:>7d}  elapsed={stats.elapsed_seconds:>6.1f}s  size={_format_bytes(stats.output_bytes)}"
     )
     print(f"\r{line:<78}", end="", file=sys.stderr, flush=True)
 
 
 def _print_final_stats(stats: CaptureStats) -> None:
     """Print the multi-line summary that follows the progress counter."""
-    rate = stats.matched / stats.elapsed_seconds if stats.elapsed_seconds > 0 else 0.0
+    rate = stats.seen / stats.elapsed_seconds if stats.elapsed_seconds > 0 else 0.0
     print("Capture stopped.", file=sys.stderr)
-    print(f"  Events seen:       {stats.seen}", file=sys.stderr)
-    print(f"  Events matched:    {stats.matched}", file=sys.stderr)
+    print(f"  Events captured:   {stats.seen}", file=sys.stderr)
     print(f"  Elapsed:           {stats.elapsed_seconds:.2f}s", file=sys.stderr)
-    print(f"  Average rate:      {rate:.1f} matched/sec", file=sys.stderr)
+    print(f"  Average rate:      {rate:.1f} events/sec", file=sys.stderr)
     print(f"  Output:            {stats.output_path}", file=sys.stderr)
     print(
         f"  Output size:       {_format_bytes(stats.output_bytes)} ({stats.output_bytes} bytes)",
         file=sys.stderr,
     )
 
-    if stats.matched == 0:
+    if stats.seen == 0:
         print(file=sys.stderr)
-        if stats.seen == 0:
-            print(
-                "  Note: no events were seen on this bus. Is the device generating traffic?",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"  Note: {stats.seen} events were seen on the bus, but none "
-                f"matched device number. Check the device number with `lsusb`.",
-                file=sys.stderr,
-            )
+        print(
+            "  Note: no events were seen on this bus. Is the device attached to "
+            "this bus, and is it generating traffic?",
+            file=sys.stderr,
+        )
 
 
 def _format_bytes(n: int) -> str:

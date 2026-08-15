@@ -21,7 +21,6 @@ This document outlines future GitHub issues for continuing the capture session w
 The roadmap is aligned with:
 
 - `docs/srs/user-stories.md`
-- `docs/mcp-tool-design.md`
 - `CONTRIBUTING.md`
 - the existing `bsu_tool/session.py` capture session model
 - the existing `bsu_tool/mcp/` session and tool scaffolding
@@ -376,10 +375,10 @@ feat: expose marker lookup through MCP tools
 
 What to build:
 
-Add or complete MCP tools aligned with `docs/mcp-tool-design.md`:
+Add or complete MCP tools for the marker system:
 
-- `mark_session_marker`
-- `list_session_markers`
+- `add_marker`
+- `list_markers`
 - a packet retrieval path for packets between two marker names
 
 Why:

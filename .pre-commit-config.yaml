@@ -11,5 +11,5 @@ repos:
     hooks:
       - id: pyright
         additional_dependencies:
-          - "mcp>=1.0"
+          - "mcp>=1.0,<2"   # 2.0 moved mcp.server.fastmcp; see pyproject
           - "pytest>=8.0"

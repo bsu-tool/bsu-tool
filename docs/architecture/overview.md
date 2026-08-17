@@ -71,3 +71,7 @@ See the team architecture diagram in docs/pdf/.
 
 In scope: USB devices using vendor-specific protocols.
 Out of scope: standard USB device classes (HID, Mass Storage, Audio, Video, CDC).
+
+See [Known Limitations And Responsible Use](../known-limitations-and-responsible-use.md)
+for the project scope, safety guidance, and analysis caveats that should frame
+all protocol descriptions.

@@ -33,6 +33,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow, branch
 | [Architecture](docs/architecture/README.md) | Component design and data flow |
 | [Milestone 2 demo](docs/demo/milestone-2-runbook.md) | Fresh-install and end-to-end demo runbook |
 | [User Guide](docs/user-guide/README.md) | Installation and usage (Milestone 4) |
+| [Known Limitations And Responsible Use](docs/known-limitations-and-responsible-use.md) | Project scope, safety guidance, and analysis caveats |
 
 ## License
 

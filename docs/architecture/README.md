@@ -9,6 +9,7 @@
 - [Overview](overview.md)
 - [Milestone 3 Engine Spec](m3-engine-spec.md)
 - [Protocol Description Layer](protocol-description.md)
+- [Known Limitations And Responsible Use](../known-limitations-and-responsible-use.md)
 
 <!-- Add links here as sections are written, e.g.:
 - [pcap-ng Reader](pcap-reader.md)

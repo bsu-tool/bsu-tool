@@ -19,6 +19,15 @@ usbmon mapping
 that captures traffic on *every* bus. Each :class:`LiveUsbDevice` carries the
 derived ``usbmon_path`` for its bus, and :data:`USBMON_ALL_BUSES_PATH` names the
 capture-everything device.
+
+Identity note
+-------------
+Live rows are keyed by *address* (``dev_bbb_ddd``), not by vid:pid. At one
+instant several attached devices can share a vid:pid — a host with multiple USB
+controllers reports one root hub per controller, all ``1d6b:0002`` — so an
+identity key would collide here. A capture has the opposite problem (one device,
+several addresses over time) and keys on vid:pid instead. Use
+:func:`identity_capture_id` to cross the two.
 """
 
 from __future__ import annotations
@@ -26,6 +35,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
+
+from bsu_tool.device_identity import address_device_id, identity_device_id
 
 DEFAULT_SYSFS_ROOT: Final[Path] = Path("/sys/bus/usb/devices")
 """Canonical Linux sysfs location that lists attached USB devices."""
@@ -52,13 +63,20 @@ class LiveUsbDevice:
 
     The ``bus_num`` and ``dev_num`` fields mirror what ``lsusb`` prints ("Bus 003
     Device 007") and match the capture-side
-    :class:`~bsu_tool.mcp.interfaces.DeviceSummary` field names. ``device_id`` is
-    the same stable ``dev_bbb_ddd`` identifier the capture side builds (e.g.
-    ``dev_001_004`` for bus 1 device 4), so a live-enumerated device can be
-    correlated to one seen in a capture. ``vendor_id`` and ``product_id`` are
-    ``0x``-prefixed 4-digit hex strings matching the capture-side convention.
-    ``usbmon_path`` is the ``/dev/usbmonN`` character device that captures this
-    device's bus.
+    :class:`~bsu_tool.mcp.interfaces.DeviceSummary` field names.
+
+    ``device_id`` is the ``dev_bbb_ddd`` **address** identifier (e.g.
+    ``dev_001_004`` for bus 1 device 4). It is stable for as long as the device
+    stays attached — which is what makes snapshot diffing work — but **not**
+    across a replug, because the kernel reassigns the address. Deliberately not
+    the capture side's vid:pid id: several attached devices can share one
+    vid:pid (root hubs routinely do), so an identity id would collide within a
+    single snapshot. Use :func:`identity_device_id` to correlate a live device
+    to one seen in a capture.
+
+    ``vendor_id`` and ``product_id`` are ``0x``-prefixed 4-digit hex strings
+    matching the capture-side convention. ``usbmon_path`` is the
+    ``/dev/usbmonN`` character device that captures this device's bus.
     """
 
     device_id: str
@@ -71,15 +89,36 @@ class LiveUsbDevice:
 
 
 def device_id_for(bus_num: int, dev_num: int) -> str:
-    """Return the stable ``dev_bbb_ddd`` id for a bus/device address.
+    """Return the ``dev_bbb_ddd`` address id for a bus/device address.
 
-    Mirrors the capture-side identifier built in :mod:`bsu_tool.session` (e.g.
-    ``dev_001_004`` for bus 1 device 4) so a live-enumerated device can be
-    matched to one observed in a capture. Each field is zero-padded to three
-    digits; addresses wider than three digits are not truncated and simply widen
-    the field, matching the capture side exactly.
+    Shares its format with the capture side's fallback id (see
+    :func:`bsu_tool.device_identity.address_device_id`). Stable while the device
+    remains attached, so two snapshots of one host agree on it — that is what
+    :func:`bsu_tool.detect_device.diff_snapshots` relies on. It is *not* stable
+    across a replug: the kernel assigns a new address, and the same physical
+    device then reports a different id.
+
+    Each field is zero-padded to three digits; wider addresses are not truncated
+    and simply widen the field.
     """
-    return f"dev_{bus_num:03d}_{dev_num:03d}"
+    return address_device_id(bus_num, dev_num)
+
+
+def identity_capture_id(device: LiveUsbDevice) -> str:
+    """Return the capture-side ``vid_pid`` id for a live-enumerated device.
+
+    Bridges live enumeration to a loaded capture, which keys devices on vid:pid
+    rather than address. Note this id is not unique among attached devices: two
+    units of the same model, or several root hubs, map to one id.
+
+    Args:
+        device: A device from :func:`enumerate_usb_devices`.
+
+    Returns:
+        The ``vid_pid`` id a capture would report for this device, e.g.
+        ``27c6_63ac``.
+    """
+    return identity_device_id(int(device.vendor_id, 16), int(device.product_id, 16))
 
 
 def usbmon_path_for_bus(bus: int) -> str:

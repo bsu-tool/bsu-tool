@@ -29,15 +29,23 @@ from bsu_tool.descriptors import (
     parse_setup_packet,
     parse_string_descriptor,
 )
+from bsu_tool.device_identity import (
+    DeviceIdMap,
+    address_device_id,
+    identity_device_id,
+    resolve_device_id,
+)
 from bsu_tool.mcp.interfaces import (
     CaptureInterface,
     CaptureMetadata,
     CapturePacket,
+    DeviceAddress,
     DeviceEnumeration,
     DeviceSummary,
     EndpointSummary,
     EnumeratedEndpoint,
     EnumeratedInterface,
+    IdentitySource,
     PacketRecord,
     PacketSelection,
 )
@@ -76,6 +84,9 @@ _ENDPOINT_NUMBER_MASK: Final[int] = 0x0F
 _TRANSFER_TYPE_ORDER: Final[tuple[TransferType, ...]] = ("control", "bulk", "interrupt")
 _DATA_PREVIEW_BYTES: Final[int] = 32
 _CONTROL_ENDPOINT: Final[int] = 0
+#: The address a device answers on before SET_ADDRESS assigns it one. Shared by
+#: every device that enumerates, so it identifies no single unit.
+_UNADDRESSED_DEV_NUM: Final[int] = 0
 
 
 @dataclass(frozen=True)
@@ -185,6 +196,18 @@ def _empty_transfer_types() -> set[TransferType]:
     return set()
 
 
+def _empty_addresses() -> list[tuple[int, int]]:
+    return []
+
+
+def _empty_identities() -> set[tuple[int, int]]:
+    return set()
+
+
+def _empty_device_ids() -> DeviceIdMap:
+    return {}
+
+
 def _empty_string_descriptors() -> dict[int, str]:
     return {}
 
@@ -199,6 +222,20 @@ class Capture:
     records: tuple[UrbRecord, ...]
     transactions: tuple[UrbTransaction, ...]
     markers: list[Marker] = field(default_factory=_empty_markers)
+    #: Every ``(bus, dev)`` address in this capture mapped to its resolved device
+    #: id. Derived from the records, so it is never passed in — see __post_init__.
+    device_ids: DeviceIdMap = field(default_factory=_empty_device_ids)
+
+    def __post_init__(self) -> None:
+        """Resolve the address→device-id map so every consumer agrees on ids.
+
+        Computed here rather than at each call site because ``device_id`` reaches
+        packet records, filters and summaries alike; deriving it in one place is
+        what keeps a merged device from being reported under one id and filtered
+        under another.
+        """
+        if not self.device_ids:
+            self.device_ids = _device_ids_by_address(self.records, self.transactions)
 
     def to_dict(self) -> JsonDict:
         """Return a JSON-safe representation of this loaded capture."""
@@ -208,7 +245,9 @@ class Capture:
             "source": str(self.source),
             "metadata": _capture_metadata_to_dict(self.metadata),
             "devices": [_device_summary_to_dict(device) for device in devices],
-            "packets": [_urb_record_to_dict(index, record) for index, record in enumerate(self.records)],
+            "packets": [
+                _urb_record_to_dict(index, record, self.device_ids) for index, record in enumerate(self.records)
+            ],
             "markers": [marker.to_dict() for marker in self.markers],
             "summary": summary.to_dict(),
         }
@@ -241,6 +280,14 @@ _LiveCapturePhase = Literal["starting", "running", "stopping"]
 
 @dataclass
 class _DeviceAccumulator:
+    """Per-device tallies built while walking a capture's records.
+
+    Accumulated per *address* first, because ``(bus, dev)`` is the only identity
+    a URB header carries, then merged by vid:pid in :func:`_merge_by_identity`
+    once descriptors have been parsed. ``addresses`` holds every address folded
+    into this accumulator; ``bus_num``/``dev_num`` track the last one observed.
+    """
+
     bus_num: int
     dev_num: int
     packet_count: int = 0
@@ -250,6 +297,13 @@ class _DeviceAccumulator:
     device_descriptor: DeviceDescriptor | None = None
     configuration: ConfigurationDescriptor | None = None
     string_descriptors: dict[int, str] = field(default_factory=_empty_string_descriptors)
+    addresses: list[tuple[int, int]] = field(default_factory=_empty_addresses)
+    #: Every distinct (vid, pid) a device descriptor reported at this address.
+    #: More than one means two physical devices shared the address — see validate().
+    observed_identities: set[tuple[int, int]] = field(default_factory=_empty_identities)
+    first_index: int = 0
+    last_index: int = 0
+    identity_source: IdentitySource = "address"
 
 
 @dataclass
@@ -410,7 +464,7 @@ class Session:
         Args:
             start_name: Name of the marker anchoring the start of the span.
             end_name: Name of the marker anchoring the end of the span.
-            device_id: Restrict the span to one device by its ``dev_bbb_ddd`` id,
+            device_id: Restrict the span to one device by its ``device_id``,
                 mirroring ``get_packets``. ``None`` keeps every device in range. An
                 unknown id matches nothing and yields an empty span (no error). The
                 returned span's ``count`` is the post-filter total.
@@ -442,9 +496,9 @@ class Session:
         # two anchors; keep each record's original index and drop any that a
         # device_id filter excludes so count reflects the post-filter total.
         packets = tuple(
-            _packet_record(index, records[index])
+            _packet_record(index, records[index], self.capture.device_ids)
             for index in range(start.packet_index + 1, end.packet_index)
-            if device_id is None or _device_id(records[index].bus_num, records[index].dev_num) == device_id
+            if device_id is None or resolve_device_id(self.capture.device_ids, records[index]) == device_id
         )
         return MarkerSpan(start_marker=start, end_marker=end, packets=packets, count=len(packets))
 
@@ -470,7 +524,7 @@ class Session:
         stream — only Isochronous records are dropped at load time.
 
         Args:
-            device_id: Restrict to one device by its ``dev_bbb_ddd`` id.
+            device_id: Restrict to one device by its ``device_id``.
             endpoint: Restrict to one endpoint number in decimal, e.g. ``"3"`` or
                 ``"15"``. A ``0x``-prefixed full address such as ``"0x83"`` is also
                 accepted — only its endpoint number (low nibble) is used, the
@@ -492,10 +546,11 @@ class Session:
         endpoint_number = _normalize_endpoint(endpoint)
         records = self.capture.records
         matches = tuple(
-            _packet_record(index, record)
+            _packet_record(index, record, self.capture.device_ids)
             for index, record in enumerate(records)
             if _record_matches(
                 record,
+                device_ids=self.capture.device_ids,
                 device_id=device_id,
                 endpoint_number=endpoint_number,
                 direction=direction,
@@ -528,7 +583,7 @@ class Session:
         records = self.capture.records
         if not 0 <= index < len(records):
             return None
-        return _packet_record(index, records[index])
+        return _packet_record(index, records[index], self.capture.device_ids)
 
     def detect_repeated_sequences(
         self,
@@ -546,7 +601,7 @@ class Session:
         that function for the normalization and detection rules.
 
         Args:
-            device_id: Restrict analysis to one ``dev_bbb_ddd`` device. ``None``
+            device_id: Restrict analysis to one device by its ``device_id``. ``None``
                 analyzes every device independently.
             scope: ``"device"`` counts sequences across one device's endpoints,
                 which is required to see command/response cycles that cross
@@ -587,7 +642,7 @@ class Session:
         is before interpreting its vendor protocol.
 
         Args:
-            device_id: The ``dev_bbb_ddd`` id of the device, as reported by
+            device_id: The ``device_id`` of the device, as reported by
                 :meth:`list_devices`.
 
         Returns:
@@ -626,6 +681,15 @@ class Session:
         1. The capture decoded no supported URB records (an empty analysis).
         2. A marker anchored outside the decoded record range (a dangling
            reference that ``get_packet`` would resolve to nothing).
+        3. One address reported two different vid:pid identities. Every device
+           enumerates at address 0, so two devices enumerating in one capture
+           share it, and their traffic cannot be told apart by address alone.
+           Whichever identity won absorbed the other's address-0 packets, so the
+           merge is unsafe and the affected device's counts are overstated.
+        4. One identity merged from two addresses active at the same time — the
+           reverse fault. Identity keys on vid:pid, so two identical units
+           attached at once (two root hubs on a two-bus machine, say) report as
+           one device with their counts summed. See :func:`_over_merge_conflicts`.
 
         In-flight submissions (no matching completion) and orphan completions
         (submission not captured) are NOT faults: usbmon captures routinely begin
@@ -648,6 +712,11 @@ class Session:
                     f"marker {marker.name!r} references packet index {marker.packet_index} "
                     f"outside the decoded range 0..{len(records) - 1}"
                 )
+        # Accumulated once and shared: both checks read the same per-address
+        # tallies, and walking the records twice to build them would be waste.
+        devices = _accumulate_devices(records, self.capture.transactions)
+        problems.extend(_identity_conflicts(devices))
+        problems.extend(_over_merge_conflicts(devices))
         return problems
 
     def to_dict(self) -> JsonDict:
@@ -825,8 +894,8 @@ def _device_summary_to_dict(device: DeviceSummary) -> JsonDict:
     }
 
 
-def _urb_record_to_dict(index: int, record: UrbRecord) -> JsonDict:
-    packet = _packet_record(index, record)
+def _urb_record_to_dict(index: int, record: UrbRecord, device_ids: DeviceIdMap) -> JsonDict:
+    packet = _packet_record(index, record, device_ids)
     return {
         "index": index,
         "urb_id": record.urb_id,
@@ -980,14 +1049,14 @@ def _decode_supported_packets(packets: list[CapturePacket]) -> tuple[UrbRecord, 
     return tuple(records)
 
 
-def _packet_record(index: int, record: UrbRecord) -> PacketRecord:
+def _packet_record(index: int, record: UrbRecord, device_ids: DeviceIdMap) -> PacketRecord:
     return PacketRecord(
         index=index,
         urb_id=record.urb_id,
         event_type=record.event_type,
         transfer_type=record.transfer_type,
         direction=record.direction,
-        device_id=_device_id(record.bus_num, record.dev_num),
+        device_id=resolve_device_id(device_ids, record),
         bus_num=record.bus_num,
         dev_num=record.dev_num,
         endpoint_address=f"0x{_endpoint_address(record):02x}",
@@ -1033,13 +1102,14 @@ def _normalize_endpoint(endpoint: str | None) -> int | None:
 def _record_matches(
     record: UrbRecord,
     *,
+    device_ids: DeviceIdMap,
     device_id: str | None,
     endpoint_number: int | None,
     direction: Direction | None,
     transfer_type: TransferType | None,
     event_type: EventType | None,
 ) -> bool:
-    if device_id is not None and _device_id(record.bus_num, record.dev_num) != device_id:
+    if device_id is not None and resolve_device_id(device_ids, record) != device_id:
         return False
     if endpoint_number is not None and record.endpoint != endpoint_number:
         return False
@@ -1057,8 +1127,11 @@ def _accumulate_devices(
     transactions: tuple[UrbTransaction, ...],
 ) -> dict[tuple[int, int], _DeviceAccumulator]:
     devices: dict[tuple[int, int], _DeviceAccumulator] = {}
-    for record in records:
+    for index, record in enumerate(records):
         accumulator = _device_accumulator(devices, record.bus_num, record.dev_num)
+        if accumulator.packet_count == 0:
+            accumulator.first_index = index
+        accumulator.last_index = index
         accumulator.packet_count += 1
         addr = _endpoint_address(record)
         accumulator.endpoint_packet_counts[addr] = accumulator.endpoint_packet_counts.get(addr, 0) + 1
@@ -1080,11 +1153,93 @@ def _summarize_devices(
     records: tuple[UrbRecord, ...],
     transactions: tuple[UrbTransaction, ...],
 ) -> tuple[DeviceSummary, ...]:
-    devices = _accumulate_devices(records, transactions)
-    return tuple(
-        _device_summary(accumulator)
-        for _, accumulator in sorted(devices.items(), key=lambda item: (item[0][0], item[0][1]))
-    )
+    merged = _merge_by_identity(_accumulate_devices(records, transactions))
+    # Sorted by first appearance so output order tracks the capture, and so a
+    # merged device sorts where its earliest address did.
+    ordered = sorted(merged.items(), key=lambda item: (item[1].first_index, item[0]))
+    return tuple(_device_summary(device_id, accumulator) for device_id, accumulator in ordered)
+
+
+def _merge_by_identity(
+    devices: dict[tuple[int, int], _DeviceAccumulator],
+) -> dict[str, _DeviceAccumulator]:
+    """Fold address-keyed accumulators into one entry per physical device.
+
+    Accumulators whose captured device descriptor reports the same vid:pid are
+    the same device seen at different addresses — during enumeration, or across
+    a replug — and are merged under a ``vid_pid`` id. An accumulator with no
+    device descriptor cannot be identified that way and is kept on its own,
+    under its ``dev_bbb_ddd`` address id.
+
+    Args:
+        devices: Address-keyed accumulators from :func:`_accumulate_devices`.
+
+    Returns:
+        Accumulators keyed by resolved device id. Each carries every address it
+        absorbed in ``addresses``, with ``bus_num``/``dev_num`` set to the last
+        address observed.
+    """
+    merged: dict[str, _DeviceAccumulator] = {}
+    for (bus_num, dev_num), accumulator in sorted(devices.items()):
+        device_id = _accumulator_device_id(bus_num, dev_num, accumulator)
+        accumulator.identity_source = "address" if accumulator.device_descriptor is None else "descriptors"
+        accumulator.addresses = [(bus_num, dev_num)]
+
+        existing = merged.get(device_id)
+        if existing is None:
+            merged[device_id] = accumulator
+            continue
+        _absorb(existing, accumulator)
+    return merged
+
+
+def _absorb(target: _DeviceAccumulator, other: _DeviceAccumulator) -> None:
+    """Fold ``other``'s tallies into ``target`` (same physical device)."""
+    target.packet_count += other.packet_count
+    for address, count in other.endpoint_packet_counts.items():
+        target.endpoint_packet_counts[address] = target.endpoint_packet_counts.get(address, 0) + count
+    for address, count in other.endpoint_byte_counts.items():
+        target.endpoint_byte_counts[address] = target.endpoint_byte_counts.get(address, 0) + count
+    target.transfer_types |= other.transfer_types
+    # String descriptors are keyed by index and identical across addresses for one
+    # device; keep any the target has not seen rather than overwriting.
+    for index, text in other.string_descriptors.items():
+        target.string_descriptors.setdefault(index, text)
+    if target.device_descriptor is None:
+        target.device_descriptor = other.device_descriptor
+    if other.configuration is not None and _prefer_configuration(target.configuration, other.configuration):
+        target.configuration = other.configuration
+    target.addresses.extend(other.addresses)
+    target.observed_identities |= other.observed_identities
+    target.first_index = min(target.first_index, other.first_index)
+    if other.last_index > target.last_index:
+        # The most recent address is the operational one, so report that pair.
+        target.last_index = other.last_index
+        target.bus_num = other.bus_num
+        target.dev_num = other.dev_num
+
+
+def _accumulator_device_id(bus_num: int, dev_num: int, accumulator: _DeviceAccumulator) -> str:
+    """Return the id one address resolves to, before any merging.
+
+    The single definition of how an accumulator picks between the identity id
+    and the address fallback, so the merge and the checks that audit the merge
+    cannot drift apart the way the two hand-synchronised ``_device_id`` copies
+    did before :mod:`bsu_tool.device_identity` existed.
+
+    Args:
+        bus_num: USB bus number of the observed address.
+        dev_num: Device address on that bus.
+        accumulator: Tallies for that address, carrying any captured descriptor.
+
+    Returns:
+        The ``vid_pid`` id when a device descriptor was captured, else the
+        ``dev_bbb_ddd`` address fallback.
+    """
+    descriptor = accumulator.device_descriptor
+    if descriptor is None:
+        return address_device_id(bus_num, dev_num)
+    return identity_device_id(descriptor.vendor_id, descriptor.product_id)
 
 
 def _device_accumulator(
@@ -1098,6 +1253,110 @@ def _device_accumulator(
         accumulator = _DeviceAccumulator(bus_num=bus_num, dev_num=dev_num)
         devices[key] = accumulator
     return accumulator
+
+
+def _identity_conflicts(
+    devices: dict[tuple[int, int], _DeviceAccumulator],
+) -> list[str]:
+    """Report addresses where more than one vid:pid identity was seen.
+
+    Devices all enumerate at address 0, so two of them enumerating within one
+    capture leave descriptors for both under the same address. Merging then
+    attributes every address-0 packet to whichever identity won.
+
+    Args:
+        devices: Address-keyed accumulators from :func:`_accumulate_devices`.
+
+    Returns:
+        One message per address reporting several identities, empty when none does.
+    """
+    problems: list[str] = []
+    for (bus_num, dev_num), accumulator in sorted(devices.items()):
+        if len(accumulator.observed_identities) <= 1:
+            continue
+        identities = ", ".join(
+            identity_device_id(vendor_id, product_id)
+            for vendor_id, product_id in sorted(accumulator.observed_identities)
+        )
+        problems.append(
+            f"address {bus_num}:{dev_num} reported more than one device identity ({identities}); "
+            f"its packets cannot be attributed by address alone and the merge overstates one device"
+        )
+    return problems
+
+
+def _over_merge_conflicts(
+    devices: dict[tuple[int, int], _DeviceAccumulator],
+) -> list[str]:
+    """Report one identity merged from addresses that were active at the same time.
+
+    Identity keys on vid:pid alone, so two identical units attached at once fold
+    into one reported device with packet counts summed and endpoints unioned.
+    The common case is a machine with two USB buses: the generic Linux root hub
+    ``1d6b_0002`` sits on each of them.
+
+    One physical device cannot transmit at two addresses simultaneously, so
+    overlapping activity is positive evidence of two units. A replug produces
+    disjoint ranges instead, which is what keeps that case quiet.
+
+    Address 0 is excluded, and must be: it is the address every device answers
+    on before ``SET_ADDRESS`` assigns one, so a device that replugs returns to
+    it and its index range spans the whole capture by construction. Only an
+    assigned address carries the one-unit-at-a-time guarantee this rests on.
+
+    Args:
+        devices: Address-keyed accumulators from :func:`_accumulate_devices`.
+
+    Returns:
+        One message per over-merged identity, empty when none is detected.
+    """
+    spans_by_identity: dict[str, list[tuple[tuple[int, int], int, int]]] = {}
+    for (bus_num, dev_num), accumulator in sorted(devices.items()):
+        if dev_num == _UNADDRESSED_DEV_NUM:
+            continue
+        device_id = _accumulator_device_id(bus_num, dev_num, accumulator)
+        spans_by_identity.setdefault(device_id, []).append(
+            ((bus_num, dev_num), accumulator.first_index, accumulator.last_index)
+        )
+
+    problems: list[str] = []
+    for device_id, spans in sorted(spans_by_identity.items()):
+        overlapping = _concurrently_active_addresses(spans)
+        if not overlapping:
+            continue
+        addresses = ", ".join(f"{bus_num}:{dev_num}" for bus_num, dev_num in sorted(overlapping))
+        problems.append(
+            f"device {device_id} merges addresses active at the same time ({addresses}); "
+            f"one device cannot transmit at two addresses at once, so these are separate "
+            f"units of the same model reported as one, with their counts summed"
+        )
+    return problems
+
+
+def _concurrently_active_addresses(
+    spans: list[tuple[tuple[int, int], int, int]],
+) -> set[tuple[int, int]]:
+    """Return the addresses whose packet index ranges overlap another's."""
+    overlapping: set[tuple[int, int]] = set()
+    for position, (address, first_index, last_index) in enumerate(spans):
+        for other_address, other_first, other_last in spans[position + 1 :]:
+            if first_index <= other_last and other_first <= last_index:
+                overlapping.add(address)
+                overlapping.add(other_address)
+    return overlapping
+
+
+def _device_ids_by_address(
+    records: tuple[UrbRecord, ...],
+    transactions: tuple[UrbTransaction, ...],
+) -> DeviceIdMap:
+    """Map every ``(bus, dev)`` address in a capture to its resolved device id.
+
+    Built once at load so per-packet lookups, filters and summaries all agree.
+    Addresses belonging to one physical device map to the same id.
+    """
+    merged = _merge_by_identity(_accumulate_devices(records, transactions))
+    return {address: device_id for device_id, accumulator in merged.items() for address in accumulator.addresses}
 
 
 def _endpoint_address(record: UrbRecord) -> int:
@@ -1127,6 +1386,7 @@ def _apply_descriptor_info(
         descriptor = parse_device_descriptor(completion.data)
         if descriptor is not None:
             accumulator.device_descriptor = descriptor
+            accumulator.observed_identities.add((descriptor.vendor_id, descriptor.product_id))
     elif setup.descriptor_type == CONFIGURATION_DESCRIPTOR:
         configuration = parse_configuration(completion.data)
         if configuration is not None and _prefer_configuration(accumulator.configuration, configuration):
@@ -1149,7 +1409,7 @@ def _prefer_configuration(existing: ConfigurationDescriptor | None, candidate: C
     return len(candidate.interfaces) > len(existing.interfaces)
 
 
-def _device_summary(accumulator: _DeviceAccumulator) -> DeviceSummary:
+def _device_summary(device_id: str, accumulator: _DeviceAccumulator) -> DeviceSummary:
     device = accumulator.device_descriptor
     config = accumulator.configuration
     manufacturer = _descriptor_string(accumulator, device.manufacturer_index) if device else None
@@ -1158,7 +1418,7 @@ def _device_summary(accumulator: _DeviceAccumulator) -> DeviceSummary:
     product_id = _format_usb_id(device.product_id) if device else None
     interface_class = config.interfaces[0].interface_class if config and config.interfaces else None
     return DeviceSummary(
-        device_id=_device_id(accumulator.bus_num, accumulator.dev_num),
+        device_id=device_id,
         bus_num=accumulator.bus_num,
         dev_num=accumulator.dev_num,
         packet_count=accumulator.packet_count,
@@ -1178,6 +1438,11 @@ def _device_summary(accumulator: _DeviceAccumulator) -> DeviceSummary:
         descriptor_summary=_descriptor_summary(vendor_id, product_id, manufacturer, product),
         device_class=device.device_class if device else None,
         interface_class=interface_class,
+        addresses=tuple(DeviceAddress(bus_num=bus, dev_num=dev) for bus, dev in sorted(set(accumulator.addresses))),
+        identity_source=accumulator.identity_source,
+        # Presence only: iSerialNumber is non-zero. The value stays out of every
+        # summary, packet record and session dump — see DeviceSummary.has_serial.
+        has_serial=device is not None and device.serial_number_index is not None,
     )
 
 
@@ -1193,10 +1458,6 @@ def _format_usb_id(value: int) -> str:
 
 def _sorted_transfer_types(transfer_types: set[TransferType]) -> tuple[TransferType, ...]:
     return tuple(transfer_type for transfer_type in _TRANSFER_TYPE_ORDER if transfer_type in transfer_types)
-
-
-def _device_id(bus_num: int, dev_num: int) -> str:
-    return f"dev_{bus_num:03d}_{dev_num:03d}"
 
 
 def _descriptor_summary(
@@ -1225,14 +1486,12 @@ def _build_enumeration(
     transactions: tuple[UrbTransaction, ...],
     device_id: str,
 ) -> DeviceEnumeration:
-    accumulators = _accumulate_devices(records, transactions)
-    accumulator = next(
-        (acc for acc in accumulators.values() if _device_id(acc.bus_num, acc.dev_num) == device_id),
-        None,
-    )
+    merged = _merge_by_identity(_accumulate_devices(records, transactions))
+    accumulator = merged.get(device_id)
+    device_ids = {address: found_id for found_id, acc in merged.items() for address in acc.addresses}
     device = accumulator.device_descriptor if accumulator else None
     config = accumulator.configuration if accumulator else None
-    enum_indices, runtime_start, is_complete = _enumeration_indices(records, device_id)
+    enum_indices, runtime_start, is_complete = _enumeration_indices(records, device_ids, device_id)
     return DeviceEnumeration(
         device_id=device_id,
         vendor_id=_format_usb_id(device.vendor_id) if device else None,
@@ -1284,6 +1543,7 @@ def _enumerated_interfaces(
 
 def _enumeration_indices(
     records: tuple[UrbRecord, ...],
+    device_ids: DeviceIdMap,
     device_id: str,
 ) -> tuple[list[int], int | None, bool]:
     """Classify a device's records into its enumeration phase.
@@ -1297,7 +1557,7 @@ def _enumeration_indices(
         (
             index
             for index, record in enumerate(records)
-            if _device_id(record.bus_num, record.dev_num) == device_id and not enum_flags[index]
+            if resolve_device_id(device_ids, record) == device_id and not enum_flags[index]
         ),
         None,
     )
@@ -1307,7 +1567,7 @@ def _enumeration_indices(
     for index, record in enumerate(records):
         if runtime_start is not None and index >= runtime_start:
             break
-        if _device_id(record.bus_num, record.dev_num) != device_id or not enum_flags[index]:
+        if resolve_device_id(device_ids, record) != device_id or not enum_flags[index]:
             continue
         enum_indices.append(index)
         if _is_set_configuration(record):

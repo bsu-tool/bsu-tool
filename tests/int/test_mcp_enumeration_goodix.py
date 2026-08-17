@@ -9,7 +9,7 @@ from bsu_tool.session import Session
 _CAPTURE = (
     pathlib.Path(__file__).parent.parent.parent / "test_data" / "captures" / "goodix_enum_and_enroll_sanitized.pcapng"
 )
-_GOODIX_DEVICE_ID = "dev_001_011"
+_GOODIX_DEVICE_ID = "27c6_63ac"
 
 
 def test_list_devices_reports_descriptor_classes() -> None:
@@ -65,7 +65,9 @@ def test_get_enumeration_identifies_phase_boundary() -> None:
     enumeration = session.get_enumeration(_GOODIX_DEVICE_ID)
 
     assert enumeration.is_complete is True
-    assert enumeration.enumeration_start_index == 30
+    # Enumeration starts where the reader first answers at address 0, not where
+    # it later appears at address 11 — both addresses are now the same device.
+    assert enumeration.enumeration_start_index == 22
     assert enumeration.enumeration_end_index == 145
     assert enumeration.runtime_start_index == 146
     # Every enumeration packet precedes the first runtime packet.

@@ -10,8 +10,8 @@
 SIGINT wiring, stderr progress/summary printing, and translation of the
 library's structured exceptions into ``bsu-tool: ...`` messages with a
 clean exit code. These tests target the parts that carry real logic —
-byte formatting, the exception→exit-code mapping, and the "nothing
-matched" hint branches — and skip asserting exact cosmetic layout.
+byte formatting, the exception→exit-code mapping, and the "no events"
+hint branch — and skip asserting exact cosmetic layout.
 
 ``capture`` is replaced with a spy so nothing touches ``/dev/usbmon`` or
 blocks on real traffic, and ``signal.signal`` is stubbed so the tests do
@@ -65,7 +65,6 @@ class _CaptureSpy:
         self,
         *,
         bus: int,
-        device: int | None,
         output_path: Path,
         stop_event: Event,
         on_progress: ProgressCallback | None = None,
@@ -75,7 +74,7 @@ class _CaptureSpy:
             raise self._error
         if self._result is not None:
             return self._result
-        return CaptureStats(output_path=output_path, seen=1, matched=1, elapsed_seconds=1.0, output_bytes=42)
+        return CaptureStats(output_path=output_path, seen=1, elapsed_seconds=1.0, output_bytes=42)
 
 
 def _install(monkeypatch: pytest.MonkeyPatch, spy: _CaptureSpy) -> list[_SigintHandler]:
@@ -90,11 +89,10 @@ def _install(monkeypatch: pytest.MonkeyPatch, spy: _CaptureSpy) -> list[_SigintH
     return handlers
 
 
-def _stats(*, seen: int, matched: int, output: str = "out.pcapng") -> CaptureStats:
+def _stats(*, seen: int, output: str = "out.pcapng") -> CaptureStats:
     return CaptureStats(
         output_path=Path(output),
         seen=seen,
-        matched=matched,
         elapsed_seconds=2.0,
         output_bytes=1024,
     )
@@ -152,7 +150,7 @@ def test_capture_errors_exit_cleanly(
 ) -> None:
     _install(monkeypatch, _CaptureSpy(error=error))
     with pytest.raises(SystemExit) as exc_info:
-        run_sniff(bus=3, device=5, output=Path("out.pcapng"))
+        run_sniff(bus=3, output=Path("out.pcapng"))
     assert exc_info.value.code == 1
     assert "bsu-tool:" in capsys.readouterr().err
 
@@ -160,7 +158,7 @@ def test_capture_errors_exit_cleanly(
 def test_file_exists_error_names_the_path(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     _install(monkeypatch, _CaptureSpy(error=FileExistsError()))
     with pytest.raises(SystemExit):
-        run_sniff(bus=3, device=5, output=Path("existing.pcapng"))
+        run_sniff(bus=3, output=Path("existing.pcapng"))
     assert "existing.pcapng" in capsys.readouterr().err
 
 
@@ -170,18 +168,18 @@ def test_file_exists_error_names_the_path(monkeypatch: pytest.MonkeyPatch, capsy
 
 
 def test_happy_path_prints_final_stats(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    spy = _CaptureSpy(result=_stats(seen=10, matched=10))
+    spy = _CaptureSpy(result=_stats(seen=10))
     _install(monkeypatch, spy)
-    run_sniff(bus=3, device=5, output=Path("out.pcapng"))  # returns normally
+    run_sniff(bus=3, output=Path("out.pcapng"))  # returns normally
     err = capsys.readouterr().err
     assert "Capture stopped." in err
     assert "out.pcapng" in err
 
 
 def test_sigint_handler_sets_the_capture_stop_event(monkeypatch: pytest.MonkeyPatch) -> None:
-    spy = _CaptureSpy(result=_stats(seen=1, matched=1))
+    spy = _CaptureSpy(result=_stats(seen=1))
     handlers = _install(monkeypatch, spy)
-    run_sniff(bus=3, device=5, output=Path("out.pcapng"))
+    run_sniff(bus=3, output=Path("out.pcapng"))
 
     assert spy.stop_event is not None
     assert not spy.stop_event.is_set()
@@ -191,46 +189,33 @@ def test_sigint_handler_sets_the_capture_stop_event(monkeypatch: pytest.MonkeyPa
     assert spy.stop_event.is_set()
 
 
-def test_bus_zero_all_devices_warns(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    _install(monkeypatch, _CaptureSpy(result=_stats(seen=1, matched=1)))
-    run_sniff(bus=0, device=None, output=Path("out.pcapng"))
+def test_bus_zero_warns_it_records_the_whole_host(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _install(monkeypatch, _CaptureSpy(result=_stats(seen=1)))
+    run_sniff(bus=0, output=Path("out.pcapng"))
     assert "Warning: bus 0" in capsys.readouterr().err
 
 
-def test_bus_zero_with_device_does_not_warn(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    # A device filter on bus 0 is fine — the whole-host warning must not fire.
-    _install(monkeypatch, _CaptureSpy(result=_stats(seen=1, matched=1)))
-    run_sniff(bus=0, device=5, output=Path("out.pcapng"))
+def test_specific_bus_does_not_warn(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    _install(monkeypatch, _CaptureSpy(result=_stats(seen=1)))
+    run_sniff(bus=3, output=Path("out.pcapng"))
     assert "Warning: bus 0" not in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
-# _print_final_stats — the "nothing matched" hint branches
+# _print_final_stats — the "no events" hint branch
 # ---------------------------------------------------------------------------
 
 
 def test_final_stats_note_when_no_events_seen(capsys: pytest.CaptureFixture[str]) -> None:
-    _print_final_stats(_stats(seen=0, matched=0))
+    _print_final_stats(_stats(seen=0))
     assert "no events were seen" in capsys.readouterr().err
 
 
-def test_final_stats_note_when_seen_but_none_matched(capsys: pytest.CaptureFixture[str]) -> None:
-    err_text = _emit_final_stats(seen=50, matched=0, capsys=capsys)
-    assert "none" in err_text
-    assert "device number" in err_text
-
-
-def test_final_stats_no_note_when_matched(capsys: pytest.CaptureFixture[str]) -> None:
-    err_text = _emit_final_stats(seen=50, matched=50, capsys=capsys)
-    assert "no events were seen" not in err_text
-    assert "none matched" not in err_text
-
-
-def _emit_final_stats(*, seen: int, matched: int, capsys: pytest.CaptureFixture[str]) -> str:
-    _print_final_stats(_stats(seen=seen, matched=matched))
-    return capsys.readouterr().err
+def test_final_stats_no_note_when_events_captured(capsys: pytest.CaptureFixture[str]) -> None:
+    _print_final_stats(_stats(seen=50))
+    assert "no events were seen" not in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

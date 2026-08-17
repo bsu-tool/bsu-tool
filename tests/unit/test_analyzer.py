@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pytest
 
@@ -15,6 +15,7 @@ from bsu_tool.analyzer import (
     build_analysis_events,
     detect_repeated_sequences,
 )
+from bsu_tool.device_identity import DeviceIdMap, address_device_id
 from bsu_tool.urb_decoder import Direction, TransferType, UrbRecord, UrbTransaction, pair_urbs
 
 _BUS = 1
@@ -28,6 +29,20 @@ class _FakeCapture:
 
     records: tuple[UrbRecord, ...]
     transactions: tuple[UrbTransaction, ...]
+    device_ids: DeviceIdMap = field(default_factory=lambda: DeviceIdMap())
+
+    def __post_init__(self) -> None:
+        """Derive the address→id map the way ``Capture`` does, if not supplied.
+
+        These fixtures carry no descriptors, so every address resolves to its
+        ``dev_bbb_ddd`` fallback id — which is what the analyzer sees for a
+        capture that never recorded an enumeration.
+        """
+        if not self.device_ids:
+            self.device_ids = {
+                (record.bus_num, record.dev_num): address_device_id(record.bus_num, record.dev_num)
+                for record in self.records
+            }
 
 
 def _transfer(

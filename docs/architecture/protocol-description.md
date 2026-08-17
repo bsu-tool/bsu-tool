@@ -1,7 +1,8 @@
 # Protocol Description Layer
 
 **Issue:** #66
-**Status:** Phase 1 models unblocked; assembly blocked on analyzer output from #63 and #64
+**Status:** Phase 1 shared models merged; Phase 2 description assembly implemented after #63
+and #64
 
 ---
 
@@ -36,15 +37,15 @@ Issue #66 has two phases:
   importing analyzer internals.
 - Announce the first commit in Discord when it lands so #63 and #64 can rebase/import it.
 
-**Phase 2 — description assembly, blocked**
-- **#63 repeated-sequence detection** for `CommandPattern`, `PatternStep`,
-  token signatures, analysis notes, and occurrence locations when the analyzer exposes them.
-- **#64 command/response pairing** for response timing, unanswered commands, unsolicited
-  responses, and command/response relationships.
+**Phase 2 — description assembly, implemented after #63/#64**
+- **#63 repeated-sequence detection** provides `CommandPattern`, `PatternStep`,
+  token signatures, analysis notes, and occurrence locations.
+- **#64 command/response pairing** provides command/response pairs, response timing,
+  unanswered commands, unsolicited responses, and incomplete-transfer evidence.
 
-Until #63 and #64 merge, #66 can prepare deterministic formatting rules and synthetic tests.
-It should avoid importing unmerged analyzer modules or duplicating dataclasses that now live
-in `bsu_tool.analysis.models`.
+The assembly code lives in `bsu_tool/analysis/description.py`. It imports the merged #63
+and #64 APIs, preserves the shared dataclasses from `bsu_tool.analysis.models`, and emits a
+presentation object plus deterministic summary for downstream MCP tooling.
 
 ---
 
@@ -74,6 +75,7 @@ class ProtocolDescription:
     device_id: str
     device_summary: DeviceContextSummary
     headline: str
+    deterministic_summary: str
     endpoint_roles: tuple[EndpointRoleDescription, ...]
     commands: tuple[CommandDescription, ...]
     observations: tuple[ObservationDescription, ...]
@@ -176,8 +178,8 @@ class EvidenceSpan:
 that matter for verification: `pattern_id`, marker correlation IDs, first packet indices,
 timestamps, `analysis_notes`, and truncation flags.
 
-The exact dataclass names may change during implementation, but all referenced presentation
-types should be defined in the #66 code rather than left as implicit dictionaries.
+The presentation dataclasses are defined in `bsu_tool.analysis.description`. The shared
+analysis output models remain in `bsu_tool.analysis.models`.
 
 Names such as `command_01` should be deterministic. More specific names, such as
 `relay_toggle`, require marker correlation or analyst-provided labels and should not be
@@ -230,27 +232,30 @@ The exact wording can evolve, but tests should assert stable content categories:
 
 ---
 
+## Module Location
+
+- `bsu_tool/analysis/models.py` holds the shared M3 §5 output models.
+- `bsu_tool/analysis/description.py` assembles `ProtocolHypothesis` objects from #63 and
+  #64 results, then formats `ProtocolDescription` objects and deterministic summaries.
+- `tests/unit/test_protocol_description.py` covers synthetic marker grouping and pairing
+  anomaly aggregation.
+- `tests/int/test_protocol_description_goodix.py` snapshot-tests the Goodix reference
+  summary.
+- #67 should expose this layer through the MCP `analyze_protocol` tool instead of adding
+  MCP registration to #66.
+
 ## Testing Plan
 
-Before #63 and #64 merge:
-- Add and validate `bsu_tool/analysis/models.py` as the first branch commit.
-- Unit-test the formatter with synthetic `ProtocolHypothesis` fixtures imported from
-  `bsu_tool.analysis.models`.
+- Unit-test the formatter with synthetic captures.
 - Verify deterministic command names and stable ordering.
-- Verify marker grouping when `marker_correlation_id` is present.
+- Verify marker grouping when marker ranges bracket pattern occurrences.
 - Verify low-confidence and `analysis_notes` text is preserved.
 - Verify `result_limits.command_patterns_truncated`,
   `result_limits.observations_truncated`, and `result_limits.truncation_note` survive into
   the description.
-
-After #63 merges:
-- Replace synthetic pattern fixtures with real analyzer dataclasses.
-- Add a snapshot test for at least one Goodix repeated pattern.
-
-After #64 merges:
-- Add response-pairing summaries and timing assertions.
-- Add tests for unanswered commands and unsolicited responses with packet indices.
-- Add tests that incomplete transfers remain neutral capture-boundary evidence.
+- Snapshot-test the Goodix reference summary.
+- Verify unanswered commands, unsolicited responses, and incomplete transfers remain
+  separate evidence groups.
 
 Final acceptance for #66:
 - `bsu_tool/analysis/models.py` matches M3 spec §5 field for field and lands as the first
@@ -258,25 +263,3 @@ Final acceptance for #66:
 - emits readable deterministic prose plus structured output for Goodix
 - groups findings by physical action using markers
 - passes `ruff`, `pyright` strict, and `pytest`
-
----
-
-## Module Location
-
-Planned implementation locations:
-- `bsu_tool/analysis/models.py` — shared analyzer output dataclasses from M3 spec §5;
-  this must land before #63 and #64 import it and must be the first commit on this branch
-- `bsu_tool/analysis/description.py` — presentation dataclasses and pure formatting
-  helpers for issue #66
-- `tests/unit/test_protocol_description.py` — synthetic `ProtocolHypothesis` formatter tests
-- `tests/int/test_mcp_describe_protocol_goodix.py` — Goodix integration test after #63 and
-  #64 provide analyzer output
-
-The first implementation should be a pure Python layer callable from `analyze_protocol`.
-Whether it becomes a separate MCP tool such as `describe_protocol` or a field on
-`analyze_protocol` should be decided after #63 and #64 settle the analyzer response shape.
-
-Commit order matters:
-1. `bsu_tool/analysis/__init__.py` and `bsu_tool/analysis/models.py`
-2. documentation and #66 planning updates
-3. formatter/assembly implementation after #63 and #64 land

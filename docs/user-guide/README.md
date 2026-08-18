@@ -3,12 +3,15 @@
 This guide explains how to use `bsu-tool` as an MCP server for USB capture
 analysis. It is written for a developer, researcher, or teammate who has not
 worked on the codebase before and wants to load a capture, inspect USB devices,
-retrieve packets, mark analyst actions, or run a live capture on Linux.
+retrieve packets, mark analyst actions, run protocol analysis, or run a live
+capture on Linux.
 
 `bsu-tool` focuses on Linux `usbmon` captures saved as `.pcapng` files. The MCP
 tools expose decoded USB Request Block (URB) data to an AI assistant such as
 Claude Code so the analyst and assistant can inspect packet-level evidence
-together.
+together. The analysis tools return structured evidence and short deterministic
+summaries; the analyst and assistant should use those as evidence when drafting
+human-readable protocol notes.
 
 ## Setup
 
@@ -70,6 +73,8 @@ For an existing capture:
    direction, transfer type, and event type.
 6. Add markers when you need to label important packet positions.
 7. Use `packets_between_markers` to inspect traffic around a physical action.
+8. Call `analyze_protocol` to assemble repeated command patterns, endpoint
+   roles, observations, anomalies, and deterministic summaries.
 
 For a live session on Linux:
 
@@ -79,7 +84,8 @@ For a live session on Linux:
 3. Operate the physical USB device.
 4. Call `stop_capture`; the output file is automatically loaded into the active
    session.
-5. Continue with `list_devices`, `get_packets`, markers, and enumeration tools.
+5. Continue with `list_devices`, `get_packets`, marker tools, enumeration tools,
+   and `analyze_protocol`.
 
 ## Tool Reference
 
@@ -123,7 +129,8 @@ Output includes:
 
 Each device summary includes:
 
-- `device_id` in the form `dev_bbb_ddd`
+- `device_id`, usually `vid_pid` when descriptor traffic identifies the device,
+  or `dev_bbb_ddd` when the capture lacks descriptor context
 - `bus_num`
 - `dev_num`
 - `packet_count`
@@ -133,8 +140,8 @@ Each device summary includes:
   `product`, `descriptor_summary`, `device_class`, and `interface_class` when
   the capture contains enough enumeration traffic
 
-Use `device_id` from this result as the main identifier in later packet and
-marker tools.
+Use `device_id` from this result as the main identifier in later packet,
+marker, and analysis tools.
 
 ### `get_enumeration`
 
@@ -143,7 +150,7 @@ active capture.
 
 Input:
 
-- `device_id: str` — a `dev_bbb_ddd` id from `list_devices`.
+- `device_id: str` — an id from `list_devices`.
 
 Output includes:
 
@@ -271,6 +278,50 @@ Output includes:
 This is the main tool for connecting a physical action to the USB traffic that
 happened during that action.
 
+### `analyze_protocol`
+
+Runs the protocol-description assembly layer on the active capture.
+
+Input:
+
+- `device_id: str | None = None` — omit to analyze every device the engine can
+  describe, or pass one id from `list_devices` to focus the result
+
+Output includes:
+
+- `descriptions`
+
+Each description includes:
+
+- `device_id`
+- `device_summary`
+- `headline`
+- `deterministic_summary`
+- `endpoint_roles`
+- `commands`
+- `observations`
+- `unanswered_commands`
+- `unsolicited_responses`
+- `incomplete_transfers`
+- `evidence_notes`
+- `analysis_notes`
+- `result_limits`
+
+Use this after basic orientation with `list_devices` and, when useful, after
+adding marker pairs around physical actions. The tool returns structured
+findings, not narrative prose. Ask the assistant to cite the returned command
+evidence, packet indexes, result limits, and analysis notes when it drafts a
+plain-language protocol explanation.
+
+Important error cases:
+
+- If no capture is loaded, the tool reports that `load_capture()` must be called
+  first.
+- If `device_id` is unknown, the tool reports the valid ids seen in the capture.
+
+The result is intentionally token-frugal: it summarizes signatures and evidence
+instead of returning every raw byte in the capture.
+
 ### `enumerate_usb_devices`
 
 Lists USB devices currently attached to the host.
@@ -385,7 +436,7 @@ Expected response shape:
 {
   "devices": [
     {
-      "device_id": "dev_001_011",
+      "device_id": "27c6_63ac",
       "bus_num": 1,
       "dev_num": 11,
       "packet_count": 180,
@@ -418,14 +469,14 @@ interface is visible because `interface_class` is `255` (`0xff`).
 ### 3. Inspect Enumeration
 
 ```text
-get_enumeration(device_id="dev_001_011")
+get_enumeration(device_id="27c6_63ac")
 ```
 
 Expected response shape:
 
 ```json
 {
-  "device_id": "dev_001_011",
+  "device_id": "27c6_63ac",
   "vendor_id": "0x27c6",
   "product_id": "0x63ac",
   "usb_version": "2.00",
@@ -456,7 +507,7 @@ normal runtime protocol.
 ### 4. Retrieve Runtime Packets
 
 ```text
-get_packets(device_id="dev_001_011", endpoint="1", direction="out", offset=0, limit=25)
+get_packets(device_id="27c6_63ac", endpoint="1", direction="out", offset=0, limit=25)
 ```
 
 Expected response shape:
@@ -470,7 +521,7 @@ Expected response shape:
       "event_type": "submission",
       "transfer_type": "bulk",
       "direction": "out",
-      "device_id": "dev_001_011",
+      "device_id": "27c6_63ac",
       "endpoint_address": "0x01",
       "endpoint_number": 1,
       "status": 0,
@@ -540,7 +591,7 @@ Expected `list_markers` response shape:
 packets_between_markers(
   start_name="enroll-1-start",
   end_name="enroll-1-end",
-  device_id="dev_001_011",
+  device_id="27c6_63ac",
   limit=50
 )
 ```
@@ -562,28 +613,110 @@ Expected response shape:
 }
 ```
 
-At the end of the session, ask Claude for a short analysis summary that includes:
+### 7. Run Protocol Analysis
 
-- target device and descriptors
-- endpoint roles
-- packet indices used as evidence
-- repeated payload previews
-- what is known, what is uncertain, and what to inspect next
+```text
+analyze_protocol(device_id="27c6_63ac")
+```
 
-`bsu-tool` does not currently expose a `generate_protocol_hypothesis` MCP tool.
-When that future tool lands, this guide should add a final step that compares
-its generated hypothesis against the packet evidence gathered above.
+Expected response shape:
+
+```json
+{
+  "descriptions": [
+    {
+      "device_id": "27c6_63ac",
+      "device_summary": {
+        "vendor_id": "0x27c6",
+        "product_id": "0x63ac",
+        "product": "Goodix Fingerprint USB Device",
+        "interface_classes": [255]
+      },
+      "headline": "Goodix Fingerprint USB Device: 5 repeated command patterns",
+      "deterministic_summary": "Device 27c6_63ac has 5 repeated command patterns...",
+      "endpoint_roles": [
+        {
+          "endpoint_address": "0x01",
+          "direction": "out",
+          "transfer_type": "bulk",
+          "summary": "analyzed OUT bulk event(s)"
+        }
+      ],
+      "commands": [
+        {
+          "command_id": "command_01",
+          "name": "command_01",
+          "occurrence_count": 11,
+          "steps": [
+            {
+              "step_index": 0,
+              "endpoint_address": "0x01",
+              "direction": "out",
+              "transfer_type": "bulk",
+              "signature_mode": "full",
+              "observed_length_range": [64, 64],
+              "payload_summary": "64 bytes; signature aa ..."
+            }
+          ],
+          "evidence": {
+            "first_packet_index": 149,
+            "last_packet_index": 251
+          }
+        }
+      ],
+      "observations": [],
+      "unanswered_commands": [],
+      "unsolicited_responses": [],
+      "incomplete_transfers": [],
+      "evidence_notes": ["pattern_01: packets 149-251, timestamps ..."],
+      "analysis_notes": [],
+      "result_limits": {
+        "command_patterns_truncated": false,
+        "observations_truncated": true,
+        "truncation_note": "single-occurrence observations truncated to the top 10"
+      }
+    }
+  ]
+}
+```
+
+The exact command ids, packet indexes, and counts depend on the capture. The
+stable parts are the shape of the response and the rule that every command must
+carry steps plus evidence. Use `deterministic_summary` for a compact status
+update, then inspect `commands`, `observations`, and anomaly collections when
+writing a more detailed explanation.
+
+To analyze every describable device in the loaded capture, omit the filter:
+
+```text
+analyze_protocol()
+```
+
+The Goodix reference capture includes the reader device and a descriptor-less
+device. The descriptor-less device may keep an address-derived id such as
+`dev_001_001`; that is expected when the capture does not include enough
+descriptor traffic to build a vendor/product id.
+
+When asking Claude for a final protocol explanation, ask for a short summary
+that includes:
+
+- the target device context from `device_summary`
+- the endpoint roles
+- the command patterns and their packet evidence
+- any single-occurrence observations
+- unanswered commands, unsolicited responses, or incomplete transfers
+- any truncation or analysis notes that limit confidence
 
 ## Example Marker Workflow
 
 ```text
-get_packets(device_id="dev_001_011", limit=10)
+get_packets(device_id="27c6_63ac", limit=10)
 add_marker(name="button-press-1-start", packet_index=120, note="pressed relay button")
 add_marker(name="button-press-1-end", packet_index=145, note="released relay button")
 packets_between_markers(
   start_name="button-press-1-start",
   end_name="button-press-1-end",
-  device_id="dev_001_011"
+  device_id="27c6_63ac"
 )
 ```
 
@@ -692,10 +825,21 @@ non-USB link types are rejected.
 Use narrower filters and pagination:
 
 ```text
-get_packets(device_id="dev_001_011", endpoint="1", direction="out", offset=0, limit=50)
+get_packets(device_id="27c6_63ac", endpoint="1", direction="out", offset=0, limit=50)
 ```
 
 Then request the next page by increasing `offset`.
+
+### `analyze_protocol` says no capture is loaded
+
+Call `load_capture(path="...")` first, or use `stop_capture()` after a live
+capture so the recorded file is loaded into the active session.
+
+### `analyze_protocol` rejects `device_id`
+
+Call `list_devices()` again and copy the id from that response. Descriptor-backed
+devices may use a `vid_pid` id such as `27c6_63ac`; devices without descriptor
+context may keep an address-derived id such as `dev_001_001`.
 
 ## Current Limitations
 

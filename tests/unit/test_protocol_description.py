@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from bsu_tool.analysis.description import assemble_protocol_hypotheses, describe_protocol
+import pytest
+
+from bsu_tool.analysis.description import MAX_OBSERVATIONS_RETURNED, assemble_protocol_hypotheses, describe_protocol
 from bsu_tool.device_identity import DeviceIdMap, address_device_id
+from bsu_tool.mcp.interfaces import DeviceSummary, EndpointSummary
 from bsu_tool.urb_decoder import Direction, TransferType, UrbRecord, UrbTransaction, pair_urbs
 
 _BUS = 1
@@ -107,8 +110,26 @@ def _capture(*groups: list[UrbRecord], markers: tuple[_Marker, ...] = ()) -> _Fa
     return _FakeCapture(records=tuple(records), transactions=tuple(pair_urbs(records)), markers=markers)
 
 
+def _device_summary(device_id: str = "dev_001_002") -> DeviceSummary:
+    """Build a minimal device summary for protocol descriptions."""
+    return DeviceSummary(
+        device_id=device_id,
+        bus_num=_BUS,
+        dev_num=_DEV,
+        packet_count=0,
+        endpoints_seen=(EndpointSummary(address="0x01", packet_count=0, byte_count=0),),
+        transfer_types_seen=("bulk",),
+        vendor_id="0x1234",
+        product_id="0xabcd",
+        manufacturer="Example",
+        product="Example Device",
+        descriptor_summary="Example Device (0x1234:0xabcd)",
+        interface_class=0xFF,
+    )
+
+
 def test_description_groups_commands_by_marker_range() -> None:
-    """Repeated command patterns carry marker correlation into readable commands."""
+    """Repeated patterns and single-occurrence observations carry marker context."""
     capture = _capture(
         _out(1, b"\x10\x00", 1.0),
         _in(2, b"\x10\xaa", 1.1),
@@ -120,12 +141,56 @@ def test_description_groups_commands_by_marker_range() -> None:
         ),
     )
 
-    description = describe_protocol(capture)[0]
+    description = describe_protocol(capture, device_summaries=(_device_summary(),))[0]
 
     assert description.commands
     assert description.commands[0].markers == ("enroll-start..enroll-end",)
-    assert description.observations[0].nearest_marker == "enroll-start..enroll-end"
+    assert description.observations
+    assert description.observations[0].reason == "near_marker"
+    assert description.observations[0].nearest_marker == "enroll-start"
     assert "near enroll-start..enroll-end" in description.deterministic_summary
+
+
+def test_hypothesis_does_not_attach_device_timing_to_patterns() -> None:
+    """Device-wide pairing timing is not copied onto individual command patterns."""
+    capture = _capture(
+        _out(1, b"\x10\x00", 1.0),
+        _in(2, b"\x10\xaa", 1.1),
+        _out(3, b"\x10\x01", 2.0),
+        _in(4, b"\x10\xab", 2.1),
+    )
+
+    hypothesis = assemble_protocol_hypotheses(capture)[0]
+
+    assert any({step.direction for step in pattern.steps} == {"in", "out"} for pattern in hypothesis.command_patterns)
+    assert all(pattern.response_timing is None for pattern in hypothesis.command_patterns)
+
+
+def test_multi_step_single_occurrences_become_observations() -> None:
+    """Non-repeating multi-step OUT/IN exchanges are preserved as observations."""
+    capture = _capture(
+        _out(1, b"\x10\x00", 1.0),
+        _in(2, b"\x10\xaa", 1.1),
+        _out(3, b"\x10\x01", 2.0),
+        _in(4, b"\x10\xab", 2.1),
+    )
+
+    hypothesis = assemble_protocol_hypotheses(capture)[0]
+
+    assert hypothesis.observations
+    assert hypothesis.observations[0].reason == "multi_step_exchange"
+    assert hypothesis.observations[0].nearest_marker is None
+    assert {step.direction for step in hypothesis.observations[0].steps} == {"in", "out"}
+    assert hypothesis.result_limits.max_observations == MAX_OBSERVATIONS_RETURNED
+    assert hypothesis.result_limits.observations_truncated is False
+
+
+def test_description_requires_device_context() -> None:
+    """Descriptions need device summaries so hypotheses are not context-free."""
+    capture = _capture(_out(1, b"\x10\x00", 1.0), _out(2, b"\x10\x00", 2.0))
+
+    with pytest.raises(ValueError, match="missing device summary"):
+        describe_protocol(capture, device_summaries=())
 
 
 def test_hypothesis_preserves_anomalies_and_incomplete_transfers() -> None:

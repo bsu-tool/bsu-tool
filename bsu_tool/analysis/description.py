@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import Protocol, cast
+from typing import Final, Protocol, cast
 
 from bsu_tool.analysis.models import (
     AnalysisObservation,
@@ -14,6 +14,7 @@ from bsu_tool.analysis.models import (
     IncompleteTransfer,
     IncompleteTransferReason,
     MarkerCorrelation,
+    ObservationReason,
     PatternOccurrence,
     PatternStep,
     ProtocolHypothesis,
@@ -22,12 +23,17 @@ from bsu_tool.analysis.models import (
     TransferType,
     UnansweredCommand,
     UnsolicitedResponse,
+    VariableByteRange,
 )
 from bsu_tool.analysis.pairing import PairingResult, pair_command_responses
 from bsu_tool.analyzer import (
     MAX_COMMAND_PATTERNS_RETURNED,
+    MAX_SEQUENCE_WINDOW,
     MAX_VARIABLE_VALUES_REPORTED,
+    AnalysisEvent,
+    PayloadSignature,
     build_analysis_events,
+    normalize_tokens,
 )
 from bsu_tool.analyzer import (
     CaptureLike as AnalyzerCaptureLike,
@@ -35,9 +41,17 @@ from bsu_tool.analyzer import (
 from bsu_tool.mcp.interfaces import DeviceSummary
 from bsu_tool.urb_decoder import UrbRecord, UrbTransaction
 
-_MARKER_CORRELATION_THRESHOLD_PERCENT = 50.0
+_MARKER_CORRELATION_THRESHOLD_PERCENT = 70.0
 _SUMMARY_PATTERN_LIMIT = 3
 _ANOMALY_PREFIX_BYTES = 8
+MARKER_CORRELATION_WINDOW_SECONDS: Final[float] = 2.0
+"""Maximum distance from a marker for single-occurrence marker observations."""
+MAX_OBSERVATIONS_RETURNED: Final[int] = 10
+"""Maximum observations returned by the assembly layer, matching spec §7."""
+MIN_OBSERVATION_STEPS: Final[int] = 2
+"""Minimum OUT/IN steps for a single-occurrence multi-step observation."""
+
+_Token = tuple[int, Direction, TransferType, SignatureMode, PayloadSignature]
 
 
 class CaptureLike(Protocol):
@@ -86,6 +100,19 @@ class MarkerLike(Protocol):
     def note(self) -> str | None:
         """Optional marker note."""
         ...
+
+
+class _TokenInfoLike(Protocol):
+    """Token metadata shape returned by analyzer normalization."""
+
+    endpoint_number: int
+    endpoint_address: str
+    direction: Direction
+    transfer_type: TransferType
+    signature_mode: SignatureMode
+    payload_signature: PayloadSignature
+    observed_length_range: tuple[int, int]
+    variable_byte_ranges: tuple[VariableByteRange, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +260,18 @@ class _AnomalySample:
     payload: bytes
 
 
+@dataclass(frozen=True, slots=True)
+class _ObservationCandidate:
+    """One single-occurrence sequence that may become an observation."""
+
+    reason: ObservationReason
+    sequence: tuple[_Token, ...]
+    start: AnalysisEvent
+    steps: tuple[PatternStep, ...]
+    nearest_marker: str | None
+    marker_distance_seconds: float
+
+
 def assemble_protocol_hypotheses(
     capture: CaptureLike,
     *,
@@ -260,30 +299,33 @@ def assemble_protocol_hypotheses(
     for sequence_result in sequence_results:
         pairing = pairing_by_device.get(sequence_result.device_id)
         marker_correlations, patterns = _correlate_markers(sequence_result.patterns, markers)
-        patterns = _attach_response_timing(patterns, pairing)
+        observations, observations_truncated = _single_occurrence_observations(
+            capture,
+            sequence_result.device_id,
+            patterns,
+            markers,
+        )
         notes = list(sequence_result.analysis_notes)
         if pairing is not None:
             notes.extend(pairing.analysis_notes)
+        if observations_truncated:
+            notes.append(f"single-occurrence observations truncated to the top {MAX_OBSERVATIONS_RETURNED} by rank")
         hypotheses.append(
             ProtocolHypothesis(
                 device_id=sequence_result.device_id,
                 command_patterns=patterns,
-                observations=_observations_for(patterns, marker_correlations),
+                observations=observations,
                 unsolicited_responses=_unsolicited_responses(capture, pairing) if pairing is not None else (),
                 unanswered_commands=_unanswered_commands(capture, pairing) if pairing is not None else (),
                 incomplete_transfers=_incomplete_transfers(pairing) if pairing is not None else (),
                 marker_correlations=marker_correlations,
                 result_limits=ResultLimits(
                     max_command_patterns=MAX_COMMAND_PATTERNS_RETURNED,
-                    max_observations=len(patterns),
+                    max_observations=MAX_OBSERVATIONS_RETURNED,
                     max_variable_values_reported=MAX_VARIABLE_VALUES_REPORTED,
                     command_patterns_truncated=sequence_result.patterns_truncated,
-                    observations_truncated=False,
-                    truncation_note=(
-                        f"command patterns truncated to the top {MAX_COMMAND_PATTERNS_RETURNED}"
-                        if sequence_result.patterns_truncated
-                        else None
-                    ),
+                    observations_truncated=observations_truncated,
+                    truncation_note=_truncation_note(sequence_result.patterns_truncated, observations_truncated),
                 ),
                 analysis_notes=tuple(dict.fromkeys(notes)),
             )
@@ -294,24 +336,31 @@ def assemble_protocol_hypotheses(
 def describe_protocol(
     capture: CaptureLike,
     *,
+    device_summaries: tuple[DeviceSummary, ...],
     device_id: str | None = None,
-    device_summaries: tuple[DeviceSummary, ...] = (),
 ) -> tuple[ProtocolDescription, ...]:
     """Assemble concise, deterministic descriptions for a loaded capture.
 
     Args:
         capture: Loaded capture state.
+        device_summaries: Summaries from ``Session.list_devices()``. Required so
+            protocol descriptions stay anchored to device and descriptor context.
         device_id: Restrict analysis to one device. ``None`` describes each device
             reported by the analysis engine.
-        device_summaries: Optional summaries from ``Session.list_devices()``.
 
     Returns:
         One presentation object per analyzed device.
+
+    Raises:
+        ValueError: The analyzer returned a device with no matching device summary.
     """
     summaries = {summary.device_id: summary for summary in device_summaries}
     descriptions: list[ProtocolDescription] = []
     for hypothesis in assemble_protocol_hypotheses(capture, device_id=device_id):
-        description = _describe_hypothesis(hypothesis, summaries.get(hypothesis.device_id))
+        summary = summaries.get(hypothesis.device_id)
+        if summary is None:
+            raise ValueError(f"missing device summary for {hypothesis.device_id}")
+        description = _describe_hypothesis(hypothesis, summary)
         descriptions.append(replace(description, deterministic_summary=format_protocol_summary(description)))
     return tuple(descriptions)
 
@@ -342,6 +391,9 @@ def format_protocol_summary(description: ProtocolDescription) -> str:
     if description.incomplete_transfers:
         count = sum(item.occurrence_count for item in description.incomplete_transfers)
         parts.append(f"{count} incomplete transfer occurrence{'' if count == 1 else 's'}.")
+    if description.observations:
+        count = len(description.observations)
+        parts.append(f"{count} single-occurrence observation{'' if count == 1 else 's'}.")
     return " ".join(parts)
 
 
@@ -554,6 +606,9 @@ def _endpoint_roles(hypothesis: ProtocolHypothesis) -> tuple[EndpointRoleDescrip
         counter[(anomaly.endpoint_address, "out", anomaly.transfer_type)] += anomaly.occurrence_count
     for anomaly in hypothesis.unsolicited_responses:
         counter[(anomaly.endpoint_address, "in", anomaly.transfer_type)] += anomaly.occurrence_count
+    for observation in hypothesis.observations:
+        for step in observation.steps:
+            counter[(step.endpoint_address, step.direction, step.transfer_type)] += 1
 
     roles: list[EndpointRoleDescription] = []
     for (endpoint_address, direction, transfer_type), count in sorted(counter.items()):
@@ -643,39 +698,143 @@ def _marker_span_name(
     return None
 
 
-def _observations_for(
+def _single_occurrence_observations(
+    capture: CaptureLike,
+    device_id: str,
     patterns: tuple[CommandPattern, ...],
-    correlations: tuple[MarkerCorrelation, ...],
-) -> tuple[AnalysisObservation, ...]:
-    by_id = {correlation.correlation_id: correlation for correlation in correlations}
-    observations: list[AnalysisObservation] = []
-    for pattern in patterns:
-        correlation = by_id.get(pattern.marker_correlation_id or "")
-        if correlation is None:
-            continue
-        observations.append(
-            AnalysisObservation(
-                observation_id=f"observation_{len(observations) + 1:02d}",
-                reason="near_marker",
-                steps=pattern.steps,
-                nearest_marker=correlation.marker_name,
-            )
+    markers: tuple[MarkerLike, ...],
+) -> tuple[tuple[AnalysisObservation, ...], bool]:
+    analyzer_capture = cast(AnalyzerCaptureLike, capture)
+    stream = build_analysis_events(analyzer_capture, device_id=device_id)
+    events = tuple(event for event in stream.events if event.device_id == device_id and not event.failed)
+    if not events:
+        return (), False
+
+    token_by_index, raw_info_by_token, _notes = normalize_tokens(events)
+    info_by_token = cast(dict[_Token, _TokenInfoLike], raw_info_by_token)
+    promoted = _promoted_sequences(patterns)
+    counts: Counter[tuple[_Token, ...]] = Counter()
+    for start in range(len(events)):
+        max_width = min(MAX_SEQUENCE_WINDOW, len(events) - start)
+        for width in range(1, max_width + 1):
+            window = events[start : start + width]
+            sequence = tuple(token_by_index[event.packet_index] for event in window)
+            counts[sequence] += 1
+
+    candidates: list[_ObservationCandidate] = []
+    for start in range(len(events)):
+        max_width = min(MAX_SEQUENCE_WINDOW, len(events) - start)
+        for width in range(1, max_width + 1):
+            window = events[start : start + width]
+            sequence = tuple(token_by_index[event.packet_index] for event in window)
+            if counts[sequence] != 1 or sequence in promoted:
+                continue
+            steps = tuple(_step_from_token(index, info_by_token[token]) for index, token in enumerate(sequence))
+            marker, distance = _nearest_marker(window[0].timestamp, markers)
+            if marker is not None and distance <= MARKER_CORRELATION_WINDOW_SECONDS:
+                candidates.append(
+                    _ObservationCandidate(
+                        reason="near_marker",
+                        sequence=sequence,
+                        start=window[0],
+                        steps=steps,
+                        nearest_marker=marker.name,
+                        marker_distance_seconds=distance,
+                    )
+                )
+                continue
+            if width >= MIN_OBSERVATION_STEPS and {event.direction for event in window} == {"in", "out"}:
+                candidates.append(
+                    _ObservationCandidate(
+                        reason="multi_step_exchange",
+                        sequence=sequence,
+                        start=window[0],
+                        steps=steps,
+                        nearest_marker=None,
+                        marker_distance_seconds=float("inf"),
+                    )
+                )
+
+    ranked = _rank_observation_candidates(candidates)
+    truncated = len(ranked) > MAX_OBSERVATIONS_RETURNED
+    observations = tuple(
+        AnalysisObservation(
+            observation_id=f"observation_{index + 1:02d}",
+            reason=candidate.reason,
+            steps=candidate.steps,
+            nearest_marker=candidate.nearest_marker,
         )
-    return tuple(observations)
-
-
-def _attach_response_timing(
-    patterns: tuple[CommandPattern, ...],
-    pairing: PairingResult | None,
-) -> tuple[CommandPattern, ...]:
-    if pairing is None or pairing.response_timing is None:
-        return patterns
-    return tuple(
-        replace(pattern, response_timing=pairing.response_timing)
-        if {step.direction for step in pattern.steps} == {"in", "out"}
-        else pattern
-        for pattern in patterns
+        for index, candidate in enumerate(ranked[:MAX_OBSERVATIONS_RETURNED])
     )
+    return observations, truncated
+
+
+def _promoted_sequences(patterns: tuple[CommandPattern, ...]) -> set[tuple[_Token, ...]]:
+    return {
+        tuple(
+            (
+                step.endpoint_number,
+                step.direction,
+                step.transfer_type,
+                step.signature_mode,
+                step.payload_signature,
+            )
+            for step in pattern.steps
+        )
+        for pattern in patterns
+    }
+
+
+def _step_from_token(step_index: int, info: _TokenInfoLike) -> PatternStep:
+    return PatternStep(
+        step_index=step_index,
+        endpoint_number=info.endpoint_number,
+        endpoint_address=info.endpoint_address,
+        direction=info.direction,
+        transfer_type=info.transfer_type,
+        signature_mode=info.signature_mode,
+        payload_signature=info.payload_signature,
+        observed_length_range=info.observed_length_range,
+        variable_byte_ranges=info.variable_byte_ranges,
+    )
+
+
+def _nearest_marker(timestamp: float, markers: tuple[MarkerLike, ...]) -> tuple[MarkerLike | None, float]:
+    if not markers:
+        return None, float("inf")
+    marker = min(markers, key=lambda item: (abs(timestamp - item.timestamp), item.packet_index, item.name))
+    return marker, abs(timestamp - marker.timestamp)
+
+
+def _rank_observation_candidates(
+    candidates: list[_ObservationCandidate],
+) -> tuple[_ObservationCandidate, ...]:
+    deduplicated: dict[tuple[int, tuple[_Token, ...]], _ObservationCandidate] = {}
+    for candidate in candidates:
+        key = (candidate.start.packet_index, candidate.sequence)
+        existing = deduplicated.get(key)
+        if existing is None or _observation_sort_key(candidate) < _observation_sort_key(existing):
+            deduplicated[key] = candidate
+    return tuple(sorted(deduplicated.values(), key=_observation_sort_key))
+
+
+def _observation_sort_key(candidate: _ObservationCandidate) -> tuple[float, int, float, int, ObservationReason]:
+    return (
+        candidate.marker_distance_seconds,
+        -len(candidate.sequence),
+        candidate.start.timestamp,
+        candidate.start.packet_index,
+        candidate.reason,
+    )
+
+
+def _truncation_note(patterns_truncated: bool, observations_truncated: bool) -> str | None:
+    notes: list[str] = []
+    if patterns_truncated:
+        notes.append(f"command patterns truncated to the top {MAX_COMMAND_PATTERNS_RETURNED}")
+    if observations_truncated:
+        notes.append(f"single-occurrence observations truncated to the top {MAX_OBSERVATIONS_RETURNED}")
+    return "; ".join(notes) if notes else None
 
 
 def _unanswered_commands(capture: CaptureLike, pairing: PairingResult) -> tuple[UnansweredCommand, ...]:

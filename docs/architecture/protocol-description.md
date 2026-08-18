@@ -45,7 +45,9 @@ Issue #66 has two phases:
 
 The assembly code lives in `bsu_tool/analysis/description.py`. It imports the merged #63
 and #64 APIs, preserves the shared dataclasses from `bsu_tool.analysis.models`, and emits a
-presentation object plus deterministic summary for downstream MCP tooling.
+presentation object plus deterministic summary for downstream MCP tooling. The presentation
+entry point requires device summaries from `Session.list_devices()` so protocol descriptions
+stay anchored to descriptor and endpoint context.
 
 ---
 
@@ -204,7 +206,11 @@ marker hits. With the M3 spec's current model, each `CommandPattern` has at most
    normalization safety valves remain visible to the analyst.
 7. Preserve unanswered commands, unsolicited responses, and incomplete transfers as separate
    evidence groups; do not fold them into named commands.
-8. Prefer short, template-based prose. Avoid speculative protocol names unless marker names
+8. Preserve §3.2 single-occurrence observations when they are marker-adjacent or when they
+   are non-repeating multi-step OUT/IN exchanges.
+9. Do not copy device-wide response timing onto individual command patterns. Per-pattern
+   timing should appear only when the assembler can tie pair evidence to that exact pattern.
+10. Prefer short, template-based prose. Avoid speculative protocol names unless marker names
    or device context support them.
 
 ---
@@ -249,10 +255,13 @@ The exact wording can evolve, but tests should assert stable content categories:
 - Unit-test the formatter with synthetic captures.
 - Verify deterministic command names and stable ordering.
 - Verify marker grouping when marker ranges bracket pattern occurrences.
+- Verify marker-adjacent and multi-step single-occurrence observations are preserved.
 - Verify low-confidence and `analysis_notes` text is preserved.
 - Verify `result_limits.command_patterns_truncated`,
   `result_limits.observations_truncated`, and `result_limits.truncation_note` survive into
   the description.
+- Verify `result_limits.max_observations` reports the spec constant rather than the command
+  pattern count.
 - Snapshot-test the Goodix reference summary.
 - Verify unanswered commands, unsolicited responses, and incomplete transfers remain
   separate evidence groups.

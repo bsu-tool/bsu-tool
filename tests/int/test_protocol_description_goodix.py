@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pathlib
 
-from bsu_tool.analysis.description import describe_protocol
+from bsu_tool.analysis.description import MAX_OBSERVATIONS_RETURNED, assemble_protocol_hypotheses, describe_protocol
 from bsu_tool.session import Session
 
 _CAPTURE = (
@@ -22,6 +22,7 @@ def test_goodix_protocol_description_snapshot() -> None:
     assert description.device_id == _GOODIX_DEVICE
     assert description.device_summary.product == "Goodix Fingerprint USB Device"
     assert description.commands
+    assert len(description.observations) == MAX_OBSERVATIONS_RETURNED
     assert description.endpoint_roles
     assert description.deterministic_summary == (
         "Device 27c6_63ac has 5 repeated command patterns across 2 endpoint roles. "
@@ -29,5 +30,17 @@ def test_goodix_protocol_description_snapshot() -> None:
         "evidence packets 149-243. command_03 occurs 3 times; evidence packets 176-225. "
         "Contains OUT and IN steps; response timing was not isolated to this pattern. "
         "3 unanswered command occurrences. 42 unsolicited response occurrences. "
-        "1 incomplete transfer occurrence."
+        "1 incomplete transfer occurrence. 10 single-occurrence observations."
     )
+
+
+def test_goodix_hypothesis_preserves_single_occurrence_observations() -> None:
+    """Goodix preserves capped multi-step single-occurrence observations."""
+    session = Session()
+    capture = session.load(_CAPTURE)
+    hypothesis = assemble_protocol_hypotheses(capture, device_id=_GOODIX_DEVICE)[0]
+
+    assert len(hypothesis.observations) == MAX_OBSERVATIONS_RETURNED
+    assert {observation.reason for observation in hypothesis.observations} == {"multi_step_exchange"}
+    assert hypothesis.result_limits.max_observations == MAX_OBSERVATIONS_RETURNED
+    assert hypothesis.result_limits.observations_truncated is True

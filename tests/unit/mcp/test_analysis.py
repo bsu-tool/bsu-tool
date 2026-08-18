@@ -26,7 +26,10 @@ _GOODIX = (
     / "captures"
     / "goodix_enum_and_enroll_sanitized.pcapng"
 )
-_GOODIX_DEVICE_IDS = ("dev_001_000", "dev_001_001", "dev_001_011")
+# The reader identifies itself by vid:pid; the other device sends no descriptors,
+# so it keeps an address-derived id.
+_GOODIX_DEVICE_IDS = ("dev_001_001", "27c6_63ac")
+_GOODIX_READER = "27c6_63ac"
 
 
 def _hypothesis(device_id: str, *, note: str = "synthetic") -> ProtocolHypothesis:
@@ -87,7 +90,7 @@ def test_analyze_protocol_without_capture_reports_error() -> None:
 def test_analyze_protocol_rejects_unknown_device_id(monkeypatch: pytest.MonkeyPatch) -> None:
     """A mistyped device_id is reported with the known ids, not silently analyzed as empty."""
 
-    def fake(capture: Capture, device_ids: tuple[str, ...]) -> tuple[ProtocolHypothesis, ...]:
+    def fake(capture: Capture, device_id: str | None) -> tuple[ProtocolHypothesis, ...]:
         raise AssertionError("the engine must not run for an unknown device_id")
 
     monkeypatch.setattr(analysis, "_generate_hypotheses", fake)
@@ -97,37 +100,42 @@ def test_analyze_protocol_rejects_unknown_device_id(monkeypatch: pytest.MonkeyPa
 
 
 def test_analyze_protocol_analyzes_every_device_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Omitting device_id analyzes all devices in the capture, mirroring get_packets."""
-    seen: list[tuple[str, ...]] = []
+    """Omitting device_id asks the engine for every device, mirroring get_packets.
 
-    def fake(capture: Capture, device_ids: tuple[str, ...]) -> tuple[ProtocolHypothesis, ...]:
+    The engine, not this wrapper, decides which devices come back, so the tool
+    passes None straight through and returns whatever it produces.
+    """
+    seen: list[str | None] = []
+
+    def fake(capture: Capture, device_id: str | None) -> tuple[ProtocolHypothesis, ...]:
         assert capture.metadata.packet_count == 253  # the real loaded capture reaches the engine
-        seen.append(device_ids)
-        return tuple(_hypothesis(device_id) for device_id in device_ids)
+        seen.append(device_id)
+        return tuple(_hypothesis(known) for known in _GOODIX_DEVICE_IDS)
 
     monkeypatch.setattr(analysis, "_generate_hypotheses", fake)
 
     payload = _call({}, _loaded_session())
 
-    assert seen == [_GOODIX_DEVICE_IDS]
+    assert seen == [None]
     assert [entry["device_id"] for entry in payload["hypotheses"]] == list(_GOODIX_DEVICE_IDS)
 
 
 def test_analyze_protocol_filters_to_one_device(monkeypatch: pytest.MonkeyPatch) -> None:
     """A known device_id narrows the analysis to that device alone."""
-    seen: list[tuple[str, ...]] = []
+    seen: list[str | None] = []
 
-    def fake(capture: Capture, device_ids: tuple[str, ...]) -> tuple[ProtocolHypothesis, ...]:
+    def fake(capture: Capture, device_id: str | None) -> tuple[ProtocolHypothesis, ...]:
         del capture
-        seen.append(device_ids)
-        return (_hypothesis(device_ids[0], note="only this device"),)
+        seen.append(device_id)
+        assert device_id is not None
+        return (_hypothesis(device_id, note="only this device"),)
 
     monkeypatch.setattr(analysis, "_generate_hypotheses", fake)
 
-    payload = _call({"device_id": "dev_001_011"}, _loaded_session())
+    payload = _call({"device_id": _GOODIX_READER}, _loaded_session())
 
-    assert seen == [("dev_001_011",)]
-    assert [entry["device_id"] for entry in payload["hypotheses"]] == ["dev_001_011"]
+    assert seen == [_GOODIX_READER]
+    assert [entry["device_id"] for entry in payload["hypotheses"]] == [_GOODIX_READER]
     assert payload["hypotheses"][0]["analysis_notes"] == ["only this device"]
     # the engine's full result shape survives serialization, not just the id
     assert payload["hypotheses"][0]["result_limits"]["max_command_patterns"] == 20

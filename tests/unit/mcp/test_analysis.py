@@ -1,9 +1,8 @@
 """Tests for the analyze_protocol MCP tool.
 
-Hypothesis assembly (#66) has not landed, so these cover the layer this tool owns:
-registration, precondition checks, device resolution, and passing the engine's
-output through. The engine seam is monkeypatched, mirroring how test_server.py
-fakes live host enumeration.
+The happy paths run the real engine against the Goodix capture and pin values only
+a real decode produces, so a stub could not satisfy them. The engine seam is
+monkeypatched only where the assertion is about what the tool passes down.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ from typing import Any, cast
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
-from bsu_tool.analysis.models import ProtocolHypothesis, ResultLimits
+from bsu_tool.analysis.description import ProtocolDescription
 from bsu_tool.mcp.server import build_server
 from bsu_tool.mcp.tools import analysis
 from bsu_tool.session import Capture, Session
@@ -28,30 +27,8 @@ _GOODIX = (
 )
 # The reader identifies itself by vid:pid; the other device sends no descriptors,
 # so it keeps an address-derived id.
-_GOODIX_DEVICE_IDS = ("dev_001_001", "27c6_63ac")
+_GOODIX_DEVICE_IDS = ("27c6_63ac", "dev_001_001")
 _GOODIX_READER = "27c6_63ac"
-
-
-def _hypothesis(device_id: str, *, note: str = "synthetic") -> ProtocolHypothesis:
-    """Build an empty hypothesis for one device, standing in for engine output."""
-    return ProtocolHypothesis(
-        device_id=device_id,
-        command_patterns=(),
-        observations=(),
-        unsolicited_responses=(),
-        unanswered_commands=(),
-        incomplete_transfers=(),
-        marker_correlations=(),
-        result_limits=ResultLimits(
-            max_command_patterns=20,
-            max_observations=10,
-            max_variable_values_reported=32,
-            command_patterns_truncated=False,
-            observations_truncated=False,
-            truncation_note=None,
-        ),
-        analysis_notes=(note,),
-    )
 
 
 def _call(tool_arguments: dict[str, Any], session: Session) -> dict[str, Any]:
@@ -90,62 +67,61 @@ def test_analyze_protocol_without_capture_reports_error() -> None:
 def test_analyze_protocol_rejects_unknown_device_id(monkeypatch: pytest.MonkeyPatch) -> None:
     """A mistyped device_id is reported with the known ids, not silently analyzed as empty."""
 
-    def fake(capture: Capture, device_id: str | None) -> tuple[ProtocolHypothesis, ...]:
+    def fake(session: Session, capture: Capture, device_id: str | None) -> tuple[ProtocolDescription, ...]:
         raise AssertionError("the engine must not run for an unknown device_id")
 
-    monkeypatch.setattr(analysis, "_generate_hypotheses", fake)
+    monkeypatch.setattr(analysis, "_describe", fake)
 
     with pytest.raises(ToolError, match="unknown device_id 'dev_009_009'"):
         asyncio.run(build_server(session=_loaded_session()).call_tool("analyze_protocol", {"device_id": "dev_009_009"}))
 
 
-def test_analyze_protocol_analyzes_every_device_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Omitting device_id asks the engine for every device, mirroring get_packets.
+def test_analyze_protocol_passes_device_id_to_the_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tool forwards device_id untouched — None for all devices, the id for one.
 
-    The engine, not this wrapper, decides which devices come back, so the tool
-    passes None straight through and returns whatever it produces.
+    The engine selects and reports devices itself, so the tool must not expand
+    None into a device list of its own.
     """
     seen: list[str | None] = []
 
-    def fake(capture: Capture, device_id: str | None) -> tuple[ProtocolHypothesis, ...]:
-        assert capture.metadata.packet_count == 253  # the real loaded capture reaches the engine
+    def fake(session: Session, capture: Capture, device_id: str | None) -> tuple[ProtocolDescription, ...]:
+        del session, capture
         seen.append(device_id)
-        return tuple(_hypothesis(known) for known in _GOODIX_DEVICE_IDS)
+        return ()
 
-    monkeypatch.setattr(analysis, "_generate_hypotheses", fake)
+    monkeypatch.setattr(analysis, "_describe", fake)
 
+    _call({}, _loaded_session())
+    _call({"device_id": _GOODIX_READER}, _loaded_session())
+
+    assert seen == [None, _GOODIX_READER]
+
+
+def test_analyze_protocol_describes_every_device_by_default() -> None:
+    """Omitting device_id runs the real engine over the whole capture."""
     payload = _call({}, _loaded_session())
 
-    assert seen == [None]
-    assert [entry["device_id"] for entry in payload["hypotheses"]] == list(_GOODIX_DEVICE_IDS)
+    described = {entry["device_id"] for entry in payload["descriptions"]}
+    assert described == set(_GOODIX_DEVICE_IDS)
 
 
-def test_analyze_protocol_filters_to_one_device(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A known device_id narrows the analysis to that device alone."""
-    seen: list[str | None] = []
+def test_analyze_protocol_returns_context_summary_and_findings() -> None:
+    """One device_id yields the three things spec 5.12 wants held together.
 
-    def fake(capture: Capture, device_id: str | None) -> tuple[ProtocolHypothesis, ...]:
-        del capture
-        seen.append(device_id)
-        assert device_id is not None
-        return (_hypothesis(device_id, note="only this device"),)
-
-    monkeypatch.setattr(analysis, "_generate_hypotheses", fake)
-
+    Device context, the deterministic summary, and the findings all come back for
+    the Goodix reader, pinned to values only a real decode of this capture yields.
+    """
     payload = _call({"device_id": _GOODIX_READER}, _loaded_session())
 
-    assert seen == [_GOODIX_READER]
-    assert [entry["device_id"] for entry in payload["hypotheses"]] == [_GOODIX_READER]
-    assert payload["hypotheses"][0]["analysis_notes"] == ["only this device"]
-    # the engine's full result shape survives serialization, not just the id
-    assert payload["hypotheses"][0]["result_limits"]["max_command_patterns"] == 20
-
-
-def test_analyze_protocol_reports_assembly_not_available() -> None:
-    """Until assembly lands the tool says so plainly instead of returning empty findings.
-
-    An empty result would read as "this capture has no protocol"; the error names the
-    issues that deliver the missing step.
-    """
-    with pytest.raises(ToolError, match="no protocol hypothesis assembly is available yet"):
-        asyncio.run(build_server(session=_loaded_session()).call_tool("analyze_protocol", {}))
+    (description,) = payload["descriptions"]
+    assert description["device_id"] == _GOODIX_READER
+    # device context, required by spec 1.3 rather than optional enrichment
+    assert description["device_summary"]["vendor_id"] == "0x27c6"
+    assert description["device_summary"]["product_id"] == "0x63ac"
+    assert "Goodix" in description["headline"]
+    # the engine's deterministic summary, not prose written by this tool
+    assert description["deterministic_summary"].startswith(f"Device {_GOODIX_READER} has 5 repeated command pattern")
+    # findings, with the evidence backing them
+    assert len(description["commands"]) == 5
+    assert description["endpoint_roles"]
+    assert description["commands"][0]["evidence"]["first_packet_index"] >= 0

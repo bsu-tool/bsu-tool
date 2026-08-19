@@ -151,19 +151,35 @@ def test_description_groups_commands_by_marker_range() -> None:
     assert "near enroll-start..enroll-end" in description.deterministic_summary
 
 
-def test_hypothesis_does_not_attach_device_timing_to_patterns() -> None:
-    """Device-wide pairing timing is not copied onto individual command patterns."""
+def test_pattern_timing_comes_from_its_own_occurrences() -> None:
+    """A pattern is timed by the pairs inside it, not by the device-wide figure.
+
+    Two exchanges of one repeated pattern answer in 10 ms; a third, unrelated
+    exchange answers in 500 ms and pulls the device-wide mean far above either.
+    The pattern must report its own latency, which is the whole reason this is
+    computed per pattern instead of copied down from the pairing result.
+    """
     capture = _capture(
         _out(1, b"\x10\x00", 1.0),
-        _in(2, b"\x10\xaa", 1.1),
-        _out(3, b"\x10\x01", 2.0),
-        _in(4, b"\x10\xab", 2.1),
+        _in(2, b"\x10\xaa", 1.01),
+        _out(3, b"\x10\x00", 2.0),
+        _in(4, b"\x10\xaa", 2.01),
+        _out(5, b"\x99\x00", 3.0),
+        _in(6, b"\x99\xaa", 3.5),
     )
 
     hypothesis = assemble_protocol_hypotheses(capture)[0]
 
-    assert any({step.direction for step in pattern.steps} == {"in", "out"} for pattern in hypothesis.command_patterns)
-    assert all(pattern.response_timing is None for pattern in hypothesis.command_patterns)
+    timed = [
+        pattern
+        for pattern in hypothesis.command_patterns
+        if {step.direction for step in pattern.steps} == {"in", "out"} and pattern.response_timing is not None
+    ]
+    assert timed, "an OUT/IN pattern with pairs inside its occurrences must carry timing"
+    for pattern in timed:
+        assert pattern.response_timing is not None
+        # ~10 ms, not the ~173 ms mean the slow third exchange produces device-wide.
+        assert pattern.response_timing.median_ms < 100.0
 
 
 def test_multi_step_single_occurrences_become_observations() -> None:

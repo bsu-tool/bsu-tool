@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -25,7 +26,7 @@ from bsu_tool.analysis.models import (
     UnsolicitedResponse,
     VariableByteRange,
 )
-from bsu_tool.analysis.pairing import PairingResult, pair_command_responses
+from bsu_tool.analysis.pairing import CommandResponsePair, PairingResult, pair_command_responses, timing_stats
 from bsu_tool.analyzer import (
     MAX_COMMAND_PATTERNS_RETURNED,
     MAX_SEQUENCE_WINDOW,
@@ -319,6 +320,8 @@ def assemble_protocol_hypotheses(
     for sequence_result in sequence_results:
         pairing = pairing_by_device.get(sequence_result.device_id)
         marker_correlations, patterns = _correlate_markers(sequence_result.patterns, markers)
+        if pairing is not None:
+            patterns = _attach_response_timing(patterns, pairing)
         observations, observations_truncated = _single_occurrence_observations(
             capture,
             sequence_result.device_id,
@@ -731,6 +734,48 @@ def _evidence_notes(hypothesis: ProtocolHypothesis) -> tuple[str, ...]:
             f"timestamps {evidence.first_timestamp:.6f}-{evidence.last_timestamp:.6f}"
         )
     return tuple(notes)
+
+
+def _attach_response_timing(
+    patterns: tuple[CommandPattern, ...],
+    pairing: PairingResult,
+) -> tuple[CommandPattern, ...]:
+    """Give each pattern the response timing of the pairs inside its own occurrences.
+
+    The detector builds patterns without timing (it does not pair) and the pairing
+    pass produces pairs without pattern membership (it does not detect sequences).
+    Neither can fill ``CommandPattern.response_timing`` alone, so it is joined here,
+    where both results are already in hand — the same place marker correlation is
+    attached, and for the same reason.
+
+    A pair belongs to an occurrence when its command falls inside that occurrence's
+    timestamp span. Timestamps rather than packet indexes because pairing locates
+    events by timestamp and its events carry no index; the spans come from the same
+    capture, so the two agree. Occurrences of one pattern can overlap, so matches are
+    de-duplicated before aggregating — counting a pair twice would weight it twice in
+    the median.
+
+    A pattern with no pairs inside it keeps ``None`` and is reported as having no
+    isolated timing, which is the honest answer: the device-wide figure is not this
+    pattern's.
+    """
+    if not pairing.pairs:
+        return patterns
+
+    ordered = sorted(pairing.pairs, key=lambda pair: pair.command.timestamp)
+    command_times = [pair.command.timestamp for pair in ordered]
+
+    updated: list[CommandPattern] = []
+    for pattern in patterns:
+        positions: set[int] = set()
+        for occurrence in pattern.occurrences:
+            first = bisect_left(command_times, occurrence.start_timestamp)
+            past_last = bisect_right(command_times, occurrence.end_timestamp)
+            positions.update(range(first, past_last))
+        matched: list[CommandResponsePair] = [ordered[position] for position in sorted(positions)]
+        timing = timing_stats(matched)
+        updated.append(pattern if timing is None else replace(pattern, response_timing=timing))
+    return tuple(updated)
 
 
 def _correlate_markers(

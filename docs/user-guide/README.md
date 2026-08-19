@@ -13,6 +13,10 @@ together. The analysis tools return structured evidence and short deterministic
 summaries; the analyst and assistant should use those as evidence when drafting
 human-readable protocol notes.
 
+## Contents
+
+- [Known Limitations And Responsible Use](../known-limitations-and-responsible-use.md)
+
 ## Setup
 
 From a fresh clone:

@@ -15,7 +15,6 @@ class StartCaptureResult:
     """Confirmation that a live capture is running."""
 
     bus: int
-    device: int | None
     output_path: str
 
 
@@ -25,8 +24,7 @@ class StopCaptureResult:
 
     output_path: str
     output_bytes: int
-    events_seen: int
-    events_matched: int
+    events_captured: int
     elapsed_seconds: float
     packet_count: int
     device_ids: tuple[str, ...]
@@ -39,17 +37,19 @@ def register(mcp: FastMCP, session: Session) -> None:
     def start_capture(  # pyright: ignore[reportUnusedFunction]
         bus: int,
         output_path: str,
-        device: int | None = None,
     ) -> StartCaptureResult:
         """Start a live usbmon capture and return once it is verifiably running.
 
         After this returns, instruct the analyst to operate the device, then
         call stop_capture to end the capture and load the result for analysis.
 
-        - bus: usbmon bus number (the N in /dev/usbmonN).
-        - device: USB device number on that bus, or omit for bus-only capture.
-          Bus-only is the right default when the capture should include
-          enumeration, since device addresses shift while a device enumerates.
+        Capture is bus-wide — every device on the bus is recorded. There is no
+        device filter, because a device's address changes as it enumerates and
+        on every replug, so no single address covers one physical device for a
+        whole capture. Select the device after loading, via the device_id
+        filters on get_packets and packets_between_markers.
+
+        - bus: usbmon bus number (the N in /dev/usbmonN). 0 captures every bus.
         - output_path: destination pcap-ng file; must end with .pcapng and not
           already exist.
 
@@ -74,7 +74,7 @@ def register(mcp: FastMCP, session: Session) -> None:
         capture_started = False
         retry_stop = False
         try:
-            controller.start(bus=bus, device=device, output_path=destination)
+            controller.start(bus=bus, output_path=destination)
             if not controller.is_running:
                 raise CaptureStateError("capture controller returned before the capture was live")
             if not session.mark_live_capture_running(live_capture):
@@ -107,7 +107,7 @@ def register(mcp: FastMCP, session: Session) -> None:
                     session.mark_live_capture_running(live_capture)
                 else:
                     session.release_live_capture(live_capture)
-        return StartCaptureResult(bus=bus, device=device, output_path=str(destination))
+        return StartCaptureResult(bus=bus, output_path=str(destination))
 
     @mcp.tool()
     def stop_capture() -> StopCaptureResult:  # pyright: ignore[reportUnusedFunction]
@@ -140,8 +140,7 @@ def register(mcp: FastMCP, session: Session) -> None:
             return StopCaptureResult(
                 output_path=str(output_path),
                 output_bytes=stats.output_bytes,
-                events_seen=stats.seen,
-                events_matched=stats.matched,
+                events_captured=stats.seen,
                 elapsed_seconds=stats.elapsed_seconds,
                 packet_count=capture.metadata.packet_count,
                 device_ids=tuple(device.device_id for device in session.list_devices()),

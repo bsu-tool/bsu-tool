@@ -19,6 +19,15 @@ usbmon mapping
 that captures traffic on *every* bus. Each :class:`LiveUsbDevice` carries the
 derived ``usbmon_path`` for its bus, and :data:`USBMON_ALL_BUSES_PATH` names the
 capture-everything device.
+
+Identity note
+-------------
+Live rows are keyed by *address* (``dev_bbb_ddd``), not by vid:pid. At one
+instant several attached devices can share a vid:pid — a host with multiple USB
+controllers reports one root hub per controller, all ``1d6b:0002`` — so an
+identity key would collide here. A capture has the opposite problem (one device,
+several addresses over time) and keys on vid:pid instead. Use
+:func:`identity_capture_id` to cross the two.
 """
 
 from __future__ import annotations
@@ -26,6 +35,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
+
+from bsu_tool.device_identity import address_device_id, identity_device_id
 
 DEFAULT_SYSFS_ROOT: Final[Path] = Path("/sys/bus/usb/devices")
 """Canonical Linux sysfs location that lists attached USB devices."""
@@ -50,19 +61,64 @@ class UsbEnumerationError(RuntimeError):
 class LiveUsbDevice:
     """A USB device currently attached to the host.
 
-    The ``bus`` and ``device`` fields mirror what ``lsusb`` prints ("Bus 003
-    Device 007"); ``vendor_id`` and ``product_id`` are ``0x``-prefixed 4-digit
-    hex strings matching the capture-side :class:`~bsu_tool.mcp.interfaces.DeviceSummary`
-    convention. ``usbmon_path`` is the ``/dev/usbmonN`` character device that
-    captures this device's bus.
+    The ``bus_num`` and ``dev_num`` fields mirror what ``lsusb`` prints ("Bus 003
+    Device 007") and match the capture-side
+    :class:`~bsu_tool.mcp.interfaces.DeviceSummary` field names.
+
+    ``device_id`` is the ``dev_bbb_ddd`` **address** identifier (e.g.
+    ``dev_001_004`` for bus 1 device 4). It is stable for as long as the device
+    stays attached — which is what makes snapshot diffing work — but **not**
+    across a replug, because the kernel reassigns the address. Deliberately not
+    the capture side's vid:pid id: several attached devices can share one
+    vid:pid (root hubs routinely do), so an identity id would collide within a
+    single snapshot. Use :func:`identity_device_id` to correlate a live device
+    to one seen in a capture.
+
+    ``vendor_id`` and ``product_id`` are ``0x``-prefixed 4-digit hex strings
+    matching the capture-side convention. ``usbmon_path`` is the
+    ``/dev/usbmonN`` character device that captures this device's bus.
     """
 
-    bus: int
-    device: int
+    device_id: str
+    bus_num: int
+    dev_num: int
     vendor_id: str
     product_id: str
     description: str | None
     usbmon_path: str
+
+
+def device_id_for(bus_num: int, dev_num: int) -> str:
+    """Return the ``dev_bbb_ddd`` address id for a bus/device address.
+
+    Shares its format with the capture side's fallback id (see
+    :func:`bsu_tool.device_identity.address_device_id`). Stable while the device
+    remains attached, so two snapshots of one host agree on it — that is what
+    :func:`bsu_tool.detect_device.diff_snapshots` relies on. It is *not* stable
+    across a replug: the kernel assigns a new address, and the same physical
+    device then reports a different id.
+
+    Each field is zero-padded to three digits; wider addresses are not truncated
+    and simply widen the field.
+    """
+    return address_device_id(bus_num, dev_num)
+
+
+def identity_capture_id(device: LiveUsbDevice) -> str:
+    """Return the capture-side ``vid_pid`` id for a live-enumerated device.
+
+    Bridges live enumeration to a loaded capture, which keys devices on vid:pid
+    rather than address. Note this id is not unique among attached devices: two
+    units of the same model, or several root hubs, map to one id.
+
+    Args:
+        device: A device from :func:`enumerate_usb_devices`.
+
+    Returns:
+        The ``vid_pid`` id a capture would report for this device, e.g.
+        ``27c6_63ac``.
+    """
+    return identity_device_id(int(device.vendor_id, 16), int(device.product_id, 16))
 
 
 def usbmon_path_for_bus(bus: int) -> str:
@@ -82,7 +138,7 @@ def enumerate_usb_devices(sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> tuple[LiveUs
     ``idProduct`` and optional ``manufacturer``/``product`` files. Interface
     directories (names containing ``":"``, e.g. ``1-1:1.0``) and any directory
     missing the required numeric files are skipped. The result is sorted by
-    ``(bus, device)`` for stable output.
+    ``(bus_num, dev_num)`` for stable output.
 
     Args:
         sysfs_root: Root directory of the sysfs USB device tree. Defaults to the
@@ -90,8 +146,8 @@ def enumerate_usb_devices(sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> tuple[LiveUs
             run on any platform without real hardware.
 
     Returns:
-        A tuple of :class:`LiveUsbDevice`, one per attached device, sorted by bus
-        then device address. Each row carries its derived ``usbmon_path``.
+        A tuple of :class:`LiveUsbDevice`, one per attached device, sorted by
+        ``bus_num`` then ``dev_num``. Each row carries its derived ``usbmon_path``.
 
     Raises:
         UsbEnumerationError: ``sysfs_root`` does not exist — typically a non-Linux
@@ -110,25 +166,26 @@ def enumerate_usb_devices(sysfs_root: Path = DEFAULT_SYSFS_ROOT) -> tuple[LiveUs
         if device is not None:
             devices.append(device)
 
-    devices.sort(key=lambda device: (device.bus, device.device))
+    devices.sort(key=lambda device: (device.bus_num, device.dev_num))
     return tuple(devices)
 
 
 def _read_device(entry: Path) -> LiveUsbDevice | None:
     """Build a LiveUsbDevice from a sysfs device dir, or None if unparseable."""
-    bus = _read_int(entry / "busnum")
-    device = _read_int(entry / "devnum")
+    bus_num = _read_int(entry / "busnum")
+    dev_num = _read_int(entry / "devnum")
     vendor_id = _read_usb_id(entry / "idVendor")
     product_id = _read_usb_id(entry / "idProduct")
-    if bus is None or device is None or vendor_id is None or product_id is None:
+    if bus_num is None or dev_num is None or vendor_id is None or product_id is None:
         return None
     return LiveUsbDevice(
-        bus=bus,
-        device=device,
+        device_id=device_id_for(bus_num, dev_num),
+        bus_num=bus_num,
+        dev_num=dev_num,
         vendor_id=vendor_id,
         product_id=product_id,
         description=_describe(_read_text(entry / "manufacturer"), _read_text(entry / "product")),
-        usbmon_path=usbmon_path_for_bus(bus),
+        usbmon_path=usbmon_path_for_bus(bus_num),
     )
 
 

@@ -2,7 +2,15 @@
 
 Wires :class:`~bsu_tool.usbmon_source.UsbmonSource` (raw events from one
 ``/dev/usbmonN``) to :class:`~bsu_tool.pcapng_writer.PcapNgWriter`
-(Enhanced Packet Blocks), filtering by device number and tracking stats.
+(Enhanced Packet Blocks), tracking stats as it goes.
+
+Capture is always *bus-wide*: every non-filler event on the bus is written.
+There is deliberately no device filter. A device's address changes while it
+enumerates (it answers at address 0 before ``SET_ADDRESS`` assigns its real
+one) and again on every replug, so no single address selects one physical
+device for a whole capture — the descriptors that identify it arrive at one
+address and its traffic at another. Selecting a device is an analysis-time
+concern, where :mod:`bsu_tool.session` keys on vid:pid and can span both.
 
 :func:`capture` takes everything by argument — no globals, signals, or
 printing — and blocks until its stop event is set. That fits a CLI bound
@@ -25,14 +33,6 @@ from bsu_tool.urb_decoder import LINKTYPE_USB_LINUX_MMAPPED
 from bsu_tool.usbmon_source import UsbmonSource
 
 # ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-#: Offset of the device-number byte in the 64-byte usbmon header
-#: (layout documented in urb_decoder.py).
-_DEVNUM_OFFSET: int = 11
-
-# ---------------------------------------------------------------------------
 # Stats
 # ---------------------------------------------------------------------------
 
@@ -46,9 +46,8 @@ class CaptureStats:
     so it sees live values, not snapshots (copy manually to compare two
     points in time).
 
-    * ``seen`` — non-filler events from the kernel, including devices the
-      user did not ask for.
-    * ``matched`` — events that passed the device filter and were written.
+    * ``seen`` — non-filler events read from the kernel. Capture is bus-wide,
+      so every one of them is written; there is no separate "matched" count.
     * ``elapsed_seconds`` — wall-clock since start; updated each tick.
     * ``output_path`` / ``output_bytes`` — the file and its size.
       ``output_bytes`` is the writer's running total (approximate mid-
@@ -57,7 +56,6 @@ class CaptureStats:
 
     output_path: Path
     seen: int = 0
-    matched: int = 0
     elapsed_seconds: float = 0.0
     output_bytes: int = 0
 
@@ -80,30 +78,23 @@ _PROGRESS_INTERVAL_SECONDS: float = 0.2
 
 def capture(
     bus: int,
-    device: int | None,
     output_path: Path,
     *,
     stop_event: Event,
     ready_event: Event | None = None,
     on_progress: ProgressCallback | None = None,
 ) -> CaptureStats:
-    """Capture USB traffic from one bus (optionally one device) to a pcap-ng file.
+    """Capture every USB event on one bus to a pcap-ng file.
 
-    Reads events from ``/dev/usbmon{bus}``, keeps those matching ``device``
-    (or all of them in bus-only mode), and writes them to ``output_path``
-    as Enhanced Packet Blocks. Runs until ``stop_event`` is set.
+    Reads events from ``/dev/usbmon{bus}`` and writes each non-filler event to
+    ``output_path`` as an Enhanced Packet Block. Runs until ``stop_event`` is
+    set. There is no device filter — see the module docstring for why.
 
     Parameters
     ----------
     bus:
-        usbmon bus number (the N in ``/dev/usbmonN``).
-    device:
-        USB device number on that bus (as shown by ``lsusb``), or ``None``
-        for *bus-only* capture (write every non-filler event regardless of
-        address). Use bus-only when the address is unknown or will change —
-        enumeration, replug/reset, or a switch into a bootloader. ``0`` is
-        a real address (the enumeration default), *not* a wildcard; only
-        ``None`` means "all devices". In bus-only mode ``matched == seen``.
+        usbmon bus number (the N in ``/dev/usbmonN``). ``0`` is the catch-all
+        node that captures every bus at once.
     output_path:
         Destination file, opened with ``"xb"`` — the open fails if it
         already exists. Resolved against the cwd at open time.
@@ -167,17 +158,6 @@ def capture(
                 for header, data in source:
                     stats.seen += 1
 
-                    if device is not None and header[_DEVNUM_OFFSET] != device:
-                        # Another device on the bus. Still tick progress so a wrong
-                        # --device shows climbing "seen" against stuck "matched".
-                        now = time.monotonic()
-                        if on_progress is not None and now - last_progress_time >= _PROGRESS_INTERVAL_SECONDS:
-                            stats.elapsed_seconds = now - start_time
-                            stats.output_bytes = out_fp.tell()
-                            on_progress(stats)
-                            last_progress_time = now
-                        continue
-
                     # Derive the EPB timestamp from the usbmon header rather than
                     # time.time(), so a reader sees consistent values whether it
                     # reads the EPB header or the URB header.
@@ -191,7 +171,6 @@ def capture(
                         timestamp_us=timestamp_us,
                         packet_data=packet_data,
                     )
-                    stats.matched += 1
 
                     now = time.monotonic()
                     if on_progress is not None and now - last_progress_time >= _PROGRESS_INTERVAL_SECONDS:
@@ -258,7 +237,7 @@ class CaptureController:
     A single controller manages one capture. Typical use::
 
         controller = CaptureController()
-        controller.start(bus=3, device=5, output_path=Path("out.pcapng"))
+        controller.start(bus=3, output_path=Path("out.pcapng"))
         # ... tell the user to operate the device, wait for them to finish ...
         stats = controller.stop()
 
@@ -299,7 +278,6 @@ class CaptureController:
     def start(
         self,
         bus: int,
-        device: int | None,
         output_path: Path,
         *,
         on_progress: ProgressCallback | None = None,
@@ -316,9 +294,6 @@ class CaptureController:
         ----------
         bus:
             usbmon bus number (the N in ``/dev/usbmonN``).
-        device:
-            USB device number on that bus (as shown by ``lsusb``), or ``None``
-            for bus-only capture. See :func:`capture`.
         output_path:
             Destination pcap-ng file. Must not already exist.
         on_progress:
@@ -347,7 +322,6 @@ class CaptureController:
             try:
                 self._stats = capture(
                     bus=bus,
-                    device=device,
                     output_path=output_path,
                     stop_event=self._stop,
                     ready_event=self._ready,

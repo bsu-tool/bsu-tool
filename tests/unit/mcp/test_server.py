@@ -79,16 +79,18 @@ def test_enumerate_usb_devices_tool_wires_result(monkeypatch: pytest.MonkeyPatch
     """The enumerate_usb_devices tool passes host devices through with count and all-buses path."""
     fake_devices = (
         LiveUsbDevice(
-            bus=1,
-            device=2,
+            device_id="dev_001_002",
+            bus_num=1,
+            dev_num=2,
             vendor_id="0x0781",
             product_id="0x5567",
             description="SanDisk Cruzer",
             usbmon_path="/dev/usbmon1",
         ),
         LiveUsbDevice(
-            bus=3,
-            device=7,
+            device_id="dev_003_007",
+            bus_num=3,
+            dev_num=7,
             vendor_id="0x1d6b",
             product_id="0x0002",
             description=None,
@@ -105,7 +107,8 @@ def test_enumerate_usb_devices_tool_wires_result(monkeypatch: pytest.MonkeyPatch
 
     assert payload["count"] == len(fake_devices)
     assert payload["usbmon_all_buses_path"] == "/dev/usbmon0"
-    assert [(d["bus"], d["device"]) for d in payload["devices"]] == [(1, 2), (3, 7)]
+    assert [(d["bus_num"], d["dev_num"]) for d in payload["devices"]] == [(1, 2), (3, 7)]
+    assert [d["device_id"] for d in payload["devices"]] == ["dev_001_002", "dev_003_007"]
     assert payload["devices"][0]["vendor_id"] == "0x0781"
     assert payload["devices"][0]["product_id"] == "0x5567"
     assert payload["devices"][0]["description"] == "SanDisk Cruzer"

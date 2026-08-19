@@ -23,7 +23,9 @@ htmlcov/
 .DS_Store
 
 # Claude config
-.claude/
+.claude/*
+!.claude/skills/
+!.claude/skills/**
 
 # MCP config — generated per-OS by setup.sh (command path differs by platform)
 .mcp.json

@@ -9,8 +9,11 @@ import pytest
 
 from bsu_tool.usb_enum import (
     USBMON_ALL_BUSES_PATH,
+    LiveUsbDevice,
     UsbEnumerationError,
+    device_id_for,
     enumerate_usb_devices,
+    identity_capture_id,
     usbmon_path_for_bus,
 )
 
@@ -58,8 +61,9 @@ def test_enumerate_reads_bus_address_and_ids(tmp_path: Path) -> None:
 
     (device,) = enumerate_usb_devices(sysfs_root=tmp_path)
 
-    assert device.bus == 3
-    assert device.device == 7
+    assert device.bus_num == 3
+    assert device.dev_num == 7
+    assert device.device_id == "dev_003_007"
     assert device.vendor_id == "0x1d6b"
     assert device.product_id == "0x0002"
     assert device.description == "Acme Relay Board"
@@ -73,7 +77,7 @@ def test_enumerate_sorts_by_bus_then_device(tmp_path: Path) -> None:
 
     devices = enumerate_usb_devices(sysfs_root=tmp_path)
 
-    assert [(d.bus, d.device) for d in devices] == [(1, 2), (3, 7)]
+    assert [(d.bus_num, d.dev_num) for d in devices] == [(1, 2), (3, 7)]
 
 
 def test_enumerate_skips_non_directory_entries(tmp_path: Path) -> None:
@@ -83,7 +87,7 @@ def test_enumerate_skips_non_directory_entries(tmp_path: Path) -> None:
 
     devices = enumerate_usb_devices(sysfs_root=tmp_path)
 
-    assert [(d.bus, d.device) for d in devices] == [(1, 2)]
+    assert [(d.bus_num, d.dev_num) for d in devices] == [(1, 2)]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="':' is not a legal filename on Windows")
@@ -95,7 +99,7 @@ def test_enumerate_skips_interface_dirs(tmp_path: Path) -> None:
 
     devices = enumerate_usb_devices(sysfs_root=tmp_path)
 
-    assert [(d.bus, d.device) for d in devices] == [(1, 2)]
+    assert [(d.bus_num, d.dev_num) for d in devices] == [(1, 2)]
 
 
 def test_enumerate_handles_missing_optional_strings(tmp_path: Path) -> None:
@@ -103,7 +107,7 @@ def test_enumerate_handles_missing_optional_strings(tmp_path: Path) -> None:
     _write_device(tmp_path, "2-1", busnum="2", devnum="3", id_vendor="abcd", id_product="ef01")
     _write_device(tmp_path, "2-2", busnum="2", devnum="4", id_vendor="abcd", id_product="ef02", product="Sensor")
 
-    by_addr = {d.device: d for d in enumerate_usb_devices(sysfs_root=tmp_path)}
+    by_addr = {d.dev_num: d for d in enumerate_usb_devices(sysfs_root=tmp_path)}
 
     assert by_addr[3].description is None
     assert by_addr[4].description == "Sensor"
@@ -116,7 +120,7 @@ def test_enumerate_skips_dirs_missing_required_files(tmp_path: Path) -> None:
 
     devices = enumerate_usb_devices(sysfs_root=tmp_path)
 
-    assert [(d.bus, d.device) for d in devices] == [(1, 2)]
+    assert [(d.bus_num, d.dev_num) for d in devices] == [(1, 2)]
 
 
 def test_enumerate_skips_dir_with_non_integer_busnum(tmp_path: Path) -> None:
@@ -126,7 +130,7 @@ def test_enumerate_skips_dir_with_non_integer_busnum(tmp_path: Path) -> None:
 
     devices = enumerate_usb_devices(sysfs_root=tmp_path)
 
-    assert [(d.bus, d.device) for d in devices] == [(1, 2)]
+    assert [(d.bus_num, d.dev_num) for d in devices] == [(1, 2)]
     assert devices[0].vendor_id == "0x0781"
 
 
@@ -137,7 +141,7 @@ def test_enumerate_skips_dir_with_non_hex_vendor_id(tmp_path: Path) -> None:
 
     devices = enumerate_usb_devices(sysfs_root=tmp_path)
 
-    assert [(d.bus, d.device) for d in devices] == [(1, 2)]
+    assert [(d.bus_num, d.dev_num) for d in devices] == [(1, 2)]
     assert devices[0].vendor_id == "0x0781"
 
 
@@ -156,8 +160,8 @@ def test_enumerate_includes_fully_populated_root_hub(tmp_path: Path) -> None:
 
     (device,) = enumerate_usb_devices(sysfs_root=tmp_path)
 
-    assert device.bus == 1
-    assert device.device == 1
+    assert device.bus_num == 1
+    assert device.dev_num == 1
     assert device.vendor_id == "0x1d6b"
     assert device.product_id == "0x0002"
     assert device.description == "Linux Foundation 2.0 root hub"
@@ -170,7 +174,37 @@ def test_enumerate_missing_root_raises(tmp_path: Path) -> None:
         enumerate_usb_devices(sysfs_root=tmp_path / "does-not-exist")
 
 
+def test_device_id_matches_capture_side_format(tmp_path: Path) -> None:
+    """A live device's device_id is byte-identical to the capture-side id for the same address."""
+    _write_device(tmp_path, "1-4", busnum="1", devnum="4", id_vendor="1d6b", id_product="0002")
+
+    (device,) = enumerate_usb_devices(sysfs_root=tmp_path)
+
+    # dev_bbb_ddd, zero-padded to three digits — byte-identical to the capture-side
+    # id (session._device_id) so a live device correlates to one seen in a capture.
+    assert device.device_id == "dev_001_004"
+    assert device.device_id == device_id_for(device.bus_num, device.dev_num)
+
+
 def test_usbmon_path_helpers() -> None:
     """Bus N maps to /dev/usbmonN and the all-buses device is usbmon0."""
     assert usbmon_path_for_bus(3) == "/dev/usbmon3"
     assert USBMON_ALL_BUSES_PATH == "/dev/usbmon0"
+
+
+def test_identity_capture_id_bridges_a_live_device_to_its_capture_id() -> None:
+    """A live row converts to the vid:pid id a capture would report for it."""
+    device = LiveUsbDevice(
+        device_id="dev_001_011",
+        bus_num=1,
+        dev_num=11,
+        vendor_id="0x27c6",
+        product_id="0x63ac",
+        description="Goodix Fingerprint USB Device",
+        usbmon_path="/dev/usbmon1",
+    )
+
+    assert identity_capture_id(device) == "27c6_63ac"
+    # The live id stays address-based: several attached devices can share a
+    # vid:pid, so identity would collide within one snapshot.
+    assert device.device_id == "dev_001_011"

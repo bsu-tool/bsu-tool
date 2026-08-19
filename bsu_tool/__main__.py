@@ -14,6 +14,7 @@ from bsu_tool.pcapng_reader import (
     PcapNgReader,
 )
 from bsu_tool.session import CaptureSession, USBDevice, USBEndpoint
+from bsu_tool.usb_enum import DEFAULT_SYSFS_ROOT
 
 # ---------------------------------------------------------------------------
 # Link-layer type constants
@@ -207,23 +208,29 @@ def main(argv: list[str] | None = None) -> None:
 
     sniff_cmd = subparsers.add_parser(
         "sniff",
-        help="Capture USB traffic from one device to a pcap-ng file (Linux only)",
+        help="Capture all USB traffic on one bus to a pcap-ng file (Linux only)",
     )
     sniff_cmd.add_argument(
         "--bus",
         type=int,
         required=True,
-        help="usbmon bus number (the N in /dev/usbmonN), as shown by lsusb",
-    )
-    sniff_cmd.add_argument(
-        "--device",
-        type=int,
-        default=None,
-        help="USB device number on that bus, as shown by lsusb; omit to capture all devices on the bus (bus-only)",
+        help="usbmon bus number (the N in /dev/usbmonN), as shown by lsusb; 0 captures every bus",
     )
     sniff_cmd.add_argument(
         "output",
         help="Destination .pcapng file (must not already exist)",
+    )
+
+    detect_cmd = subparsers.add_parser(
+        "detect-device",
+        help="Detect a newly attached USB device by diffing before/after snapshots (Linux only)",
+    )
+
+    detect_cmd.add_argument(
+        "--sysfs-root",
+        type=Path,
+        default=None,
+        help=argparse.SUPPRESS,  # hidden: for testing only
     )
 
     args = parser.parse_args(argv)
@@ -244,7 +251,14 @@ def main(argv: list[str] | None = None) -> None:
         # machines, where fcntl is absent.
         from bsu_tool.sniff_command import run_sniff
 
-        run_sniff(args.bus, args.device, Path(args.output))
+        run_sniff(args.bus, Path(args.output))
+        return
+
+    if args.command == "detect-device":
+        from bsu_tool.detect_device import run_detect
+
+        sysfs_root = args.sysfs_root if args.sysfs_root is not None else DEFAULT_SYSFS_ROOT
+        sys.exit(run_detect(sysfs_root))
         return
 
     parser.print_help()

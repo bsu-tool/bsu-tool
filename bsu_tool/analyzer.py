@@ -24,7 +24,7 @@ each flagged for the spec follow-up:
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Final, Literal, Protocol
 
@@ -38,6 +38,7 @@ from bsu_tool.analysis.models import (
     VariableByteRange,
 )
 from bsu_tool.device_identity import DeviceIdMap, resolve_device_id
+from bsu_tool.urb_decoder import TransferType as RecordTransferType
 from bsu_tool.urb_decoder import UrbRecord, UrbTransaction
 
 
@@ -560,17 +561,53 @@ def normalize_tokens(
 # --- Stream scoping --------------------------------------------------------
 
 
-def _background_endpoints(events: tuple[AnalysisEvent, ...]) -> set[int]:
+class EndpointEventLike(Protocol):
+    """The three fields :func:`background_endpoints` reads from an analysis event.
+
+    Structural rather than concrete because this module and
+    :mod:`bsu_tool.analysis.pairing` still define separate ``AnalysisEvent``
+    types. Converging them is issue #127; until then a Protocol lets one rule
+    serve both rather than each growing its own copy.
+    """
+
+    @property
+    def endpoint_number(self) -> int:
+        """Bare endpoint number the event was seen on."""
+        ...
+
+    @property
+    def direction(self) -> Direction:
+        """``"in"`` or ``"out"``."""
+        ...
+
+    @property
+    def transfer_type(self) -> RecordTransferType:
+        """``"control"``, ``"bulk"`` or ``"interrupt"``.
+
+        The decoder's wider alias, not the engine's ``bulk|interrupt`` one, so an
+        event type carrying either satisfies this. Return types are covariant, so
+        the narrower engine events still match.
+        """
+        ...
+
+
+def background_endpoints(events: Sequence[EndpointEventLike]) -> set[int]:
     """Identify interrupt IN-only endpoints that look like background status polls.
 
     Interleaved polls otherwise land inside n-gram windows, inventing sequences
-    and breaking real repeats. The rule is narrow on purpose: every event on the
-    endpoint must be interrupt IN and the device must send OUT traffic elsewhere.
-    Pass ``suppress_background=False`` to disable.
+    and breaking real repeats. In pairing they are worse: they are simply the
+    nearest IN in timestamp order, so they take a pending OUT and the real answer
+    is filed as unsolicited, with counts identical to a correct pairing.
+
+    The rule is narrow on purpose: every event on the endpoint must be interrupt
+    IN and the device must send OUT traffic elsewhere. The interrupt clause is
+    load-bearing. Goodix answers on a bulk IN-only endpoint while sending OUT on
+    another, so relaxing it would classify that device's only responder as
+    background. Pass ``suppress_background=False`` to disable.
     """
     if not any(event.direction == "out" for event in events):
         return set()
-    by_endpoint: dict[int, list[AnalysisEvent]] = {}
+    by_endpoint: dict[int, list[EndpointEventLike]] = {}
     for event in events:
         by_endpoint.setdefault(event.endpoint_number, []).append(event)
     out_endpoints = {event.endpoint_number for event in events if event.direction == "out"}
@@ -694,7 +731,7 @@ def detect_repeated_sequences(
         notes = list(stream.excluded[device].notes()) if device in stream.excluded else []
 
         if suppress_background and scope == "device":
-            background = _background_endpoints(device_events)
+            background = background_endpoints(device_events)
             if background:
                 listed = ", ".join(f"ep{endpoint}" for endpoint in sorted(background))
                 notes.append(f"suppressed background interrupt IN endpoints from the analysis stream: {listed}")

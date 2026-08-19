@@ -29,7 +29,10 @@ def test_goodix_protocol_description_snapshot() -> None:
         "command_01 occurs 11 times; evidence packets 149-251. command_02 occurs 10 times; "
         "evidence packets 149-243. command_03 occurs 3 times; evidence packets 176-225. "
         "Contains OUT and IN steps; response timing was not isolated to this pattern. "
-        "3 unanswered command occurrences. 42 unsolicited response occurrences. "
+        # No unanswered commands since pairing moved to transfer-type lanes: every OUT
+        # on 0x01 now reaches its answer on 0x83. The 10 that remain unsolicited are the
+        # second payload-bearing IN of each exchange, which a one-to-one pass cannot claim.
+        "10 unsolicited response occurrences. "
         "1 incomplete transfer occurrence. 10 single-occurrence observations."
     )
 

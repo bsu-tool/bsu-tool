@@ -648,3 +648,213 @@ def test_capture_boundary_is_shared_across_devices() -> None:
     )
     by_id = {result.device_id: result for result in results}
     assert len(by_id["dev_001_005"].unanswered_commands) == 1
+
+
+def test_out_and_in_on_different_endpoint_numbers_pair() -> None:
+    """A command on one endpoint number pairs with its answer on another.
+
+    This is the arrangement both Goodix reference captures use: commands on
+    endpoint 1 OUT, answers on endpoint 3 IN. Keying lanes on endpoint number put
+    the two halves in separate lanes, so a device that answered every command it
+    was sent reported zero pairs and every command unanswered.
+    """
+    result = _run(
+        _out_transaction(1, _BASE_TIME, data=b"\xd0\x01", endpoint=1),
+        _in_transaction(2, _BASE_TIME + 0.002, data=b"\xaa\x01", endpoint=3),
+    )
+
+    (pair,) = result.pairs
+    assert pair.command.endpoint_address == "0x01"
+    assert pair.response.endpoint_address == "0x83"
+    assert result.unanswered_commands == ()
+    assert result.unsolicited_responses == ()
+    assert result.response_timing is not None
+
+
+def test_zero_length_in_does_not_consume_the_pending_command() -> None:
+    """A zero-length read cannot answer a command, so the real response still pairs.
+
+    The Goodix reader answers with a zero-length read before the payload. Letting
+    the empty one take the slot pairs the command with a USB artifact and times the
+    exchange to it, which is more misleading than reporting nothing at all.
+    """
+    result = _run(
+        _out_transaction(1, _BASE_TIME, data=b"\xd0\x01", endpoint=1),
+        _in_transaction(2, _BASE_TIME + 0.001, data=b"", endpoint=3),
+        _in_transaction(3, _BASE_TIME + 0.002, data=b"\xaa\x01", endpoint=3),
+    )
+
+    (pair,) = result.pairs
+    assert pair.response.data == b"\xaa\x01", "the payload-bearing IN must be the response"
+    assert result.unsolicited_responses == (), "the empty read is excluded, not filed as unsolicited"
+    assert any("zero-length" in note for note in result.analysis_notes), "exclusion must be reported, not silent"
+
+
+def test_interrupt_traffic_does_not_answer_a_bulk_command() -> None:
+    """Transfer type still separates lanes, so a status endpoint cannot mispair.
+
+    Scoping lanes to the whole device would let a background interrupt IN consume a
+    pending bulk OUT. Transfer type is the widest scope that admits the
+    cross-endpoint bulk case without reopening that one.
+    """
+    interrupt_in = UrbTransaction(
+        urb_id=2,
+        submission=None,
+        completion=_record(
+            urb_id=2,
+            event_type="completion",
+            direction="in",
+            timestamp=_BASE_TIME + 0.001,
+            transfer_type="interrupt",
+            endpoint=2,
+            data=b"\x04\x00",
+        ),
+    )
+    result = _run(
+        _out_transaction(1, _BASE_TIME, data=b"\xd0\x01", endpoint=1),
+        interrupt_in,
+    )
+
+    assert result.pairs == (), "an interrupt event must not answer a bulk command"
+
+
+def test_failed_in_with_no_payload_still_consumes_the_command() -> None:
+    """A failed IN suppresses the false unanswered even carrying no data.
+
+    An errored transfer usually returns no data at all, so a zero-payload filter
+    that looks only at the bytes drops exactly the events spec section 4.1 step 5
+    relies on. The trailing OUT holds the capture open past the timeout, without
+    which the boundary rule would suppress the result and hide the regression.
+    """
+    result = _run(
+        _out_transaction(1, _BASE_TIME),
+        _in_transaction(2, _BASE_TIME + 0.010, status=-71, data=b""),
+        _out_transaction(3, _BASE_TIME + 20.0, data=b"\x11\x22"),
+    )
+
+    assert result.pairs == ()
+    assert result.failed_event_count == 1
+    # The first OUT is explained by the failed IN. The trailing OUT is explained
+    # by the capture boundary. Neither is a real unanswered command.
+    assert result.unanswered_commands == ()
+
+
+def test_successful_zero_length_in_is_excluded_but_failed_one_is_not() -> None:
+    """The exclusion is scoped to successful events, and says so in the notes."""
+    result = _run(
+        _out_transaction(1, _BASE_TIME),
+        _in_transaction(2, _BASE_TIME + 0.001, data=b""),
+        _in_transaction(3, _BASE_TIME + 0.002, data=b"\xaa\x01"),
+        _out_transaction(4, _BASE_TIME + 20.0, data=b"\x11\x22"),
+    )
+
+    (pair,) = result.pairs
+    assert pair.response.data == b"\xaa\x01"
+    assert any("successful zero-length" in note for note in result.analysis_notes)
+
+
+def _interrupt_in(urb_id: int, at: float, *, endpoint: int, data: bytes) -> UrbTransaction:
+    """Build an interrupt IN transaction, the shape a status endpoint produces."""
+    return UrbTransaction(
+        urb_id=urb_id,
+        submission=_record(
+            urb_id=urb_id,
+            event_type="submission",
+            direction="in",
+            timestamp=at - 0.0005,
+            transfer_type="interrupt",
+            endpoint=endpoint,
+            status=-115,
+        ),
+        completion=_record(
+            urb_id=urb_id,
+            event_type="completion",
+            direction="in",
+            timestamp=at,
+            transfer_type="interrupt",
+            endpoint=endpoint,
+            data=data,
+        ),
+    )
+
+
+def _interrupt_out(urb_id: int, at: float, *, endpoint: int, data: bytes) -> UrbTransaction:
+    """Build an interrupt OUT transaction."""
+    return UrbTransaction(
+        urb_id=urb_id,
+        submission=_record(
+            urb_id=urb_id,
+            event_type="submission",
+            direction="out",
+            timestamp=at,
+            transfer_type="interrupt",
+            endpoint=endpoint,
+            data=data,
+            status=-115,
+        ),
+        completion=_record(
+            urb_id=urb_id,
+            event_type="completion",
+            direction="out",
+            timestamp=at + 0.0005,
+            transfer_type="interrupt",
+            endpoint=endpoint,
+        ),
+    )
+
+
+def test_background_status_endpoint_cannot_claim_a_command() -> None:
+    """A status endpoint firing mid-exchange must not take the pending command.
+
+    Widening the lane to the transfer type puts an unrelated interrupt IN in
+    reach of a pending OUT, and being the nearest IN in timestamp order it wins.
+    The counts alone cannot reveal the error: a mispairing and a correct pairing
+    both report one pair and one unsolicited response, so this asserts which
+    endpoint answered.
+    """
+    result = _run(
+        _interrupt_out(1, _BASE_TIME, endpoint=1, data=b"\xd0\x01"),
+        _interrupt_in(2, _BASE_TIME + 0.001, endpoint=2, data=b"\x99\x99"),
+        _interrupt_in(3, _BASE_TIME + 0.002, endpoint=1, data=b"\xd0\xaa"),
+        _interrupt_out(9, _BASE_TIME + 20.0, endpoint=1, data=b"\x11\x22"),
+    )
+
+    (pair,) = result.pairs
+    assert pair.response.endpoint_address == "0x81", "the real answer must win, not the status endpoint"
+    assert pair.response.data == b"\xd0\xaa"
+    # The status packet is still reported, just not as an answer.
+    assert [event.endpoint_address for event in result.unsolicited_responses] == ["0x82"]
+    assert any("background interrupt IN" in note for note in result.analysis_notes)
+
+
+def test_background_suppression_needs_out_traffic_elsewhere() -> None:
+    """An interrupt IN-only device has nothing to protect, so nothing is suppressed.
+
+    This is the hub shape. With no OUT anywhere the endpoint cannot steal a
+    command, and suppressing it would only hide real device-pushed traffic.
+    """
+    result = _run(
+        _interrupt_in(1, _BASE_TIME, endpoint=1, data=b"\x04\x00"),
+        _interrupt_in(2, _BASE_TIME + 1.0, endpoint=1, data=b"\x04\x00"),
+    )
+
+    assert result.pairs == ()
+    assert len(result.unsolicited_responses) == 2
+    assert not any("background interrupt IN" in note for note in result.analysis_notes)
+
+
+def test_bulk_in_only_responder_is_never_suppressed() -> None:
+    """The interrupt clause is load-bearing: Goodix answers on a bulk IN-only endpoint.
+
+    Relaxing the rule to any IN-only endpoint would classify `0x83` as background
+    on a device sending OUT on `0x01`, which is the reader's only responder, and
+    return pairing to zero pairs.
+    """
+    result = _run(
+        _out_transaction(1, _BASE_TIME, data=b"\xd0\x01", endpoint=1),
+        _in_transaction(2, _BASE_TIME + 0.002, data=b"\xaa\x01", endpoint=3),
+    )
+
+    (pair,) = result.pairs
+    assert pair.command.endpoint_address == "0x01"
+    assert pair.response.endpoint_address == "0x83"

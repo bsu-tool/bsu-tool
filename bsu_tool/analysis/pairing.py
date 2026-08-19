@@ -2,9 +2,17 @@
 
 Links an OUT analysis event from one :class:`~bsu_tool.urb_decoder.UrbTransaction`
 to a later IN analysis event from a separate transaction on the same device and
-endpoint number. Pairing starts from the transactions ``pair_urbs()`` already
+transfer type. Pairing starts from the transactions ``pair_urbs()`` already
 built. It never rebuilds submit/complete pairs with a FIFO queue, because USB
 allows multiple outstanding URBs and completions can arrive out of submit order.
+
+Lanes are keyed on transfer type rather than endpoint number, because a
+vendor-specific device routinely commands on one endpoint number and answers on
+another. Both Goodix reference captures send commands on ``0x01`` (endpoint
+number 1) and answers on ``0x83`` (endpoint number 3), so an endpoint-keyed lane
+put every command and its response in different lanes and produced zero pairs on
+both. See :func:`_result_for` for what transfer-type scoping does and does not
+protect against.
 
 A single transaction is never a pair. One transaction is one URB id lifecycle,
 while a command/response pair is a protocol level relationship between two
@@ -42,6 +50,7 @@ from dataclasses import dataclass, field
 from typing import Final
 
 from bsu_tool.analysis.models import IncompleteTransferReason, ResponseTimingStats
+from bsu_tool.analyzer import background_endpoints
 from bsu_tool.device_identity import DeviceIdMap, resolve_device_id
 from bsu_tool.urb_decoder import Direction, TransferType, UrbTransaction
 
@@ -83,10 +92,17 @@ class AnalysisEvent:
 
 @dataclass(frozen=True, slots=True)
 class CommandResponsePair:
-    """A likely command and its response on one endpoint lane."""
+    """A likely command and its response within one device's transfer-type lane.
+
+    The two halves may sit on different endpoint numbers — the common vendor
+    arrangement is a bulk OUT on one and a bulk IN on another — so read
+    ``command.endpoint_address`` and ``response.endpoint_address`` for where each
+    half actually appeared.
+    """
 
     device_id: str
     endpoint_number: int
+    """The command's endpoint number. The response may be on a different one."""
     command: AnalysisEvent
     response: AnalysisEvent
     response_time_ms: float
@@ -284,15 +300,48 @@ def _result_for(
     unanswered: list[UnpairedCommand] = []
     unsolicited: list[UnpairedResponse] = []
 
-    # Scope within a device is the endpoint number, per spec section 4.1.
-    # Transfer type is determined by (device, endpoint number, direction) in
-    # USB, so it is not part of the key. The device half of the scope is already
-    # settled: events reached here bucketed by their resolved device_id, which
-    # is what keeps a device that re-addresses mid-capture in one lane instead
-    # of one lane per address.
-    lanes: dict[int, list[AnalysisEvent]] = {}
-    for event in events:
-        lanes.setdefault(event.endpoint_number, []).append(event)
+    # A successful zero-length completion carries no protocol content, so it can
+    # neither be a command nor answer one. Left in the lane it consumes the
+    # pending OUT before the real response arrives: this device answers with a
+    # zero-length read, then the payload, so keeping them paired 92 of 95
+    # commands on the 1122-packet capture with an empty response and timed the
+    # exchange to a USB artifact. Excluded and counted rather than dropped
+    # silently.
+    #
+    # Failed events stay in regardless of payload. A failed transfer usually
+    # carries no data at all, and its job in the lane is to consume a slot so
+    # spec section 4.1 steps 4 and 5 can explain a missing counterpart. That job
+    # does not depend on carrying bytes, and filtering on payload alone would
+    # turn every errored IN back into a false unanswered command.
+    payload_events = [event for event in events if event.data or not event.successful]
+    empty_event_count = len(events) - len(payload_events)
+
+    # A background status endpoint must never claim a pending command. Widening
+    # the lane to the transfer type puts it in reach of one, and because it is
+    # simply the nearest IN in timestamp order it wins: the command pairs with a
+    # status packet and the real answer is filed as unsolicited, with counts
+    # identical to a correct pairing. The analyzer already identifies these
+    # endpoints for n-gram scoping, so the rule is shared rather than restated,
+    # and the two passes cannot drift apart on what "background" means.
+    #
+    # Suppressed events are still reported as unsolicited responses. They are
+    # genuinely device-pushed traffic, which is what spec section 6 says an IN
+    # with no preceding OUT is; only their ability to consume a command is removed.
+    suppressed = background_endpoints(events)
+
+    # Scope within a device is the transfer type, not the endpoint number. A
+    # vendor device routinely commands on one endpoint number and answers on
+    # another, which an endpoint-keyed lane can never pair (see module docstring).
+    # The device half of the scope is already settled: events reached here
+    # bucketed by their resolved device_id, which is what keeps a device that
+    # re-addresses mid-capture in one lane instead of one per address.
+    lanes: dict[TransferType, list[AnalysisEvent]] = {}
+    for event in payload_events:
+        if event.endpoint_number in suppressed:
+            if event.successful:
+                _record_unsolicited(event, unsolicited)
+            continue
+        lanes.setdefault(event.transfer_type, []).append(event)
 
     for lane_events in lanes.values():
         _pair_lane(lane_events, timeout_seconds, capture_end, pairs, unanswered, unsolicited)
@@ -307,6 +356,14 @@ def _result_for(
         )
     if accumulator.failed_count:
         notes.append(f"{accumulator.failed_count} failed bulk/interrupt events kept visible, not promoted into pairs")
+    if suppressed:
+        listed = ", ".join(f"ep{endpoint}" for endpoint in sorted(suppressed))
+        notes.append(f"background interrupt IN endpoints excluded from pairing and reported as unsolicited: {listed}")
+    if empty_event_count:
+        notes.append(
+            f"{empty_event_count} successful zero-length bulk/interrupt events excluded from pairing, "
+            "carrying no payload to match"
+        )
     if not events and not accumulator.incomplete:
         notes.append("no bulk or interrupt traffic for this device, nothing to pair")
 

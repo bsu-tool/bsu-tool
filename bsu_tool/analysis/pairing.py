@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import statistics
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Final
 
@@ -373,7 +374,7 @@ def _result_for(
         unanswered_commands=tuple(unanswered),
         unsolicited_responses=tuple(unsolicited),
         incomplete_transfers=tuple(accumulator.incomplete),
-        response_timing=_timing_stats(pairs),
+        response_timing=timing_stats(pairs),
         vendor_control_count=len(accumulator.vendor_requests),
         vendor_control_requests=tuple(sorted(set(accumulator.vendor_requests))),
         failed_event_count=accumulator.failed_count,
@@ -592,8 +593,13 @@ def _vendor_control_request(transaction: UrbTransaction) -> int | None:
     return None
 
 
-def _timing_stats(pairs: list[CommandResponsePair]) -> ResponseTimingStats | None:
-    """Aggregate response times across pairs, or ``None`` with no pairs."""
+def timing_stats(pairs: Sequence[CommandResponsePair]) -> ResponseTimingStats | None:
+    """Aggregate response times across pairs, or ``None`` with no pairs.
+
+    Public because the description layer aggregates the same statistic over a
+    subset of these pairs — the ones inside one pattern's occurrences — and must
+    compute it the same way the device-wide figure is computed.
+    """
     if not pairs:
         return None
     times = [pair.response_time_ms for pair in pairs]

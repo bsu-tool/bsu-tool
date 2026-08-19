@@ -28,7 +28,9 @@ def test_goodix_protocol_description_snapshot() -> None:
         "Device 27c6_63ac has 5 repeated command patterns across 2 endpoint roles. "
         "command_01 occurs 11 times; evidence packets 149-251. command_02 occurs 10 times; "
         "evidence packets 149-243. command_03 occurs 3 times; evidence packets 176-225. "
-        "Contains OUT and IN steps; response timing was not isolated to this pattern. "
+        # A real median, not "response timing was not isolated to this pattern": the
+        # pairs inside command_03's own occurrences now supply it.
+        "Median response time 1.9 ms. "
         # No unanswered commands since pairing moved to transfer-type lanes: every OUT
         # on 0x01 now reaches its answer on 0x83. The 10 that remain unsolicited are the
         # second payload-bearing IN of each exchange, which a one-to-one pass cannot claim.

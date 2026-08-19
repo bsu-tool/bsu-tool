@@ -2,7 +2,9 @@
 
 Spec section 8 asks the Goodix integration test to assert the stable output shape
 rather than an exact narrative: every collection present even when empty, result
-limits reported, and each command carrying at least one step with its evidence.
+limits reported, and each command carrying an ordered evidence range. Step detail
+is opt-in since #136, so the default response reports ``step_count`` and leaves
+``steps`` empty.
 """
 
 from __future__ import annotations
@@ -51,10 +53,30 @@ def test_analyze_protocol_goodix_output_shape() -> None:
     assert "truncated" in limits["truncation_note"]
 
     for command in description["commands"]:
-        assert command["steps"], "a command pattern must carry at least one step"
+        # Step detail is opt-in, but the count is always reported so a caller knows
+        # there is detail to ask for.
+        assert command["steps"] == []
+        assert command["step_count"] >= 1
         assert command["occurrence_count"] >= 2  # promoted patterns repeat by definition
         evidence = command["evidence"]
         assert 0 <= evidence["first_packet_index"] <= evidence["last_packet_index"]
+
+
+def test_analyze_protocol_step_flags_are_independent() -> None:
+    """Each flag fills in only its own half of the step detail.
+
+    The counts stay the same either way, so a caller can tell what asking would
+    buy before paying for it.
+    """
+    default = _analyze({"device_id": _READER})["descriptions"][0]
+    commands_only = _analyze({"device_id": _READER, "include_command_steps": True})["descriptions"][0]
+    observations_only = _analyze({"device_id": _READER, "include_observation_steps": True})["descriptions"][0]
+
+    assert [c["step_count"] for c in default["commands"]] == [c["step_count"] for c in commands_only["commands"]]
+    assert all(c["steps"] for c in commands_only["commands"])
+    assert all(c["steps"] == [] for c in observations_only["commands"])
+    assert all(o["steps"] for o in observations_only["observations"])
+    assert all(o["steps"] == [] for o in commands_only["observations"])
 
 
 def test_analyze_protocol_goodix_covers_both_devices() -> None:

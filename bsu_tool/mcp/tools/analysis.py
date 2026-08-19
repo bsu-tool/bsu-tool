@@ -34,7 +34,14 @@ class AnalyzeProtocolResult:
     descriptions: tuple[ProtocolDescription, ...]
 
 
-def _describe(session: Session, capture: Capture, device_id: str | None) -> tuple[ProtocolDescription, ...]:
+def _describe(
+    session: Session,
+    capture: Capture,
+    device_id: str | None,
+    *,
+    include_command_steps: bool,
+    include_observation_steps: bool,
+) -> tuple[ProtocolDescription, ...]:
     """Run the protocol engine, restricted to ``device_id`` when given.
 
     This is the single seam between the MCP layer and the engine; tests replace it
@@ -46,14 +53,24 @@ def _describe(session: Session, capture: Capture, device_id: str | None) -> tupl
     required engine input rather than an enrichment: without it the engine can only
     label a device by id, and its findings read as unanchored guesses.
     """
-    return describe_protocol(capture, device_summaries=session.list_devices(), device_id=device_id)
+    return describe_protocol(
+        capture,
+        device_summaries=session.list_devices(),
+        device_id=device_id,
+        include_command_steps=include_command_steps,
+        include_observation_steps=include_observation_steps,
+    )
 
 
 def register(mcp: FastMCP, session: Session) -> None:
     """Register protocol-analysis tools on the FastMCP instance."""
 
     @mcp.tool()
-    def analyze_protocol(device_id: str | None = None) -> AnalyzeProtocolResult:  # pyright: ignore[reportUnusedFunction]
+    def analyze_protocol(  # pyright: ignore[reportUnusedFunction]
+        device_id: str | None = None,
+        include_command_steps: bool = False,
+        include_observation_steps: bool = False,
+    ) -> AnalyzeProtocolResult:
         """Analyze the active capture and return a protocol description per device.
 
         Reports the repeated command patterns, command/response pairings, endpoint
@@ -67,12 +84,26 @@ def register(mcp: FastMCP, session: Session) -> None:
         Pass ``device_id`` — an id from list_devices, ``vid_pid`` when the capture
         holds the device's descriptors and ``dev_bbb_ddd`` otherwise — to analyze one
         device; omit it to analyze every device in the capture, mirroring get_packets.
+
+        Per-step detail is deferred by default to keep the response small: commands
+        and observations report ``step_count`` while ``steps`` stays empty. Ask for
+        the halves you need — ``include_command_steps`` for the command patterns,
+        ``include_observation_steps`` for the single-occurrence observations — since
+        each roughly triples the size of the part it covers.
         """
         capture = session.capture
         if capture is None:
             raise RuntimeError("No capture loaded. Call load_capture() first.")
         _reject_unknown_device_id(session, device_id)
-        return AnalyzeProtocolResult(descriptions=_describe(session, capture, device_id))
+        return AnalyzeProtocolResult(
+            descriptions=_describe(
+                session,
+                capture,
+                device_id,
+                include_command_steps=include_command_steps,
+                include_observation_steps=include_observation_steps,
+            )
+        )
 
 
 def _reject_unknown_device_id(session: Session, device_id: str | None) -> None:

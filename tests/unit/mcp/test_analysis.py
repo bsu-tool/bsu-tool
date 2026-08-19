@@ -67,7 +67,14 @@ def test_analyze_protocol_without_capture_reports_error() -> None:
 def test_analyze_protocol_rejects_unknown_device_id(monkeypatch: pytest.MonkeyPatch) -> None:
     """A mistyped device_id is reported with the known ids, not silently analyzed as empty."""
 
-    def fake(session: Session, capture: Capture, device_id: str | None) -> tuple[ProtocolDescription, ...]:
+    def fake(
+        session: Session,
+        capture: Capture,
+        device_id: str | None,
+        *,
+        include_command_steps: bool,
+        include_observation_steps: bool,
+    ) -> tuple[ProtocolDescription, ...]:
         raise AssertionError("the engine must not run for an unknown device_id")
 
     monkeypatch.setattr(analysis, "_describe", fake)
@@ -76,25 +83,40 @@ def test_analyze_protocol_rejects_unknown_device_id(monkeypatch: pytest.MonkeyPa
         asyncio.run(build_server(session=_loaded_session()).call_tool("analyze_protocol", {"device_id": "dev_009_009"}))
 
 
-def test_analyze_protocol_passes_device_id_to_the_engine(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The tool forwards device_id untouched — None for all devices, the id for one.
+def test_analyze_protocol_forwards_arguments_to_the_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tool forwards its arguments untouched, and defers step detail by default.
 
     The engine selects and reports devices itself, so the tool must not expand
-    None into a device list of its own.
+    None into a device list of its own. The two step flags are independent, so a
+    caller can pay for one half of the detail without the other.
     """
-    seen: list[str | None] = []
+    seen: list[tuple[str | None, bool, bool]] = []
 
-    def fake(session: Session, capture: Capture, device_id: str | None) -> tuple[ProtocolDescription, ...]:
+    def fake(
+        session: Session,
+        capture: Capture,
+        device_id: str | None,
+        *,
+        include_command_steps: bool,
+        include_observation_steps: bool,
+    ) -> tuple[ProtocolDescription, ...]:
         del session, capture
-        seen.append(device_id)
+        seen.append((device_id, include_command_steps, include_observation_steps))
         return ()
 
     monkeypatch.setattr(analysis, "_describe", fake)
 
     _call({}, _loaded_session())
     _call({"device_id": _GOODIX_READER}, _loaded_session())
+    _call({"include_command_steps": True}, _loaded_session())
+    _call({"include_observation_steps": True}, _loaded_session())
 
-    assert seen == [None, _GOODIX_READER]
+    assert seen == [
+        (None, False, False),  # step detail is off unless asked for
+        (_GOODIX_READER, False, False),
+        (None, True, False),
+        (None, False, True),
+    ]
 
 
 def test_analyze_protocol_describes_every_device_by_default() -> None:

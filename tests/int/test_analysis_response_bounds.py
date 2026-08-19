@@ -31,6 +31,12 @@ _GOODIX_DEVICE = "27c6_63ac"
 #: Headroom is deliberate: this catches a return to unbounded growth, not drift.
 _MAX_SERIALIZED_KB = 25.0
 
+#: Ceiling with both step collections requested on the same capture, measured at
+#: ~75.4 KB. Step detail is bounded by MAX_COMMAND_PATTERNS_RETURNED multiplied by
+#: MAX_SEQUENCE_WINDOW rather than by traffic, but at a far higher ceiling than the
+#: default, so it gets its own bound instead of going unpinned.
+_MAX_DETAILED_SERIALIZED_KB = 100.0
+
 
 def _encode(value: object) -> object:
     """Render a description the way the MCP layer serializes it."""
@@ -41,7 +47,9 @@ def _encode(value: object) -> object:
     return str(value)
 
 
-def _describe(path: pathlib.Path, *, include_steps: bool = False) -> tuple[ProtocolDescription, ...]:
+def _describe(
+    path: pathlib.Path, *, include_command_steps: bool = False, include_observation_steps: bool = False
+) -> tuple[ProtocolDescription, ...]:
     """Describe every device in a capture, as analyze_protocol does."""
     session = Session()
     capture = session.load(path)
@@ -49,7 +57,8 @@ def _describe(path: pathlib.Path, *, include_steps: bool = False) -> tuple[Proto
         capture,
         device_summaries=session.list_devices(),
         device_id=None,
-        include_steps=include_steps,
+        include_command_steps=include_command_steps,
+        include_observation_steps=include_observation_steps,
     )
 
 
@@ -145,18 +154,62 @@ def test_steps_are_deferred_by_default_but_counted() -> None:
 
 
 def test_include_steps_returns_the_full_detail() -> None:
-    """Detail is deferred, not lost: step_count matches what the flag returns."""
+    """Detail is deferred, not lost: step_count matches what the flags return."""
     default = next(d for d in _describe(_LARGE) if d.device_id == _GOODIX_DEVICE)
-    detailed = next(d for d in _describe(_LARGE, include_steps=True) if d.device_id == _GOODIX_DEVICE)
+    detailed = next(
+        d
+        for d in _describe(_LARGE, include_command_steps=True, include_observation_steps=True)
+        if d.device_id == _GOODIX_DEVICE
+    )
 
     assert [c.step_count for c in detailed.commands] == [len(c.steps) for c in detailed.commands]
     assert [c.step_count for c in default.commands] == [c.step_count for c in detailed.commands]
     assert [o.step_count for o in default.observations] == [len(o.steps) for o in detailed.observations]
 
 
+def test_command_and_observation_steps_opt_in_independently() -> None:
+    """Each flag returns its own steps and leaves the other collection deferred.
+
+    The two are read for different reasons, so a caller chasing one unpaired
+    transfer must not pay for every command's payloads, and vice versa.
+    """
+    commands_only = next(d for d in _describe(_LARGE, include_command_steps=True) if d.device_id == _GOODIX_DEVICE)
+    observations_only = next(
+        d for d in _describe(_LARGE, include_observation_steps=True) if d.device_id == _GOODIX_DEVICE
+    )
+
+    assert any(c.steps for c in commands_only.commands)
+    assert all(o.steps == () for o in commands_only.observations)
+
+    assert any(o.steps for o in observations_only.observations)
+    assert all(c.steps == () for c in observations_only.commands)
+
+
+def test_each_step_flag_charges_only_for_its_own_collection() -> None:
+    """The flags partition the step cost: neither pays for the other's steps.
+
+    That partition is the point of splitting them. Note that neither half is cheap
+    in absolute terms on this capture — measured at ~36.6 KB for observations and
+    ~54.7 KB for commands against a ~15.8 KB default — so the split narrows the
+    charge without bringing an opt-in under ``_MAX_SERIALIZED_KB``.
+    """
+    default = _serialized_kb(_describe(_LARGE))
+    commands_only = _serialized_kb(_describe(_LARGE, include_command_steps=True))
+    observations_only = _serialized_kb(_describe(_LARGE, include_observation_steps=True))
+    both = _serialized_kb(_describe(_LARGE, include_command_steps=True, include_observation_steps=True))
+
+    assert default < observations_only < commands_only < both
+    assert both < _MAX_DETAILED_SERIALIZED_KB
+
+    # Each increment is exactly its own collection's steps, so the two sum to both.
+    command_cost = commands_only - default
+    observation_cost = observations_only - default
+    assert abs((command_cost + observation_cost) - (both - default)) < 0.5
+
+
 def test_payload_signatures_are_bounded_and_report_elision() -> None:
     """A long signature is cut to the named bound and says what it dropped."""
-    detailed = next(d for d in _describe(_LARGE, include_steps=True) if d.device_id == _GOODIX_DEVICE)
+    detailed = next(d for d in _describe(_LARGE, include_command_steps=True) if d.device_id == _GOODIX_DEVICE)
     summaries = [
         step.payload_summary
         for command in detailed.commands

@@ -358,7 +358,8 @@ def describe_protocol(
     *,
     device_summaries: tuple[DeviceSummary, ...],
     device_id: str | None = None,
-    include_steps: bool = False,
+    include_command_steps: bool = False,
+    include_observation_steps: bool = False,
 ) -> tuple[ProtocolDescription, ...]:
     """Assemble concise, deterministic descriptions for a loaded capture.
 
@@ -368,11 +369,19 @@ def describe_protocol(
             protocol descriptions stay anchored to device and descriptor context.
         device_id: Restrict analysis to one device. ``None`` describes each device
             reported by the analysis engine.
-        include_steps: Return the per-step breakdown of every command and
-            observation. Off by default: steps carry the payload signatures and are
-            most of the response, so a caller that only needs the shape of the
-            protocol pays for detail it will not read. ``step_count`` is always
-            reported, so a caller can ask again for the detail it wants.
+        include_command_steps: Return the per-step breakdown of every command
+            pattern. Off by default: steps carry the payload signatures and are most
+            of the response, so a caller that only needs the shape of the protocol
+            pays for detail it will not read.
+        include_observation_steps: Return the per-step breakdown of every
+            single-occurrence observation. Off by default for the same reason.
+
+    Commands and observations opt in separately because they are read for different
+    reasons and cost different amounts: observation steps are a flat charge bounded
+    by ``MAX_OBSERVATIONS_RETURNED``, while command steps scale with how many
+    patterns the capture yields, up to ``MAX_COMMAND_PATTERNS_RETURNED``. A caller
+    chasing one unpaired transfer should not pay for every command's payloads.
+    ``step_count`` is reported either way, so the detail is deferred, never lost.
 
     Returns:
         One presentation object per analyzed device.
@@ -386,7 +395,12 @@ def describe_protocol(
         summary = summaries.get(hypothesis.device_id)
         if summary is None:
             raise ValueError(f"missing device summary for {hypothesis.device_id}")
-        description = _describe_hypothesis(hypothesis, summary, include_steps=include_steps)
+        description = _describe_hypothesis(
+            hypothesis,
+            summary,
+            include_command_steps=include_command_steps,
+            include_observation_steps=include_observation_steps,
+        )
         descriptions.append(replace(description, deterministic_summary=format_protocol_summary(description)))
     return tuple(descriptions)
 
@@ -427,14 +441,16 @@ def _describe_hypothesis(
     hypothesis: ProtocolHypothesis,
     device_summary: DeviceSummary | None,
     *,
-    include_steps: bool,
+    include_command_steps: bool,
+    include_observation_steps: bool,
 ) -> ProtocolDescription:
     commands = tuple(
-        _command_description(index, pattern, hypothesis.marker_correlations, include_steps=include_steps)
+        _command_description(index, pattern, hypothesis.marker_correlations, include_steps=include_command_steps)
         for index, pattern in enumerate(hypothesis.command_patterns)
     )
     observations = tuple(
-        _observation_description(observation, include_steps=include_steps) for observation in hypothesis.observations
+        _observation_description(observation, include_steps=include_observation_steps)
+        for observation in hypothesis.observations
     )
     unanswered, unanswered_sampled = _group_anomalies(hypothesis.unanswered_commands, "out", "unanswered OUT command")
     unsolicited, unsolicited_sampled = _group_anomalies(

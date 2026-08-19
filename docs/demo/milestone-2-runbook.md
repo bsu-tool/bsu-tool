@@ -3,13 +3,18 @@
 This is the exact happy path for the sponsor demo. Run every command from the
 repository root and use the sanitized Goodix enumeration-and-enroll capture.
 
-Two ways in. With a USB device and no capture file, the sections run in order:
-[Fresh install](#fresh-install), then
-[Capturing from a real device](#capturing-from-a-real-device) to produce one,
-then the analysis steps. Running the sponsor demo from the capture already in
-the repository instead, skip
-[Capturing from a real device](#capturing-from-a-real-device) — nothing after it
-needs hardware.
+Three ways in:
+
+- **Running the sponsor demo.** Follow it straight through, skipping
+  [Capturing your first enumeration](#capturing-your-first-enumeration) — nothing
+  else needs hardware.
+- **A capture already in hand.** Skip that section too, and substitute your own
+  `.pcapng` path from [CLI sanity check](#cli-sanity-check) onward. This is the
+  common case on a second sitting: MCP session state lives in memory, so a restart
+  returns you here rather than to the hardware.
+- **A device but no capture.** Do
+  [Capturing your first enumeration](#capturing-your-first-enumeration) after the
+  install, then carry on with your own file.
 
 ## Prerequisites
 
@@ -19,7 +24,8 @@ needs hardware.
 - Claude Code, already signed in
 
 Capturing from real hardware additionally needs Linux with the `usbmon` module
-loaded; see [Capturing from a real device](#capturing-from-a-real-device). The
+loaded; see
+[Capturing your first enumeration](#capturing-your-first-enumeration). The
 sponsor demo path needs none of that — it replays a capture checked into the
 repository.
 
@@ -38,13 +44,24 @@ Expected setup results:
   `.venv/Scripts/python.exe` on Windows.
 - The final output says `Setup complete` and `bsu_tool imports successfully`.
 
-## Capturing from a real device
+## Capturing your first enumeration
 
 Linux only, and it needs [Fresh install](#fresh-install) done first. Skip this
-section entirely if you are running the demo from the checked-in capture.
+section entirely if you already have a `.pcapng`, or are running the demo from the
+checked-in capture.
 
-Activate the venv so `bsu-tool` is on your path, and load `usbmon` — nothing
-below works without both:
+This produces one `enumeration` capture — the device plugging in, through
+`SET_CONFIGURATION` — which is enough to have a real capture of your own device to
+analyze. It is deliberately the smallest useful capture, not a full session: the
+corpus workflow that records stimulus events, manifests, and repetitions is
+specified in [`capture-workflow-spec.md`](../architecture/capture-workflow-spec.md)
+and driven by the guided-capture command (#112), not by hand.
+
+**Unplug the device before you start.** Every step below assumes it starts
+detached: `detect-device` finds it by watching it appear, and the sniffer can only
+record an enumeration that happens after the sniffer is running.
+
+Activate the venv so `bsu-tool` is on your path, and load `usbmon`:
 
 ```bash
 source .venv/bin/activate
@@ -53,21 +70,19 @@ ls /dev/usbmon*
 ```
 
 If `/dev/usbmon*` is missing, the module is not loaded. If the files exist but
-`sniff` reports a permission error, run it under `sudo` as shown in step 3, or
+`sniff` reports a permission error, run it under `sudo` as shown in step 2, or
 give your user read access to `/dev/usbmonN`.
 
-### 1. Find the device's bus
+### 1. Find the device's bus and ids
 
-`lsusb` lists everything attached, which does not tell you which line is your
-device. `detect-device` answers that by diffing snapshots taken before and
-after you plug it in:
+With the device **unplugged**, run:
 
 ```bash
 bsu-tool detect-device
 ```
 
-Follow the prompt: it snapshots, waits for you to plug the device in and press
-Enter, then prints the device that appeared:
+It snapshots the attached devices, waits for you to plug yours in and press Enter,
+then reports what appeared:
 
 ```
 Detected new device:
@@ -78,45 +93,39 @@ Detected new device:
   Description: Goodix Fingerprint USB Device
 ```
 
-Note the `Bus:` number — it is the `N` in the `usbmon path:` and the value
-`sniff --bus` wants. This step reads sysfs only, so it needs no elevation.
+Note the `Bus:` number — the `N` in `usbmon path:` and the value `sniff --bus`
+wants — and the `VID:PID:`, which names the capture file in step 2. This step
+reads sysfs only, so it needs no elevation.
 
-### 2. Unplug the device
+Then **unplug the device again**. It goes back in only once the sniffer is running.
 
-This step is the one that is easy to miss. The sniffer can only record traffic
-that happens after it starts, and a device enumerates — reports its descriptors,
-including vendor and product id — only at the moment it is plugged in. Capturing
-a device that is already connected misses enumeration entirely, and
-`list_devices` then falls back to an address-derived id (`identity_source` is
-`address` rather than `descriptors`) because no descriptor was ever seen.
+### 2. Start the sniffer, then plug in
 
-So unplug the device now. It goes back in only once the sniffer is running.
+The sniffer must be running before the device attaches, because enumeration
+happens once, at attach (`capture-workflow-spec-sections.md` §P.3). Capturing an
+already-connected device misses it, and `list_devices` then falls back to an
+address-derived id (`identity_source` is `address` rather than `descriptors`)
+because no descriptor was ever seen.
 
-### 3. Start the sniffer
-
-Use the bus number from step 1. The output file must not already exist:
+Name the file as the spec requires — `<seq>-<vid>_<pid>-<event>.pcapng`, with
+lowercase hex ids and no `0x` — using the ids from step 1:
 
 ```bash
-sudo .venv/bin/bsu-tool sniff --bus 1 my-device.pcapng
+sudo .venv/bin/bsu-tool sniff --bus 1 0000-27c6_63ac-enumeration.pcapng
 ```
 
 Reading `/dev/usbmonN` needs elevation, and `sudo` resets `PATH`, so plain
 `sudo bsu-tool` fails with "command not found" even after activating the venv.
-Call the venv's executable by path as shown. Drop the `sudo` if your user
-already has read access to `/dev/usbmonN`.
+Call the venv's executable by path as shown. Drop the `sudo` if your user already
+has read access to `/dev/usbmonN`. Pass `--bus 0` to capture every bus if you are
+unsure which one to watch; the output file must not already exist.
 
-Pass `--bus 0` to capture every bus if you are unsure which one to watch.
-`sniff` captures all devices on the bus; you select a device later at analysis
-time.
+With the sniffer running, plug the device in and wait a couple of seconds for
+enumeration to finish. Do not exercise the device yet — an `enumeration` capture
+covers attach through `SET_CONFIGURATION` and nothing else, and mixing a button
+press into it would make one file two events (§N.2.1).
 
-### 4. Plug the device in and operate it
-
-With the sniffer running, plug the device in. Wait a second for enumeration to
-finish, then exercise whatever behavior you want to analyze — press its button,
-run its vendor tool, trigger the event you care about. Do one action at a time
-so the traffic stays readable.
-
-### 5. Stop the capture
+### 3. Stop and verify
 
 Press `Ctrl+C`. `sniff` prints a summary:
 
@@ -125,37 +134,36 @@ Capture stopped.
   Events captured:   1482
   Elapsed:           23.41s
   Average rate:      63.3 events/sec
-  Output:            my-device.pcapng
+  Output:            0000-27c6_63ac-enumeration.pcapng
   Output size:       412.6 KB (422503 bytes)
 ```
 
-`Events captured: 0` means the sniffer saw nothing — almost always the wrong
-bus. Re-run from step 1, or capture every bus with `--bus 0`.
-
-Confirm the capture is usable before moving on:
+`Events captured: 0` means the sniffer saw nothing — almost always the wrong bus.
+Re-run from step 1, or capture every bus with `--bus 0`.
 
 ```bash
-bsu-tool parse my-device.pcapng
+bsu-tool parse 0000-27c6_63ac-enumeration.pcapng
 ```
 
 The summary should report a non-zero packet count and list your device. `parse`
-still keys devices by address, so expect `001:002` form here rather than
-`vid_pid`; `list_devices` in the Claude demo resolves the identity.
+keys devices by address, so expect `001:002` form here; `list_devices` in the
+Claude demo resolves it to `vid_pid` from the descriptors you just captured.
+
+A committed corpus also needs a `.json` manifest beside each capture (§N.4). That
+is out of scope here — this file is for getting you analyzing, not for the record.
 
 ### Analyzing your own capture
 
-The Claude Code demo below is written against the Goodix capture, so its
-expected values — `253` packets, device `27c6_63ac`, packet indexes `145` and
-`252` — are specific to that file. Run the same sequence against your capture,
-taking each value from your own tool output instead:
+Substitute your `.pcapng` path in the [Claude Code demo](#claude-code-demo) below
+and take each expected value from your own tool output: `packet_count` from step 1,
+your `device_id` from `list_devices` in step 2, then that id wherever the demo says
+`27c6_63ac`.
 
-- Step 1: pass your `.pcapng` path; note the `packet_count` it reports.
-- Step 2: `list_devices` names your device. Use that `device_id` from here on —
-  `vid_pid` if enumeration was captured, address-derived otherwise.
-- Step 3: pass your `device_id`.
-- Steps 4–5: pick two `index` values from the step 3 output that bracket the
-  action you performed in step 4 of the capture, rather than `145` and `252`.
-- Step 7: `span_count` is whatever falls between your markers.
+Stop after step 3. The marker steps need two packet indexes that bracket a physical
+action, and an `enumeration` capture has no such action in it. Delimiting actions in
+a live capture is the job of live marks, which `add_marker` cannot do — it anchors
+to a decoded packet, and a live capture is not decoded until the capture stops
+(§P.3.1). That tool is specified but not yet built.
 
 ## CLI sanity check
 
@@ -223,6 +231,9 @@ time. Ask Claude to show each tool result before continuing.
 ## Recovery
 
 - If `bsu-tool` is not found, activate the venv and retry.
+- If `detect-device` exits with "No new USB device detected", the device was
+  already attached when it took its first snapshot, so there was no change to
+  find. Unplug it and run the command again.
 - If `sniff` reports that the usbmon bus is not available, load the module with
   `sudo modprobe usbmon` and confirm `/dev/usbmon*` exists.
 - If `sudo bsu-tool` reports "command not found", `sudo` reset `PATH` and lost

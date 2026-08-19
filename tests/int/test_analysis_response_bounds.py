@@ -15,6 +15,7 @@ from typing import cast
 
 from bsu_tool.analysis.description import (
     MAX_ANOMALY_SAMPLES_REPORTED,
+    MAX_SIGNATURE_BYTES_SHOWN,
     ProtocolDescription,
     describe_protocol,
 )
@@ -25,10 +26,10 @@ _SMALL = _CAPTURES / "goodix_enum_and_enroll_sanitized.pcapng"
 _LARGE = _CAPTURES / "goodix_enroll_verify_sanitized.pcapng"
 _GOODIX_DEVICE = "27c6_63ac"
 
-#: Serialized ceiling for the 1122-packet capture. Measured at ~91 KB after
-#: grouping, against ~162 KB before it. Headroom is deliberate: this catches a
-#: return to unbounded growth, not normal drift.
-_MAX_SERIALIZED_KB = 110.0
+#: Serialized ceiling for the 1122-packet capture at the default detail level.
+#: Measured at ~15.8 KB, against ~162 KB before grouping and step deferral.
+#: Headroom is deliberate: this catches a return to unbounded growth, not drift.
+_MAX_SERIALIZED_KB = 25.0
 
 
 def _encode(value: object) -> object:
@@ -40,11 +41,16 @@ def _encode(value: object) -> object:
     return str(value)
 
 
-def _describe(path: pathlib.Path) -> tuple[ProtocolDescription, ...]:
+def _describe(path: pathlib.Path, *, include_steps: bool = False) -> tuple[ProtocolDescription, ...]:
     """Describe every device in a capture, as analyze_protocol does."""
     session = Session()
     capture = session.load(path)
-    return describe_protocol(capture, device_summaries=session.list_devices(), device_id=None)
+    return describe_protocol(
+        capture,
+        device_summaries=session.list_devices(),
+        device_id=None,
+        include_steps=include_steps,
+    )
 
 
 def _serialized_kb(descriptions: tuple[ProtocolDescription, ...]) -> float:
@@ -122,3 +128,46 @@ def test_deterministic_summary_is_unchanged_by_grouping() -> None:
         "Device 27c6_63ac has 5 repeated command patterns across 2 endpoint roles."
     )
     assert "42 unsolicited response occurrences." in description.deterministic_summary
+
+
+def test_steps_are_deferred_by_default_but_counted() -> None:
+    """The default response omits steps and still says how many there are."""
+    description = next(d for d in _describe(_LARGE) if d.device_id == _GOODIX_DEVICE)
+
+    assert description.commands
+    assert description.observations
+    for command in description.commands:
+        assert command.steps == ()
+        assert command.step_count > 0
+    for observation in description.observations:
+        assert observation.steps == ()
+        assert observation.step_count > 0
+
+
+def test_include_steps_returns_the_full_detail() -> None:
+    """Detail is deferred, not lost: step_count matches what the flag returns."""
+    default = next(d for d in _describe(_LARGE) if d.device_id == _GOODIX_DEVICE)
+    detailed = next(d for d in _describe(_LARGE, include_steps=True) if d.device_id == _GOODIX_DEVICE)
+
+    assert [c.step_count for c in detailed.commands] == [len(c.steps) for c in detailed.commands]
+    assert [c.step_count for c in default.commands] == [c.step_count for c in detailed.commands]
+    assert [o.step_count for o in default.observations] == [len(o.steps) for o in detailed.observations]
+
+
+def test_payload_signatures_are_bounded_and_report_elision() -> None:
+    """A long signature is cut to the named bound and says what it dropped."""
+    detailed = next(d for d in _describe(_LARGE, include_steps=True) if d.device_id == _GOODIX_DEVICE)
+    summaries = [
+        step.payload_summary
+        for command in detailed.commands
+        for step in command.steps
+        if "signature" in step.payload_summary
+    ]
+    assert summaries
+
+    for summary in summaries:
+        rendered = summary.split("signature ", 1)[1].split(" (+", 1)[0].split(";", 1)[0]
+        assert len(rendered.split()) <= MAX_SIGNATURE_BYTES_SHOWN
+
+    elided = [summary for summary in summaries if "more byte" in summary]
+    assert elided, "expected at least one signature long enough to elide"

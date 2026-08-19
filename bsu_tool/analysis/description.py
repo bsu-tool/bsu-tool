@@ -52,6 +52,8 @@ MIN_OBSERVATION_STEPS: Final[int] = 2
 """Minimum OUT/IN steps for a single-occurrence multi-step observation."""
 MAX_ANOMALY_SAMPLES_REPORTED: Final[int] = 5
 """Per-group evidence spans kept when pairing anomalies are grouped."""
+MAX_SIGNATURE_BYTES_SHOWN: Final[int] = 24
+"""Payload-signature bytes rendered in a step summary before eliding the rest."""
 
 _Token = tuple[int, Direction, TransferType, SignatureMode, PayloadSignature]
 
@@ -178,6 +180,7 @@ class CommandDescription:
     summary: str
     occurrence_count: int
     markers: tuple[str, ...]
+    step_count: int
     steps: tuple[StepDescription, ...]
     response_summary: str | None
     evidence: EvidenceSpan
@@ -204,6 +207,7 @@ class ObservationDescription:
     reason: str
     summary: str
     nearest_marker: str | None
+    step_count: int
     steps: tuple[StepDescription, ...]
 
 
@@ -354,6 +358,7 @@ def describe_protocol(
     *,
     device_summaries: tuple[DeviceSummary, ...],
     device_id: str | None = None,
+    include_steps: bool = False,
 ) -> tuple[ProtocolDescription, ...]:
     """Assemble concise, deterministic descriptions for a loaded capture.
 
@@ -363,6 +368,11 @@ def describe_protocol(
             protocol descriptions stay anchored to device and descriptor context.
         device_id: Restrict analysis to one device. ``None`` describes each device
             reported by the analysis engine.
+        include_steps: Return the per-step breakdown of every command and
+            observation. Off by default: steps carry the payload signatures and are
+            most of the response, so a caller that only needs the shape of the
+            protocol pays for detail it will not read. ``step_count`` is always
+            reported, so a caller can ask again for the detail it wants.
 
     Returns:
         One presentation object per analyzed device.
@@ -376,7 +386,7 @@ def describe_protocol(
         summary = summaries.get(hypothesis.device_id)
         if summary is None:
             raise ValueError(f"missing device summary for {hypothesis.device_id}")
-        description = _describe_hypothesis(hypothesis, summary)
+        description = _describe_hypothesis(hypothesis, summary, include_steps=include_steps)
         descriptions.append(replace(description, deterministic_summary=format_protocol_summary(description)))
     return tuple(descriptions)
 
@@ -416,12 +426,16 @@ def format_protocol_summary(description: ProtocolDescription) -> str:
 def _describe_hypothesis(
     hypothesis: ProtocolHypothesis,
     device_summary: DeviceSummary | None,
+    *,
+    include_steps: bool,
 ) -> ProtocolDescription:
     commands = tuple(
-        _command_description(index, pattern, hypothesis.marker_correlations)
+        _command_description(index, pattern, hypothesis.marker_correlations, include_steps=include_steps)
         for index, pattern in enumerate(hypothesis.command_patterns)
     )
-    observations = tuple(_observation_description(observation) for observation in hypothesis.observations)
+    observations = tuple(
+        _observation_description(observation, include_steps=include_steps) for observation in hypothesis.observations
+    )
     unanswered, unanswered_sampled = _group_anomalies(hypothesis.unanswered_commands, "out", "unanswered OUT command")
     unsolicited, unsolicited_sampled = _group_anomalies(
         hypothesis.unsolicited_responses, "in", "unsolicited IN response"
@@ -483,6 +497,8 @@ def _command_description(
     position: int,
     pattern: CommandPattern,
     correlations: tuple[MarkerCorrelation, ...],
+    *,
+    include_steps: bool,
 ) -> CommandDescription:
     markers = tuple(
         correlation.marker_name
@@ -490,7 +506,7 @@ def _command_description(
         if correlation.correlation_id == pattern.marker_correlation_id
     )
     command_id = f"command_{position + 1:02d}"
-    steps = tuple(_step_description(step) for step in pattern.steps)
+    steps = tuple(_step_description(step) for step in pattern.steps) if include_steps else ()
     response_summary = _response_summary(pattern)
     return CommandDescription(
         command_id=command_id,
@@ -499,6 +515,7 @@ def _command_description(
         summary=_pattern_summary(pattern, markers),
         occurrence_count=pattern.occurrence_count,
         markers=markers,
+        step_count=len(pattern.steps),
         steps=steps,
         response_summary=response_summary,
         evidence=_pattern_evidence(pattern),
@@ -560,7 +577,11 @@ def _step_description(step: PatternStep) -> StepDescription:
 def _payload_summary(step: PatternStep) -> str:
     if not step.payload_signature:
         return "zero-length payload"
-    signature = " ".join("??" if byte is None else f"{byte:02x}" for byte in step.payload_signature)
+    shown = step.payload_signature[:MAX_SIGNATURE_BYTES_SHOWN]
+    elided = len(step.payload_signature) - len(shown)
+    signature = " ".join("??" if byte is None else f"{byte:02x}" for byte in shown)
+    if elided:
+        signature = f"{signature} (+{elided} more byte{'' if elided == 1 else 's'})"
     length_min, length_max = step.observed_length_range
     length = f"{length_min} bytes" if length_min == length_max else f"{length_min}-{length_max} bytes"
     variable = ""
@@ -570,13 +591,14 @@ def _payload_summary(step: PatternStep) -> str:
     return f"{length}; signature {signature}{variable}"
 
 
-def _observation_description(observation: AnalysisObservation) -> ObservationDescription:
+def _observation_description(observation: AnalysisObservation, *, include_steps: bool) -> ObservationDescription:
     return ObservationDescription(
         source_observation_id=observation.observation_id,
         reason=observation.reason,
         summary=f"{observation.reason.replace('_', ' ')} observation with {len(observation.steps)} step(s)",
         nearest_marker=observation.nearest_marker,
-        steps=tuple(_step_description(step) for step in observation.steps),
+        step_count=len(observation.steps),
+        steps=tuple(_step_description(step) for step in observation.steps) if include_steps else (),
     )
 
 

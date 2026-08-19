@@ -50,6 +50,10 @@ MAX_OBSERVATIONS_RETURNED: Final[int] = 10
 """Maximum observations returned by the assembly layer, matching spec §7."""
 MIN_OBSERVATION_STEPS: Final[int] = 2
 """Minimum OUT/IN steps for a single-occurrence multi-step observation."""
+MAX_ANOMALY_SAMPLES_REPORTED: Final[int] = 5
+"""Per-group evidence spans kept when pairing anomalies are grouped."""
+MAX_SIGNATURE_BYTES_SHOWN: Final[int] = 24
+"""Payload-signature bytes rendered in a step summary before eliding the rest."""
 
 _Token = tuple[int, Direction, TransferType, SignatureMode, PayloadSignature]
 
@@ -152,6 +156,7 @@ class ResultLimitSummary:
 
     command_patterns_truncated: bool
     observations_truncated: bool
+    anomaly_groups_sampled: bool
     truncation_note: str | None
 
 
@@ -175,6 +180,7 @@ class CommandDescription:
     summary: str
     occurrence_count: int
     markers: tuple[str, ...]
+    step_count: int
     steps: tuple[StepDescription, ...]
     response_summary: str | None
     evidence: EvidenceSpan
@@ -201,19 +207,33 @@ class ObservationDescription:
     reason: str
     summary: str
     nearest_marker: str | None
+    step_count: int
     steps: tuple[StepDescription, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class PairingAnomalyDescription:
-    """Readable description of unanswered commands or unsolicited responses."""
+    """Unanswered commands or unsolicited responses on one endpoint role.
+
+    One entry per ``(endpoint_address, direction, transfer_type)`` group, not per
+    raw anomaly. A busy endpoint produces hundreds of individually uninteresting
+    anomalies that differ only in payload signature and packet index, so reporting
+    each one grows the response with traffic volume while saying the same thing.
+
+    ``occurrence_count`` is the group total and ``distinct_signatures`` is how many
+    anomalies were folded in, so neither number is lost. ``evidence`` spans the
+    whole group; ``samples`` holds up to ``MAX_ANOMALY_SAMPLES_REPORTED`` individual
+    spans for drill-down. Use ``get_packets`` for the full set.
+    """
 
     endpoint_address: str
     direction: Direction
     transfer_type: TransferType
     occurrence_count: int
+    distinct_signatures: int
     summary: str
     evidence: EvidenceSpan
+    samples: tuple[EvidenceSpan, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,6 +358,8 @@ def describe_protocol(
     *,
     device_summaries: tuple[DeviceSummary, ...],
     device_id: str | None = None,
+    include_command_steps: bool = False,
+    include_observation_steps: bool = False,
 ) -> tuple[ProtocolDescription, ...]:
     """Assemble concise, deterministic descriptions for a loaded capture.
 
@@ -347,6 +369,19 @@ def describe_protocol(
             protocol descriptions stay anchored to device and descriptor context.
         device_id: Restrict analysis to one device. ``None`` describes each device
             reported by the analysis engine.
+        include_command_steps: Return the per-step breakdown of every command
+            pattern. Off by default: steps carry the payload signatures and are most
+            of the response, so a caller that only needs the shape of the protocol
+            pays for detail it will not read.
+        include_observation_steps: Return the per-step breakdown of every
+            single-occurrence observation. Off by default for the same reason.
+
+    Commands and observations opt in separately because they are read for different
+    reasons and cost different amounts: observation steps are a flat charge bounded
+    by ``MAX_OBSERVATIONS_RETURNED``, while command steps scale with how many
+    patterns the capture yields, up to ``MAX_COMMAND_PATTERNS_RETURNED``. A caller
+    chasing one unpaired transfer should not pay for every command's payloads.
+    ``step_count`` is reported either way, so the detail is deferred, never lost.
 
     Returns:
         One presentation object per analyzed device.
@@ -360,7 +395,12 @@ def describe_protocol(
         summary = summaries.get(hypothesis.device_id)
         if summary is None:
             raise ValueError(f"missing device summary for {hypothesis.device_id}")
-        description = _describe_hypothesis(hypothesis, summary)
+        description = _describe_hypothesis(
+            hypothesis,
+            summary,
+            include_command_steps=include_command_steps,
+            include_observation_steps=include_observation_steps,
+        )
         descriptions.append(replace(description, deterministic_summary=format_protocol_summary(description)))
     return tuple(descriptions)
 
@@ -400,20 +440,23 @@ def format_protocol_summary(description: ProtocolDescription) -> str:
 def _describe_hypothesis(
     hypothesis: ProtocolHypothesis,
     device_summary: DeviceSummary | None,
+    *,
+    include_command_steps: bool,
+    include_observation_steps: bool,
 ) -> ProtocolDescription:
     commands = tuple(
-        _command_description(index, pattern, hypothesis.marker_correlations)
+        _command_description(index, pattern, hypothesis.marker_correlations, include_steps=include_command_steps)
         for index, pattern in enumerate(hypothesis.command_patterns)
     )
-    observations = tuple(_observation_description(observation) for observation in hypothesis.observations)
-    unanswered = tuple(
-        _anomaly_description(command, "out", f"unanswered OUT command on {command.endpoint_address}")
-        for command in hypothesis.unanswered_commands
+    observations = tuple(
+        _observation_description(observation, include_steps=include_observation_steps)
+        for observation in hypothesis.observations
     )
-    unsolicited = tuple(
-        _anomaly_description(response, "in", f"unsolicited IN response on {response.endpoint_address}")
-        for response in hypothesis.unsolicited_responses
+    unanswered, unanswered_sampled = _group_anomalies(hypothesis.unanswered_commands, "out", "unanswered OUT command")
+    unsolicited, unsolicited_sampled = _group_anomalies(
+        hypothesis.unsolicited_responses, "in", "unsolicited IN response"
     )
+    anomaly_groups_sampled = unanswered_sampled or unsolicited_sampled
     incomplete = tuple(_incomplete_description(item) for item in hypothesis.incomplete_transfers)
     headline = _headline(hypothesis, device_summary)
     return ProtocolDescription(
@@ -432,7 +475,8 @@ def _describe_hypothesis(
         result_limits=ResultLimitSummary(
             command_patterns_truncated=hypothesis.result_limits.command_patterns_truncated,
             observations_truncated=hypothesis.result_limits.observations_truncated,
-            truncation_note=hypothesis.result_limits.truncation_note,
+            anomaly_groups_sampled=anomaly_groups_sampled,
+            truncation_note=_extend_truncation_note(hypothesis.result_limits.truncation_note, anomaly_groups_sampled),
         ),
     )
 
@@ -469,6 +513,8 @@ def _command_description(
     position: int,
     pattern: CommandPattern,
     correlations: tuple[MarkerCorrelation, ...],
+    *,
+    include_steps: bool,
 ) -> CommandDescription:
     markers = tuple(
         correlation.marker_name
@@ -476,7 +522,7 @@ def _command_description(
         if correlation.correlation_id == pattern.marker_correlation_id
     )
     command_id = f"command_{position + 1:02d}"
-    steps = tuple(_step_description(step) for step in pattern.steps)
+    steps = tuple(_step_description(step) for step in pattern.steps) if include_steps else ()
     response_summary = _response_summary(pattern)
     return CommandDescription(
         command_id=command_id,
@@ -485,6 +531,7 @@ def _command_description(
         summary=_pattern_summary(pattern, markers),
         occurrence_count=pattern.occurrence_count,
         markers=markers,
+        step_count=len(pattern.steps),
         steps=steps,
         response_summary=response_summary,
         evidence=_pattern_evidence(pattern),
@@ -546,7 +593,11 @@ def _step_description(step: PatternStep) -> StepDescription:
 def _payload_summary(step: PatternStep) -> str:
     if not step.payload_signature:
         return "zero-length payload"
-    signature = " ".join("??" if byte is None else f"{byte:02x}" for byte in step.payload_signature)
+    shown = step.payload_signature[:MAX_SIGNATURE_BYTES_SHOWN]
+    elided = len(step.payload_signature) - len(shown)
+    signature = " ".join("??" if byte is None else f"{byte:02x}" for byte in shown)
+    if elided:
+        signature = f"{signature} (+{elided} more byte{'' if elided == 1 else 's'})"
     length_min, length_max = step.observed_length_range
     length = f"{length_min} bytes" if length_min == length_max else f"{length_min}-{length_max} bytes"
     variable = ""
@@ -556,34 +607,82 @@ def _payload_summary(step: PatternStep) -> str:
     return f"{length}; signature {signature}{variable}"
 
 
-def _observation_description(observation: AnalysisObservation) -> ObservationDescription:
+def _observation_description(observation: AnalysisObservation, *, include_steps: bool) -> ObservationDescription:
     return ObservationDescription(
         source_observation_id=observation.observation_id,
         reason=observation.reason,
         summary=f"{observation.reason.replace('_', ' ')} observation with {len(observation.steps)} step(s)",
         nearest_marker=observation.nearest_marker,
-        steps=tuple(_step_description(step) for step in observation.steps),
+        step_count=len(observation.steps),
+        steps=tuple(_step_description(step) for step in observation.steps) if include_steps else (),
     )
 
 
-def _anomaly_description(
-    anomaly: UnansweredCommand | UnsolicitedResponse,
+def _anomaly_span(anomaly: UnansweredCommand | UnsolicitedResponse) -> EvidenceSpan:
+    """Packet and timestamp bounds for one raw pairing anomaly."""
+    return EvidenceSpan(
+        first_packet_index=anomaly.first_occurrence_index,
+        last_packet_index=anomaly.last_occurrence_index,
+        first_timestamp=anomaly.first_occurrence_timestamp,
+        last_timestamp=anomaly.last_occurrence_timestamp,
+    )
+
+
+def _group_anomalies(
+    anomalies: Sequence[UnansweredCommand] | Sequence[UnsolicitedResponse],
     direction: Direction,
-    summary: str,
-) -> PairingAnomalyDescription:
-    return PairingAnomalyDescription(
-        endpoint_address=anomaly.endpoint_address,
-        direction=direction,
-        transfer_type=anomaly.transfer_type,
-        occurrence_count=anomaly.occurrence_count,
-        summary=summary,
-        evidence=EvidenceSpan(
-            first_packet_index=anomaly.first_occurrence_index,
-            last_packet_index=anomaly.last_occurrence_index,
-            first_timestamp=anomaly.first_occurrence_timestamp,
-            last_timestamp=anomaly.last_occurrence_timestamp,
-        ),
-    )
+    label: str,
+) -> tuple[tuple[PairingAnomalyDescription, ...], bool]:
+    """Collapse raw pairing anomalies to one entry per endpoint role.
+
+    Groups on ``(endpoint_address, transfer_type)``; ``direction`` is fixed by the
+    caller, since unanswered commands are always OUT and unsolicited responses
+    always IN. Group order follows first appearance, so output is deterministic.
+
+    Returns the descriptions and whether any group held back samples, which the
+    caller reports through ``ResultLimitSummary`` rather than dropping silently.
+    """
+    grouped: dict[tuple[str, TransferType], list[UnansweredCommand | UnsolicitedResponse]] = {}
+    for anomaly in anomalies:
+        grouped.setdefault((anomaly.endpoint_address, anomaly.transfer_type), []).append(anomaly)
+
+    descriptions: list[PairingAnomalyDescription] = []
+    sampled = False
+    for (endpoint_address, transfer_type), members in grouped.items():
+        spans = sorted((_anomaly_span(item) for item in members), key=lambda span: span.first_packet_index)
+        total = sum(item.occurrence_count for item in members)
+        if len(spans) > MAX_ANOMALY_SAMPLES_REPORTED:
+            sampled = True
+        plural = "" if len(members) == 1 else "s"
+        descriptions.append(
+            PairingAnomalyDescription(
+                endpoint_address=endpoint_address,
+                direction=direction,
+                transfer_type=transfer_type,
+                occurrence_count=total,
+                distinct_signatures=len(members),
+                summary=(
+                    f"{len(members)} distinct {label} signature{plural} on {endpoint_address}, "
+                    f"{total} occurrence{'' if total == 1 else 's'}"
+                ),
+                evidence=EvidenceSpan(
+                    first_packet_index=spans[0].first_packet_index,
+                    last_packet_index=max(span.last_packet_index for span in spans),
+                    first_timestamp=spans[0].first_timestamp,
+                    last_timestamp=max(span.last_timestamp for span in spans),
+                ),
+                samples=tuple(spans[:MAX_ANOMALY_SAMPLES_REPORTED]),
+            )
+        )
+    return tuple(descriptions), sampled
+
+
+def _extend_truncation_note(note: str | None, anomaly_groups_sampled: bool) -> str | None:
+    """Append the anomaly-sampling note to whatever the analyzer already reported."""
+    if not anomaly_groups_sampled:
+        return note
+    added = f"pairing anomaly groups sampled to {MAX_ANOMALY_SAMPLES_REPORTED} spans each"
+    return f"{note}; {added}" if note else added
 
 
 def _incomplete_description(item: IncompleteTransfer) -> IncompleteTransferDescription:

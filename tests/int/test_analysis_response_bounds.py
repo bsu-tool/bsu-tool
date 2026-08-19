@@ -83,25 +83,26 @@ def test_anomaly_entries_do_not_grow_with_packet_count() -> None:
     large = next(d for d in _describe(_LARGE) if d.device_id == _GOODIX_DEVICE)
 
     assert len(small.unsolicited_responses) == len(large.unsolicited_responses) == 1
-    assert len(small.unanswered_commands) == len(large.unanswered_commands) == 1
+    # Zero, not one: transfer-type lanes let every OUT on 0x01 pair with its answer on
+    # 0x83. Under the old endpoint-number lanes these were 1 and 1 because nothing
+    # paired at all and every command fell out as unanswered.
+    assert len(small.unanswered_commands) == len(large.unanswered_commands) == 0
 
 
 def test_grouping_preserves_totals_and_reports_what_it_folded() -> None:
-    """Collapsing 181 anomalies keeps both the occurrence total and the count."""
+    """Collapsing 90 anomalies keeps both the occurrence total and the count."""
     description = next(d for d in _describe(_LARGE) if d.device_id == _GOODIX_DEVICE)
 
     unsolicited = description.unsolicited_responses[0]
     assert unsolicited.endpoint_address == "0x83"
     assert unsolicited.direction == "in"
-    assert unsolicited.distinct_signatures == 181
-    assert unsolicited.occurrence_count == 368
-    assert "181 distinct" in unsolicited.summary
+    assert unsolicited.distinct_signatures == 90
+    assert unsolicited.occurrence_count == 92
+    assert "90 distinct" in unsolicited.summary
 
-    unanswered = description.unanswered_commands[0]
-    assert unanswered.endpoint_address == "0x01"
-    assert unanswered.direction == "out"
-    assert unanswered.distinct_signatures == 79
-    assert unanswered.occurrence_count == 87
+    # Nothing unanswered to fold: this device answers every command it is sent, which
+    # only became visible once lanes stopped being keyed on endpoint number.
+    assert description.unanswered_commands == ()
 
 
 def test_samples_are_bounded_and_sampling_is_reported() -> None:
@@ -136,7 +137,7 @@ def test_deterministic_summary_is_unchanged_by_grouping() -> None:
     assert description.deterministic_summary.startswith(
         "Device 27c6_63ac has 5 repeated command patterns across 2 endpoint roles."
     )
-    assert "42 unsolicited response occurrences." in description.deterministic_summary
+    assert "10 unsolicited response occurrences." in description.deterministic_summary
 
 
 def test_steps_are_deferred_by_default_but_counted() -> None:

@@ -398,14 +398,55 @@ submission and completion have opposite directions. A single `UrbTransaction` re
 URB id lifecycle, while command/response inference is a protocol-level relationship between
 separate directional analysis events.
 
-**Endpoint scope:** pairing is scoped by device and endpoint number. An OUT on endpoint
-`0x01` may pair with an IN on endpoint `0x81` because both refer to endpoint number 1
-with opposite directions. Pairing by full endpoint address would miss this common USB
-command/response shape.
+**Endpoint scope:** pairing is scoped by device and **transfer type**, not by endpoint
+number. An OUT on endpoint `0x01` pairs with an IN on `0x81` (same endpoint number,
+opposite directions) *and* with an IN on `0x83` (a different endpoint number entirely),
+because both are bulk traffic from the same device.
 
-If a device sends commands and responses on different endpoint numbers, those events are
-not forced into a simple command/response pair. They remain visible as separate endpoint
-lane patterns or as `AnalysisObservation` entries for analyst review.
+This revises an earlier rule that scoped pairing to the endpoint number and said events
+on different endpoint numbers were "not forced into a simple command/response pair."
+That rule assumed the same-number OUT/IN arrangement is the common one. It is not the
+arrangement this project's reference device uses: both Goodix captures send commands on
+`0x01` (endpoint number 1) and answers on `0x83` (endpoint number 3). Under
+endpoint-number scoping every command and its answer landed in separate lanes, so
+`pair_command_responses` returned **zero pairs** on both captures, `response_timing` was
+always `None`, and every command was reported as unanswered while every response was
+reported as unsolicited. Those counts described the scoping, not the device.
+
+**Background endpoint suppression:** widening the lane to the transfer type puts an
+unrelated IN endpoint in reach of a pending OUT. Being the nearest IN in timestamp
+order it wins, so the command pairs with a status packet and the real answer is filed
+as unsolicited. The counts are identical either way, so nothing in the output
+distinguishes the mispairing from a correct pairing.
+
+Pairing therefore applies the same background-endpoint rule §3.1 scoping uses: an
+endpoint every one of whose events is **interrupt IN**, on a device that sends OUT
+traffic elsewhere, may not claim a pending command. Its events are still reported as
+unsolicited responses, because they are genuinely device-pushed traffic; only their
+ability to consume a command is removed. The suppression is named in `analysis_notes`.
+
+The interrupt clause is load-bearing and must not be relaxed to "any IN-only
+endpoint". Goodix answers on a bulk IN-only endpoint (`0x83`) while sending OUT on
+`0x01`, so a wider rule would classify the reader's only responder as background and
+return pairing to zero pairs.
+
+What this does **not** separate is two independent protocols running on different
+endpoint pairs of the same transfer type on one device. Those interleave into one lane
+and may mispair; separating them needs correlation analysis this pass does not
+perform, and no capture in the corpus exercises it.
+
+**Zero-length events:** a **successful** event with an empty payload is excluded from
+pairing and counted in the result notes. It can neither be a command nor answer one,
+and leaving it in the lane lets it consume the pending OUT before the real response
+arrives — the Goodix reader answers with a zero-length read followed by the payload, so
+keeping them paired 92 of 95 commands on the 1122-packet capture with an empty response
+and timed each exchange to a USB artifact.
+
+**Failed events stay in the lane regardless of payload.** An errored transfer usually
+returns no data at all, and §2.1 goal 2 requires failed URBs to remain visible to
+pairing so they do not turn into false `UnansweredCommand` or `UnsolicitedResponse`
+results. Filtering on payload alone would drop exactly the events steps 4 and 5 rely on
+to explain a missing counterpart.
 
 ### 4.2 Control Transfer Handling
 
@@ -638,8 +679,10 @@ human-readable protocol description. The engine does not attempt narrative prose
 | Orphan submission | Recorded as `IncompleteTransfer`; does not by itself imply an unanswered protocol command |
 | Orphan completion | Recorded as `IncompleteTransfer`; does not by itself imply an unsolicited protocol response |
 | OUT and IN use same endpoint number with opposite directions | Pair as likely command/response, e.g. `0x01` OUT and `0x81` IN |
-| OUT and IN use different endpoint numbers | Preserve as separate endpoint-lane patterns or `AnalysisObservation`; do not force into simple pair |
-| Background endpoint traffic interleaves with command traffic | Analyze per endpoint lane by default so unrelated polling does not contaminate n-gram windows |
+| OUT and IN use different endpoint numbers | Pair within the device's transfer-type lane, e.g. `0x01` OUT and `0x83` IN. This is the arrangement both Goodix captures use (§4.1) |
+| Background endpoint traffic interleaves with command traffic | Suppress interrupt IN-only endpoints on a device that sends OUT elsewhere: excluded from n-gram windows (§3.1) and barred from claiming a pending command while still reported as `UnsolicitedResponse` (§4.1) |
+| Successful zero-length event | Excluded from pairing and counted in notes; it can neither be a command nor answer one |
+| Failed event with no payload | Stays in the lane; per §2.1 goal 2 it must remain able to explain a missing counterpart |
 | Overlapping marker windows | Occurrence assigned to the single nearest marker by timestamp |
 | Multiple devices in capture | Engine runs independently per device; results are separate `ProtocolHypothesis` objects |
 | All-zero payload | Treated as a valid payload; not filtered out |
